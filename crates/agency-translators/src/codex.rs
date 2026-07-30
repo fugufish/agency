@@ -31,7 +31,7 @@ impl LiveEventTranslator for CodexTranslator {
                     native: Some(native(event.clone())),
                 }])
             }
-            "item/started" => {
+            "item/started" | "item/completed" => {
                 let Some(item) = event.pointer("/params/item") else {
                     return Ok(Vec::new());
                 };
@@ -40,6 +40,12 @@ impl LiveEventTranslator for CodexTranslator {
                     .and_then(Value::as_str)
                     .unwrap_or("activity");
                 if matches!(kind, "agentMessage" | "userMessage") {
+                    return Ok(Vec::new());
+                }
+                if kind == "fileChange" && method == "item/started" {
+                    return Ok(Vec::new());
+                }
+                if kind != "fileChange" && method == "item/completed" {
                     return Ok(Vec::new());
                 }
                 let name = item
@@ -308,6 +314,60 @@ fn export_content(block: &ContentBlock, assistant: bool) -> Value {
         ContentBlock::Attachment { kind, reference } => {
             json!({ "type": "input_text", "text": format!("[{kind} attachment: {reference}]") })
         }
+    }
+}
+
+#[cfg(test)]
+mod file_change_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn waits_for_completed_file_changes() {
+        let started = json!({
+            "method": "item/started",
+            "params": {
+                "turnId": "turn-1",
+                "item": {
+                    "id": "change-1",
+                    "type": "fileChange",
+                    "status": "inProgress",
+                    "changes": [{
+                        "path": "src/lib.rs",
+                        "kind": "update",
+                        "diff": "@@ -1 +1 @@\n-old\n+new\n"
+                    }]
+                }
+            }
+        });
+        assert!(CodexTranslator.translate_live(&started).unwrap().is_empty());
+
+        let completed = json!({
+            "method": "item/completed",
+            "params": {
+                "turnId": "turn-1",
+                "item": {
+                    "id": "change-1",
+                    "type": "fileChange",
+                    "status": "completed",
+                    "changes": [{
+                        "path": "src/lib.rs",
+                        "kind": "update",
+                        "diff": "@@ -1 +1 @@\n-old\n+new\n"
+                    }]
+                }
+            }
+        });
+        let updates = CodexTranslator.translate_live(&completed).unwrap();
+        assert_eq!(updates.len(), 1);
+        let ConversationUpdate::Append { event } = &updates[0] else {
+            panic!("file changes should append a completed tool event");
+        };
+        assert_eq!(event.id, "change-1");
+        let EventPayload::ToolCall { input, .. } = &event.payload else {
+            panic!("file changes should remain normalized tool calls");
+        };
+        assert_eq!(input["status"], "completed");
     }
 }
 

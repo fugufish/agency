@@ -45,6 +45,7 @@ dependencies = [
  "arboard",
  "base64",
  "iced",
+ "image",
  "libghostty-vt",
  "png 0.18.1",
  "serde",

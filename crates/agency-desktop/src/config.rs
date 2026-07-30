@@ -108,6 +108,7 @@ pub struct KeybindingConfig {
     pub leader: String,
     pub show_explorer: String,
     pub show_sessions: String,
+    pub show_diffs: String,
     pub new_session: String,
     pub toggle_terminal: String,
     pub enter_active_view: String,
@@ -119,6 +120,7 @@ impl Default for KeybindingConfig {
             leader: " ".to_owned(),
             show_explorer: "e".to_owned(),
             show_sessions: "s".to_owned(),
+            show_diffs: "d".to_owned(),
             new_session: "n".to_owned(),
             toggle_terminal: "t".to_owned(),
             enter_active_view: "i".to_owned(),
@@ -153,7 +155,6 @@ pub struct ModeColors {
     pub terminal: Color,
     pub agent: Color,
     pub leader: Color,
-    pub escape: Color,
 }
 
 impl ModeColors {
@@ -169,7 +170,6 @@ impl ModeColors {
             ),
             agent: configured_color("AGENCY_MODE_COLOR_AGENT", &config.agent, &defaults.agent),
             leader: configured_color("AGENCY_MODE_COLOR_LEADER", &config.leader, &defaults.leader),
-            escape: configured_color("AGENCY_MODE_COLOR_ESCAPE", &config.escape, &defaults.escape),
         }
     }
 }

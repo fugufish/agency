@@ -1,5 +1,6 @@
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use agency_agents::Provider;
@@ -7,7 +8,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::workspace_config_directory;
 
-const SESSION_REGISTRY_FILE: &str = "sessions.json";
+const LEGACY_SESSION_REGISTRY_FILE: &str = "sessions.json";
+const SESSION_CONFIG_FILE: &str = "session.json";
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -34,6 +36,8 @@ pub struct SessionRecord {
     pub codex_id: Option<String>,
     #[serde(default)]
     pub claude_id: Option<String>,
+    #[serde(default)]
+    pub updated_at_millis: u64,
 }
 
 impl SessionRecord {
@@ -76,27 +80,61 @@ enum StoredSessionRecord {
 
 pub struct SessionRegistry {
     records: Vec<SessionRecord>,
-    path: PathBuf,
+    sessions_directory: PathBuf,
 }
 
 impl SessionRegistry {
     pub fn empty(workspace: &Path) -> Self {
         Self {
             records: Vec::new(),
-            path: workspace_config_directory(workspace).join(SESSION_REGISTRY_FILE),
+            sessions_directory: worktree_sessions_directory(workspace),
         }
     }
 
     pub fn load(workspace: &Path) -> Result<Self, String> {
-        let path = workspace_config_directory(workspace).join(SESSION_REGISTRY_FILE);
-        if !path.exists() {
-            return Ok(Self::empty(workspace));
+        let sessions_directory = worktree_sessions_directory(workspace);
+        let mut records = Vec::new();
+        if sessions_directory.exists() {
+            let entries = fs::read_dir(&sessions_directory).map_err(|error| {
+                format!("Could not read {}: {error}", sessions_directory.display())
+            })?;
+            for entry in entries {
+                let entry = entry.map_err(|error| {
+                    format!(
+                        "Could not read an entry in {}: {error}",
+                        sessions_directory.display()
+                    )
+                })?;
+                let path = entry.path().join(SESSION_CONFIG_FILE);
+                if !path.is_file() {
+                    continue;
+                }
+                let source = fs::read_to_string(&path)
+                    .map_err(|error| format!("Could not read {}: {error}", path.display()))?;
+                let mut record: SessionRecord = serde_json::from_str(&source)
+                    .map_err(|error| format!("Could not parse {}: {error}", path.display()))?;
+                if record.updated_at_millis == 0 {
+                    record.updated_at_millis = modified_at_millis(&path);
+                }
+                records.push(record);
+            }
+            return Ok(Self {
+                records,
+                sessions_directory,
+            });
         }
-        let source = fs::read_to_string(&path)
-            .map_err(|error| format!("Could not read {}: {error}", path.display()))?;
+
+        let legacy_path = workspace_config_directory(workspace).join(LEGACY_SESSION_REGISTRY_FILE);
+        if !legacy_path.exists() {
+            return Ok(Self {
+                records,
+                sessions_directory,
+            });
+        }
+        let source = fs::read_to_string(&legacy_path)
+            .map_err(|error| format!("Could not read {}: {error}", legacy_path.display()))?;
         let stored: Vec<StoredSessionRecord> = serde_json::from_str(&source)
-            .map_err(|error| format!("Could not parse {}: {error}", path.display()))?;
-        let mut records: Vec<SessionRecord> = Vec::new();
+            .map_err(|error| format!("Could not parse {}: {error}", legacy_path.display()))?;
         for stored in stored {
             let (conversation_id, name, provider, id) = match stored {
                 StoredSessionRecord::Current(record) => {
@@ -131,22 +169,22 @@ impl SessionRegistry {
                     name,
                     codex_id: None,
                     claude_id: None,
+                    updated_at_millis: now_millis(),
                 };
                 record.set_binding(provider, id);
                 records.push(record);
             }
         }
-        Ok(Self { records, path })
+        let registry = Self {
+            records,
+            sessions_directory,
+        };
+        registry.save()?;
+        Ok(registry)
     }
 
     pub fn records(&self) -> &[SessionRecord] {
         &self.records
-    }
-
-    pub fn find(&self, provider: Provider, id: &str) -> Option<&SessionRecord> {
-        self.records
-            .iter()
-            .find(|record| record.contains(provider, id))
     }
 
     pub fn record(
@@ -162,6 +200,7 @@ impl SessionRegistry {
         {
             if name.is_some() && record.name != name {
                 record.name = name;
+                record.updated_at_millis = now_millis();
                 return self.save();
             }
             return Ok(());
@@ -171,6 +210,7 @@ impl SessionRegistry {
             name,
             codex_id: (provider == Provider::Codex).then_some(id.clone()),
             claude_id: (provider == Provider::Claude).then_some(id),
+            updated_at_millis: now_millis(),
         });
         self.save()
     }
@@ -191,6 +231,7 @@ impl SessionRegistry {
             if name.is_some() {
                 record.name = name;
             }
+            record.updated_at_millis = now_millis();
             return self.save();
         }
         self.records.push(SessionRecord {
@@ -198,6 +239,7 @@ impl SessionRegistry {
             name,
             codex_id: (provider == Provider::Codex).then_some(id.clone()),
             claude_id: (provider == Provider::Claude).then_some(id),
+            updated_at_millis: now_millis(),
         });
         self.save()
     }
@@ -217,6 +259,7 @@ impl SessionRegistry {
         };
         if record.name.is_none() {
             record.name = Some(name);
+            record.updated_at_millis = now_millis();
             self.save()
         } else {
             Ok(())
@@ -228,28 +271,116 @@ impl SessionRegistry {
             return Err("Session no longer exists".to_owned());
         }
         let record = self.records.remove(index);
-        if let Err(error) = self.save() {
+        let directory = self.session_directory(record.conversation_id());
+        if let Err(error) = fs::remove_dir_all(&directory) {
             self.records.insert(index, record);
-            return Err(error);
+            return Err(format!("Could not remove {}: {error}", directory.display()));
         }
         Ok(record)
     }
 
+    pub fn session_directory(&self, conversation_id: &str) -> PathBuf {
+        self.sessions_directory
+            .join(path_component(conversation_id))
+    }
+
     fn save(&self) -> Result<(), String> {
-        let directory = self
-            .path
-            .parent()
-            .ok_or_else(|| "Session registry has no parent directory".to_owned())?;
-        fs::create_dir_all(directory)
-            .map_err(|error| format!("Could not create {}: {error}", directory.display()))?;
-        let data = serde_json::to_string_pretty(&self.records)
-            .map_err(|error| format!("Could not encode agent sessions: {error}"))?;
-        fs::write(&self.path, format!("{data}\n"))
-            .map_err(|error| format!("Could not write {}: {error}", self.path.display()))
+        for record in &self.records {
+            let directory = self.session_directory(record.conversation_id());
+            fs::create_dir_all(&directory)
+                .map_err(|error| format!("Could not create {}: {error}", directory.display()))?;
+            let path = directory.join(SESSION_CONFIG_FILE);
+            let data = serde_json::to_string_pretty(record)
+                .map_err(|error| format!("Could not encode agent session: {error}"))?;
+            fs::write(&path, format!("{data}\n"))
+                .map_err(|error| format!("Could not write {}: {error}", path.display()))?;
+        }
+        Ok(())
     }
 }
 
-fn new_conversation_id() -> String {
+fn now_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .try_into()
+        .unwrap_or(u64::MAX)
+}
+
+fn modified_at_millis(path: &Path) -> u64 {
+    fs::metadata(path)
+        .and_then(|metadata| metadata.modified())
+        .ok()
+        .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
+        .map(|duration| duration.as_millis().try_into().unwrap_or(u64::MAX))
+        .unwrap_or_default()
+}
+
+pub fn worktree_sessions_directory(workspace: &Path) -> PathBuf {
+    let Some(current_root) = git_output(workspace, &["rev-parse", "--show-toplevel"]) else {
+        return workspace_config_directory(workspace)
+            .join("worktrees")
+            .join("root")
+            .join("sessions");
+    };
+    let current_root = PathBuf::from(current_root);
+    let worktrees = git_output(workspace, &["worktree", "list", "--porcelain"]);
+    let primary_root = worktrees
+        .as_deref()
+        .and_then(|output| {
+            output
+                .lines()
+                .find_map(|line| line.strip_prefix("worktree "))
+        })
+        .map(PathBuf::from)
+        .unwrap_or_else(|| current_root.clone());
+    let worktree = if current_root == primary_root {
+        "root".to_owned()
+    } else {
+        git_output(workspace, &["branch", "--show-current"])
+            .filter(|branch| !branch.is_empty())
+            .unwrap_or_else(|| {
+                let commit = git_output(workspace, &["rev-parse", "--short", "HEAD"])
+                    .unwrap_or_else(|| "unknown".to_owned());
+                format!("detached-{commit}")
+            })
+    };
+    workspace_config_directory(&primary_root)
+        .join("worktrees")
+        .join(path_component(&worktree))
+        .join("sessions")
+}
+
+fn git_output(workspace: &Path, arguments: &[&str]) -> Option<String> {
+    let output = Command::new("git")
+        .args(arguments)
+        .current_dir(workspace)
+        .output()
+        .ok()?;
+    output
+        .status
+        .success()
+        .then(|| String::from_utf8_lossy(&output.stdout).trim().to_owned())
+}
+
+fn path_component(value: &str) -> String {
+    let mut encoded = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.') {
+            encoded.push(byte as char);
+        } else {
+            encoded.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    if encoded.is_empty() {
+        "_".to_owned()
+    } else {
+        encoded
+    }
+}
+
+pub fn new_conversation_id() -> String {
     let timestamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -284,6 +415,7 @@ mod tests {
             name: Some("Fix terminal rendering".to_owned()),
             codex_id: Some("thread-123".to_owned()),
             claude_id: None,
+            updated_at_millis: 123,
         };
         let encoded = serde_json::to_string(&record).unwrap();
         let decoded: SessionRecord = serde_json::from_str(&encoded).unwrap();
@@ -315,7 +447,7 @@ mod tests {
         let directory = workspace_config_directory(&workspace);
         std::fs::create_dir_all(&directory).unwrap();
         std::fs::write(
-            directory.join(SESSION_REGISTRY_FILE),
+            directory.join(LEGACY_SESSION_REGISTRY_FILE),
             r#"[{"provider":"claude","id":"session-123"}]"#,
         )
         .unwrap();

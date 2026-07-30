@@ -33,8 +33,71 @@ pub fn rail() -> container::Style {
         .background(BACKGROUND)
 }
 
+pub fn activity_bar() -> container::Style {
+    container::Style::default()
+        .color(TEXT)
+        .background(BACKGROUND)
+        .border(Border {
+            color: BORDER,
+            width: 1.0,
+            radius: 0.0.into(),
+        })
+}
+
+pub fn diff_line(kind: crate::diffs::DiffLineKind) -> container::Style {
+    use crate::diffs::DiffLineKind;
+
+    let (text, background) = match kind {
+        DiffLineKind::Addition => (SUCCESS, Color { a: 0.12, ..SUCCESS }),
+        DiffLineKind::Deletion => (DANGER, Color { a: 0.12, ..DANGER }),
+        DiffLineKind::Hunk => (PRIMARY, Color { a: 0.16, ..PRIMARY }),
+        DiffLineKind::Metadata => (WARNING, SURFACE_RAISED),
+        DiffLineKind::Context => (TEXT, BACKGROUND),
+    };
+    container::Style::default()
+        .color(text)
+        .background(background)
+}
+
+pub fn diff_gutter() -> container::Style {
+    container::Style::default()
+        .color(PRIMARY)
+        .background(SURFACE)
+        .border(Border {
+            color: BORDER,
+            width: 0.0,
+            radius: 0.0.into(),
+        })
+}
+
 pub fn status_bar() -> container::Style {
     container::Style::default().color(TEXT).background(SURFACE)
+}
+
+pub fn tab_bar() -> container::Style {
+    container::Style::default().color(TEXT).background(SURFACE)
+}
+
+pub fn worktree_tab(selected: bool, status: button::Status) -> button::Style {
+    let background = if selected {
+        SURFACE_SELECTED
+    } else if matches!(status, button::Status::Hovered | button::Status::Pressed) {
+        SURFACE_RAISED
+    } else {
+        SURFACE
+    };
+    let mut style = button::Style::default().with_background(background);
+    style.text_color = TEXT;
+    style.border = Border {
+        color: if selected {
+            PRIMARY
+        } else {
+            Color::TRANSPARENT
+        },
+        width: 1.0,
+        radius: 4.0.into(),
+    };
+    style
 }
 
 pub fn agent_badge() -> container::Style {
@@ -166,6 +229,17 @@ pub fn shortcut_badge() -> container::Style {
         })
 }
 
+pub fn counter_badge() -> container::Style {
+    container::Style::default()
+        .color(PRIMARY)
+        .background(SURFACE_RAISED)
+        .border(Border {
+            color: PRIMARY,
+            width: 1.0,
+            radius: 6.0.into(),
+        })
+}
+
 pub fn disclosure_icon() -> svg::Style {
     svg::Style {
         color: Some(PRIMARY),
@@ -205,9 +279,9 @@ pub fn markdown_settings() -> markdown::Settings {
             },
             inline_code_padding: Padding {
                 top: 1.0,
-                right: 8.0,
+                right: 1.0,
                 bottom: 1.0,
-                left: 8.0,
+                left: 1.0,
             },
             inline_code_color: TEXT,
             inline_code_font: Font::MONOSPACE,
@@ -240,6 +314,31 @@ pub fn session_button(selected: bool, status: button::Status) -> button::Style {
         };
     }
     style
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum SessionStatus {
+    Active,
+    Running,
+    Waiting,
+    Resume,
+}
+
+pub fn session_status_badge(status: SessionStatus) -> container::Style {
+    let color = match status {
+        SessionStatus::Active => PRIMARY,
+        SessionStatus::Running => SUCCESS,
+        SessionStatus::Waiting => WARNING,
+        SessionStatus::Resume => TEXT,
+    };
+    container::Style::default()
+        .color(color)
+        .background(SURFACE_RAISED)
+        .border(Border {
+            color,
+            width: 1.0,
+            radius: 4.0.into(),
+        })
 }
 
 pub fn tool_button(selected: bool, status: button::Status) -> button::Style {

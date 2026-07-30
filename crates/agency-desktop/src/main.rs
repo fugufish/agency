@@ -1,16 +1,17 @@
 mod config;
+mod diffs;
 mod keybindings;
 mod sessions;
 mod terminal;
 mod ui_theme;
+mod worktrees;
 
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::path::PathBuf;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
-use iced::keyboard;
 use iced::widget::{
     button, column, container, image, markdown, opaque, row, rule, scrollable, stack, svg, text,
 };
@@ -18,6 +19,7 @@ use iced::{
     Border, Color, Element, Fill, Font, Length, Point, Size, Subscription, Task, Theme, time,
     window,
 };
+use iced::{event, keyboard};
 
 use agency_agents::{
     Event as AgentEvent, Image as AgentImage, Provider, QuestionRequest, Session as AgentSession,
@@ -28,19 +30,24 @@ use agency_translator_api::{
     MessageRole,
 };
 use config::{DefaultAgent, GlobalConfig, ModeColors, WindowState};
-use keybindings::{Action, Keybindings, ModeIndicator};
-use sessions::{SessionRecord, SessionRegistry, name_from_prompt};
+use diffs::{DiffLineKind, DiffSessionState, file_changes, renderable_diff_lines};
+use keybindings::{Action, Activity, Keybindings, ModeIndicator};
+use sessions::{SessionRegistry, name_from_prompt, new_conversation_id};
 use terminal::TerminalSession;
+use worktrees::Worktree;
 
 const AGENT_TRANSCRIPT_ID: &str = "agent-transcript";
+const DIFF_VIEW_ID: &str = "diff-view";
 const PANEL_RIGHT_CLOSE_ICON: &[u8] = include_bytes!("../assets/icons/panel-right-close.svg");
 const MESSAGE_SQUARE_ICON: &[u8] = include_bytes!("../assets/icons/message-square.svg");
 const ARROW_RIGHT_ICON: &[u8] = include_bytes!("../assets/icons/arrow-right.svg");
 const TRASH_ICON: &[u8] = include_bytes!("../assets/icons/trash-2.svg");
 const FILE_ICON: &[u8] = include_bytes!("../assets/icons/file.svg");
 const FOLDER_ICON: &[u8] = include_bytes!("../assets/icons/folder.svg");
+const TERMINAL_ICON: &[u8] = include_bytes!("../assets/icons/terminal.svg");
 const CHEVRON_RIGHT_ICON: &[u8] = include_bytes!("../assets/icons/chevron-right.svg");
 const CHEVRON_DOWN_ICON: &[u8] = include_bytes!("../assets/icons/chevron-down.svg");
+const MOUSE_CHASTISEMENT: &str = "Easy there, clicky—this is a keybindings establishment.";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SidebarTool {
@@ -84,7 +91,8 @@ struct Agency {
     terminals: Vec<TerminalSession>,
     active_terminal: Option<usize>,
     terminal_visible: bool,
-    agent: Option<AgentView>,
+    agents: Vec<AgentView>,
+    active_agent: Option<usize>,
     sessions: SessionRegistry,
     toolbar_visible: bool,
     sidebar_tool: SidebarTool,
@@ -92,16 +100,21 @@ struct Agency {
     explorer_expanded: HashSet<PathBuf>,
     selected_session: usize,
     pending_session_trash: Option<usize>,
+    worktrees: Vec<Worktree>,
+    active_worktree: usize,
     cwd: PathBuf,
     notice: Option<String>,
+    mouse_notice_until: Option<Instant>,
     mode_colors: ModeColors,
     selected_agent: Provider,
     default_agent: Provider,
     cursor_visible: bool,
     cursor_blinked_at: Instant,
+    transcript_scroll_target: Option<f32>,
 }
 
 struct AgentView {
+    conversation_id: String,
     session: AgentSession,
     transcript: Vec<TranscriptEntry>,
     conversation: Conversation,
@@ -117,13 +130,18 @@ struct AgentView {
     thinking_since: Option<Instant>,
     awaiting_agent_content: bool,
     queued_messages: VecDeque<QueuedMessage>,
+    image_cache: HashMap<String, TranscriptImage>,
+    image_cache_directory: PathBuf,
+    diff_state: DiffSessionState,
+    session_directory: PathBuf,
+    last_changed_at_millis: u64,
 }
 
 enum TranscriptEntry {
     User {
         message: String,
         attachments: usize,
-        images: Vec<Vec<u8>>,
+        images: Vec<TranscriptImage>,
     },
     Assistant {
         source: String,
@@ -134,6 +152,35 @@ enum TranscriptEntry {
         content: markdown::Content,
     },
     Activity(String),
+}
+
+#[derive(Clone)]
+struct TranscriptImage {
+    data: Vec<u8>,
+    handle: image::Handle,
+}
+
+impl TranscriptImage {
+    fn new(data: Vec<u8>) -> Self {
+        let handle =
+            transcript_thumbnail(&data).unwrap_or_else(|| image::Handle::from_bytes(data.clone()));
+        Self { data, handle }
+    }
+}
+
+fn transcript_thumbnail(data: &[u8]) -> Option<image::Handle> {
+    const MAX_WIDTH: u32 = 1_600;
+    const MAX_HEIGHT: u32 = 480;
+
+    let decoded = ::image::load_from_memory(data).ok()?;
+    let thumbnail = decoded.thumbnail(MAX_WIDTH, MAX_HEIGHT).into_rgba8();
+    let (width, height) = thumbnail.dimensions();
+
+    Some(image::Handle::from_rgba(
+        width,
+        height,
+        thumbnail.into_raw(),
+    ))
 }
 
 struct PendingQuestion {
@@ -152,17 +199,22 @@ enum Message {
     OpenRepository,
     LinkClicked(markdown::Uri),
     ToggleToolbar,
-    ShowSidebarTool(SidebarTool),
+    ToggleActivity(SidebarTool),
     ToggleExplorerEntry(usize),
+    SelectWorktree(usize),
     ResumeSession(usize),
     RequestSessionTrash(usize),
     CancelSessionTrash,
     ConfirmSessionTrash,
     AnswerChoice(usize),
+    ToggleTerminalActivity,
+    ToggleDiffActivity,
+    SelectDiff(usize),
     ToggleFullscreen(window::Id, window::Mode),
     WindowEvent(window::Id, window::Event),
     WindowGeometryReady(window::Id, Size, Option<Point>, bool, window::Mode, bool),
     Keyboard(keyboard::Event),
+    MouseClick,
     Tick(Instant),
 }
 
@@ -178,6 +230,25 @@ impl Default for Agency {
             DefaultAgent::Claude => Provider::Claude,
         };
         let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let (worktrees, worktree_notice) = match worktrees::discover(&cwd) {
+            Ok(worktrees) => (worktrees, None),
+            Err(error) => (
+                vec![Worktree {
+                    label: cwd.file_name().map_or_else(
+                        || cwd.display().to_string(),
+                        |name| name.to_string_lossy().into_owned(),
+                    ),
+                    path: cwd.clone(),
+                    branch: None,
+                }],
+                Some(error),
+            ),
+        };
+        let active_worktree = worktrees
+            .iter()
+            .position(|worktree| worktree.path == cwd)
+            .unwrap_or(0);
+        let cwd = worktrees[active_worktree].path.clone();
         let (sessions, session_notice) = match SessionRegistry::load(&cwd) {
             Ok(sessions) => (sessions, None),
             Err(error) => (SessionRegistry::empty(&cwd), Some(error)),
@@ -189,7 +260,8 @@ impl Default for Agency {
             terminals: Vec::new(),
             active_terminal: None,
             terminal_visible: false,
-            agent: None,
+            agents: Vec::new(),
+            active_agent: None,
             sessions,
             toolbar_visible: false,
             sidebar_tool: SidebarTool::Sessions,
@@ -197,13 +269,17 @@ impl Default for Agency {
             explorer_expanded: HashSet::new(),
             selected_session: 0,
             pending_session_trash: None,
+            worktrees,
+            active_worktree,
             cwd,
-            notice: notice.or(session_notice),
+            notice: notice.or(worktree_notice).or(session_notice),
+            mouse_notice_until: None,
             mode_colors,
             selected_agent: default_agent,
             default_agent,
             cursor_visible: true,
             cursor_blinked_at: Instant::now(),
+            transcript_scroll_target: None,
         };
         let startup_notice = agency.notice.take();
         agency.start_agent(default_agent);
@@ -220,23 +296,30 @@ impl Agency {
     }
 
     fn update(&mut self, message: Message) -> Task<Message> {
-        let transcript_len = self.agent.as_ref().map_or(0, AgentView::transcript_len);
+        let transcript_len = self.active_agent().map_or(0, AgentView::transcript_len);
 
         match message {
             Message::OpenRepository => {}
             Message::LinkClicked(uri) => self.notice = Some(format!("Link: {uri}")),
             Message::ToggleToolbar => self.toolbar_visible = !self.toolbar_visible,
-            Message::ShowSidebarTool(tool) => self.show_sidebar_tool(tool),
+            Message::ToggleActivity(tool) => self.toggle_activity(tool),
             Message::ToggleExplorerEntry(index) => self.toggle_explorer_entry(index),
+            Message::SelectWorktree(index) => self.select_worktree(index),
             Message::ResumeSession(index) => self.resume_session(index),
             Message::RequestSessionTrash(index) => self.request_session_trash(index),
             Message::CancelSessionTrash => self.pending_session_trash = None,
             Message::ConfirmSessionTrash => self.confirm_session_trash(),
             Message::AnswerChoice(choice) => {
-                if let Some(agent) = &mut self.agent {
+                if let Some(agent) = self.active_agent_mut() {
                     agent.answer_choice(choice);
                 }
             }
+            Message::ToggleTerminalActivity => {
+                self.keybindings.toggle_terminal_mode(self.terminal_visible);
+                self.toggle_terminal();
+            }
+            Message::ToggleDiffActivity => self.activate_diff_activity(),
+            Message::SelectDiff(index) => self.select_diff(index),
             Message::ToggleFullscreen(id, mode) => {
                 let mode = match mode {
                     window::Mode::Fullscreen => window::Mode::Windowed,
@@ -300,26 +383,29 @@ impl Agency {
                     return Task::none();
                 }
                 if self
-                    .agent
-                    .as_ref()
+                    .active_agent()
                     .is_some_and(|agent| agent.pending_question.is_some())
                     && let Some(choice) = numeric_choice(&key, physical_key, modifiers)
                 {
-                    if let Some(agent) = &mut self.agent {
+                    if let Some(agent) = self.active_agent_mut() {
                         agent.answer_choice(choice);
                     }
                     return Task::none();
                 }
                 let composer_was_active = self.keybindings.is_composer_active();
-                let action = self.keybindings.handle(
+                let action = self.keybindings.handle_with_diff(
                     &key,
                     physical_key,
                     modifiers,
                     text.as_deref(),
                     self.terminal_visible,
-                    self.agent.is_some(),
+                    self.active_agent.is_some(),
                     self.toolbar_visible,
                     self.sidebar_tool == SidebarTool::Explorer,
+                    self.active_agent()
+                        .is_some_and(|agent| agent.diff_state.activity_visible),
+                    self.active_agent()
+                        .is_some_and(|agent| agent.diff_state.viewer_visible),
                 );
                 self.apply(action);
                 if !composer_was_active && self.keybindings.is_composer_active() {
@@ -327,7 +413,16 @@ impl Agency {
                 }
             }
             Message::Keyboard(_) => {}
+            Message::MouseClick => {
+                self.mouse_notice_until = Some(Instant::now() + Duration::from_secs(30));
+            }
             Message::Tick(now) => {
+                if self
+                    .mouse_notice_until
+                    .is_some_and(|deadline| now >= deadline)
+                {
+                    self.mouse_notice_until = None;
+                }
                 if now.duration_since(self.cursor_blinked_at) >= Duration::from_millis(500) {
                     self.cursor_visible = !self.cursor_visible;
                     self.cursor_blinked_at = now;
@@ -335,7 +430,11 @@ impl Agency {
                 for terminal in &mut self.terminals {
                     terminal.poll();
                 }
-                let session_updates = self.agent.as_mut().map_or_else(Vec::new, AgentView::poll);
+                let session_updates = self
+                    .agents
+                    .iter_mut()
+                    .flat_map(AgentView::poll)
+                    .collect::<Vec<_>>();
                 for (provider, id, name, conversation_id) in session_updates {
                     let result = if let Some(conversation_id) = conversation_id {
                         self.sessions
@@ -347,14 +446,20 @@ impl Agency {
                         self.notice = Some(error);
                     }
                 }
-                let action = self.keybindings.tick(now);
-                self.apply(action);
             }
         }
 
-        let updated_transcript_len = self.agent.as_ref().map_or(0, AgentView::transcript_len);
+        let updated_transcript_len = self.active_agent().map_or(0, AgentView::transcript_len);
 
-        if updated_transcript_len > transcript_len {
+        if let Some(y) = self.transcript_scroll_target.take() {
+            iced::widget::operation::snap_to(
+                AGENT_TRANSCRIPT_ID,
+                iced::widget::operation::RelativeOffset {
+                    x: None,
+                    y: Some(y),
+                },
+            )
+        } else if updated_transcript_len > transcript_len {
             iced::widget::operation::snap_to_end(AGENT_TRANSCRIPT_ID)
         } else {
             Task::none()
@@ -364,6 +469,12 @@ impl Agency {
     fn subscription(&self) -> Subscription<Message> {
         Subscription::batch([
             keyboard::listen().map(Message::Keyboard),
+            event::listen_with(|event, _status, _window| match event {
+                iced::Event::Mouse(iced::mouse::Event::ButtonPressed(_)) => {
+                    Some(Message::MouseClick)
+                }
+                _ => None,
+            }),
             window::events().map(|(id, event)| Message::WindowEvent(id, event)),
             time::every(Duration::from_millis(16)).map(Message::Tick),
         ])
@@ -372,24 +483,68 @@ impl Agency {
     fn apply(&mut self, action: Action) {
         match action {
             Action::None => {}
-            Action::ShowSessions => self.show_sidebar_tool(SidebarTool::Sessions),
-            Action::ShowExplorer => self.show_sidebar_tool(SidebarTool::Explorer),
+            Action::WorktreePrevious => {
+                self.select_worktree(self.active_worktree.saturating_sub(1));
+            }
+            Action::WorktreeNext => {
+                self.select_worktree(
+                    self.active_worktree
+                        .saturating_add(1)
+                        .min(self.worktrees.len().saturating_sub(1)),
+                );
+            }
+            Action::WorktreeSelect(index) => {
+                if index < self.worktrees.len() {
+                    self.select_worktree(index);
+                }
+            }
+            Action::ToggleActivity(activity) => self.toggle_activity(match activity {
+                Activity::Sessions => SidebarTool::Sessions,
+                Activity::Explorer => SidebarTool::Explorer,
+                Activity::Diffs => {
+                    self.toggle_diff_activity();
+                    return;
+                }
+            }),
             Action::NewSession => {
                 self.selected_agent = self.default_agent;
                 self.start_agent(self.default_agent);
             }
             Action::ToolbarPrevious => {
-                self.selected_session = self.selected_session.saturating_sub(1);
+                let ordered = self.ordered_session_indices();
+                let position = ordered
+                    .iter()
+                    .position(|index| *index == self.selected_session)
+                    .unwrap_or_default();
+                self.selected_session = ordered
+                    .get(position.saturating_sub(1))
+                    .copied()
+                    .unwrap_or_default();
             }
             Action::ToolbarNext => {
-                self.selected_session = self
-                    .selected_session
-                    .saturating_add(1)
-                    .min(self.sessions.records().len().saturating_sub(1));
+                let ordered = self.ordered_session_indices();
+                let position = ordered
+                    .iter()
+                    .position(|index| *index == self.selected_session)
+                    .unwrap_or_default();
+                self.selected_session = ordered
+                    .get(position.saturating_add(1))
+                    .copied()
+                    .unwrap_or(self.selected_session);
             }
-            Action::ToolbarFirst => self.selected_session = 0,
+            Action::ToolbarFirst => {
+                self.selected_session = self
+                    .ordered_session_indices()
+                    .first()
+                    .copied()
+                    .unwrap_or_default();
+            }
             Action::ToolbarLast => {
-                self.selected_session = self.sessions.records().len().saturating_sub(1);
+                self.selected_session = self
+                    .ordered_session_indices()
+                    .last()
+                    .copied()
+                    .unwrap_or_default();
             }
             Action::ToolbarOpen => {
                 if !self.sessions.records().is_empty() {
@@ -413,18 +568,46 @@ impl Agency {
             Action::ExplorerCollapse => self.collapse_explorer_entry(),
             Action::ExplorerExpand => self.expand_explorer_entry(),
             Action::ExplorerOpen => self.toggle_selected_explorer_entry(),
-            Action::ToggleTerminal => {
-                self.agent = None;
-                if self.terminal_visible {
-                    self.terminal_visible = false;
-                } else if self.active_terminal.is_some() {
-                    self.terminal_visible = true;
-                } else {
-                    self.start_terminal(Program::Shell);
+            Action::DiffPrevious => self.update_diff_state(|state| {
+                state.selected = state.selected.saturating_sub(1);
+            }),
+            Action::DiffNext => self.update_diff_state(|state| {
+                state.selected = state
+                    .selected
+                    .saturating_add(1)
+                    .min(state.artifacts.len().saturating_sub(1));
+            }),
+            Action::DiffFirst => self.update_diff_state(|state| state.selected = 0),
+            Action::DiffLast => self.update_diff_state(|state| {
+                state.selected = state.artifacts.len().saturating_sub(1);
+            }),
+            Action::DiffOpen => self.update_diff_state(|state| {
+                if !state.artifacts.is_empty() {
+                    state.viewer_visible = true;
+                    state.viewer_scroll = 0;
+                }
+            }),
+            Action::DiffScrollUp => self.scroll_diff(false),
+            Action::DiffScrollDown => self.scroll_diff(true),
+            Action::DiffClose => {
+                self.update_diff_state(|state| state.viewer_visible = false);
+            }
+            Action::DiffJumpToTool => {
+                if let Some(agent) = self.active_agent()
+                    && let Some(artifact) =
+                        agent.diff_state.artifacts.get(agent.diff_state.selected)
+                {
+                    self.transcript_scroll_target = Some(
+                        artifact.transcript_index as f32
+                            / agent.transcript.len().saturating_sub(1).max(1) as f32,
+                    );
                 }
             }
+            Action::ToggleTerminal => {
+                self.toggle_terminal();
+            }
             Action::AgentAppend(text) => {
-                if let Some(agent) = &mut self.agent {
+                if let Some(agent) = self.active_agent_mut() {
                     if agent.prompt_selected {
                         agent.prompt.clear();
                         agent.prompt_selected = false;
@@ -433,7 +616,7 @@ impl Agency {
                 }
             }
             Action::AgentBackspace => {
-                if let Some(agent) = &mut self.agent {
+                if let Some(agent) = self.active_agent_mut() {
                     if agent.prompt_selected {
                         agent.prompt.clear();
                         agent.prompt_selected = false;
@@ -444,12 +627,12 @@ impl Agency {
             }
             Action::AgentPaste => self.paste_into_agent(),
             Action::AgentSelectAll => {
-                if let Some(agent) = &mut self.agent {
+                if let Some(agent) = self.active_agent_mut() {
                     agent.prompt_selected = !agent.prompt.is_empty();
                 }
             }
             Action::AgentSubmit => {
-                let submitted = self.agent.as_mut().and_then(AgentView::submit);
+                let submitted = self.active_agent_mut().and_then(AgentView::submit);
                 if let Some((provider, id, name)) = submitted
                     && let Err(error) = self.sessions.name_if_missing(provider, &id, name)
                 {
@@ -464,9 +647,102 @@ impl Agency {
         }
     }
 
-    fn show_sidebar_tool(&mut self, tool: SidebarTool) {
-        self.sidebar_tool = tool;
-        self.toolbar_visible = true;
+    fn toggle_activity(&mut self, tool: SidebarTool) {
+        (self.sidebar_tool, self.toolbar_visible) =
+            toggled_activity(self.sidebar_tool, self.toolbar_visible, tool);
+    }
+
+    fn toggle_terminal(&mut self) {
+        if self.terminal_visible {
+            self.terminal_visible = false;
+        } else if self.active_terminal.is_some() {
+            self.terminal_visible = true;
+        } else {
+            self.start_terminal(Program::Shell);
+        }
+    }
+
+    fn update_diff_state(&mut self, update: impl FnOnce(&mut DiffSessionState)) {
+        let Some(agent) = self.active_agent_mut() else {
+            return;
+        };
+        update(&mut agent.diff_state);
+        if let Err(error) = agent.diff_state.save(&agent.session_directory) {
+            self.notice = Some(error);
+        }
+    }
+
+    fn toggle_diff_activity(&mut self) {
+        self.update_diff_state(|state| {
+            state.activity_visible = !state.activity_visible;
+        });
+    }
+
+    fn activate_diff_activity(&mut self) {
+        if self.terminal_visible {
+            self.keybindings.toggle_terminal_mode(true);
+            self.terminal_visible = false;
+            if self
+                .active_agent()
+                .is_some_and(|agent| !agent.diff_state.activity_visible)
+            {
+                self.toggle_diff_activity();
+            }
+        } else {
+            self.toggle_diff_activity();
+        }
+    }
+
+    fn select_diff(&mut self, index: usize) {
+        self.update_diff_state(|state| {
+            if index < state.artifacts.len() {
+                state.selected = index;
+            }
+        });
+    }
+
+    fn scroll_diff(&mut self, down: bool) {
+        self.update_diff_state(|state| {
+            state.viewer_scroll = if down {
+                state.viewer_scroll.saturating_add(80)
+            } else {
+                state.viewer_scroll.saturating_sub(80)
+            };
+        });
+    }
+
+    fn select_worktree(&mut self, index: usize) {
+        let Some(worktree) = self.worktrees.get(index) else {
+            return;
+        };
+        if index == self.active_worktree {
+            return;
+        }
+
+        let cwd = worktree.path.clone();
+        let sessions = match SessionRegistry::load(&cwd) {
+            Ok(sessions) => sessions,
+            Err(error) => {
+                self.notice = Some(error);
+                return;
+            }
+        };
+
+        self.active_worktree = index;
+        self.cwd = cwd;
+        self.sessions = sessions;
+        self.agents.clear();
+        self.active_agent = None;
+        self.terminal_visible = false;
+        self.active_terminal = self
+            .terminals
+            .iter()
+            .position(|terminal| terminal.cwd() == self.cwd);
+        self.explorer_selected = 0;
+        self.explorer_expanded.clear();
+        self.selected_session = 0;
+        self.pending_session_trash = None;
+        self.notice = Some(format!("Switched to {}", self.cwd.display()));
     }
 
     fn explorer_entries(&self) -> Vec<ExplorerEntry> {
@@ -533,7 +809,11 @@ impl Agency {
     fn start_agent(&mut self, provider: Provider) {
         match AgentSession::spawn(provider, &self.cwd) {
             Ok(session) => {
-                self.agent = Some(AgentView {
+                let conversation_id = new_conversation_id();
+                let session_directory = self.sessions.session_directory(&conversation_id);
+                let diff_state = DiffSessionState::load(&session_directory).unwrap_or_default();
+                self.agents.push(AgentView {
+                    conversation_id: conversation_id.clone(),
                     session,
                     transcript: Vec::new(),
                     conversation: Conversation::default(),
@@ -544,17 +824,25 @@ impl Agency {
                     status: "Initializing".to_owned(),
                     session_id: None,
                     pending_session_name: None,
-                    pending_conversation_id: None,
+                    pending_conversation_id: Some(conversation_id.clone()),
                     completed_turns: 0,
                     thinking_since: None,
                     awaiting_agent_content: false,
                     queued_messages: VecDeque::new(),
+                    image_cache: HashMap::new(),
+                    image_cache_directory: self
+                        .sessions
+                        .session_directory(&conversation_id)
+                        .join("images"),
+                    diff_state,
+                    session_directory,
+                    last_changed_at_millis: unix_time_millis(),
                 });
+                self.active_agent = Some(self.agents.len() - 1);
                 self.terminal_visible = false;
                 self.notice = None;
             }
             Err(error) => {
-                self.agent = None;
                 self.notice = Some(error);
             }
         }
@@ -564,6 +852,18 @@ impl Agency {
         let Some(record) = self.sessions.records().get(index).cloned() else {
             return;
         };
+        if let Some(running_index) = self
+            .agents
+            .iter()
+            .position(|agent| agent.conversation_id == record.conversation_id)
+        {
+            self.selected_session = index;
+            self.selected_agent = self.agents[running_index].session.provider();
+            self.active_agent = Some(running_index);
+            self.terminal_visible = false;
+            self.notice = None;
+            return;
+        }
         let (provider, id) = if let Some(id) = record.binding(self.selected_agent) {
             (self.selected_agent, id.to_owned())
         } else if let Some(id) = record.binding(next_provider(self.selected_agent)) {
@@ -576,7 +876,16 @@ impl Agency {
         match AgentSession::resume(provider, &id, &self.cwd) {
             Ok(session) => {
                 self.selected_session = index;
-                self.agent = Some(AgentView {
+                let session_directory = self.sessions.session_directory(record.conversation_id());
+                let diff_state = match DiffSessionState::load(&session_directory) {
+                    Ok(state) => state,
+                    Err(error) => {
+                        self.notice = Some(error);
+                        DiffSessionState::default()
+                    }
+                };
+                self.agents.push(AgentView {
+                    conversation_id: record.conversation_id.clone(),
                     session,
                     transcript: Vec::new(),
                     conversation: Conversation::default(),
@@ -592,7 +901,16 @@ impl Agency {
                     thinking_since: None,
                     awaiting_agent_content: false,
                     queued_messages: VecDeque::new(),
+                    image_cache: HashMap::new(),
+                    image_cache_directory: self
+                        .sessions
+                        .session_directory(record.conversation_id())
+                        .join("images"),
+                    diff_state,
+                    session_directory,
+                    last_changed_at_millis: unix_time_millis(),
                 });
+                self.active_agent = Some(self.agents.len() - 1);
                 self.terminal_visible = false;
                 self.notice = None;
             }
@@ -613,13 +931,19 @@ impl Agency {
         };
         match self.sessions.remove(index) {
             Ok(record) => {
-                if self.agent.as_ref().is_some_and(|agent| {
-                    agent
-                        .session_id
-                        .as_deref()
-                        .is_some_and(|id| record.contains(agent.session.provider(), id))
-                }) {
-                    self.agent = None;
+                if let Some(running_index) = self
+                    .agents
+                    .iter()
+                    .position(|agent| agent.conversation_id == record.conversation_id)
+                {
+                    self.agents.remove(running_index);
+                    self.active_agent = match self.active_agent {
+                        Some(active) if active == running_index => {
+                            (!self.agents.is_empty()).then_some(active.min(self.agents.len() - 1))
+                        }
+                        Some(active) if active > running_index => Some(active - 1),
+                        active => active,
+                    };
                 }
                 self.selected_session = index.min(self.sessions.records().len().saturating_sub(1));
                 self.notice = Some(format!(
@@ -639,8 +963,45 @@ impl Agency {
             .and_then(|index| self.terminals.get(index))
     }
 
+    fn active_agent(&self) -> Option<&AgentView> {
+        self.active_agent.and_then(|index| self.agents.get(index))
+    }
+
+    fn active_agent_mut(&mut self) -> Option<&mut AgentView> {
+        self.active_agent
+            .and_then(|index| self.agents.get_mut(index))
+    }
+
+    fn ordered_session_indices(&self) -> Vec<usize> {
+        let active_conversation_id = self
+            .active_agent()
+            .map(|agent| agent.conversation_id.as_str());
+        let mut indices = (0..self.sessions.records().len()).collect::<Vec<_>>();
+        indices.sort_by_key(|index| {
+            let session = &self.sessions.records()[*index];
+            let agent = self
+                .agents
+                .iter()
+                .find(|agent| agent.conversation_id == session.conversation_id);
+            let rank = if agent.is_some_and(|agent| agent.pending_question.is_some()) {
+                0
+            } else if active_conversation_id == Some(session.conversation_id()) {
+                1
+            } else if agent.is_some() {
+                2
+            } else {
+                3
+            };
+            let changed = agent
+                .map(|agent| agent.last_changed_at_millis)
+                .unwrap_or(session.updated_at_millis);
+            (rank, std::cmp::Reverse(changed))
+        });
+        indices
+    }
+
     fn paste_into_agent(&mut self) {
-        let Some(agent) = &mut self.agent else {
+        let Some(agent) = self.active_agent_mut() else {
             return;
         };
 
@@ -682,19 +1043,55 @@ impl Agency {
     }
 
     fn view(&self) -> Element<'_, Message> {
-        let active_session_id = self
-            .agent
-            .as_ref()
-            .and_then(|agent| agent.session_id.as_deref());
-        let active_provider = self.agent.as_ref().map(|agent| agent.session.provider());
-        let active_conversation_id = active_provider
-            .zip(active_session_id)
-            .and_then(|(provider, id)| self.sessions.find(provider, id))
-            .map(SessionRecord::conversation_id);
         let leader_pending = self.keybindings.is_leader_pending();
-        let session_buttons = self.sessions.records().iter().enumerate().fold(
+        let worktree_tabs =
+            self.worktrees
+                .iter()
+                .enumerate()
+                .fold(row![].spacing(4), |tabs, (index, worktree)| {
+                    let selected = index == self.active_worktree;
+                    let label: Element<'_, Message> = if leader_pending && index < 10 {
+                        let shortcut = if index == 9 {
+                            "0".to_owned()
+                        } else {
+                            (index + 1).to_string()
+                        };
+                        row![shortcut_badge(shortcut), text(&worktree.label).size(12),]
+                            .align_y(iced::Alignment::Center)
+                            .spacing(6)
+                            .into()
+                    } else {
+                        text(&worktree.label).size(12).into()
+                    };
+                    tabs.push(
+                        button(label)
+                            .padding([5, 10])
+                            .style(move |_theme: &Theme, status| {
+                                ui_theme::worktree_tab(selected, status)
+                            })
+                            .on_press_maybe((!selected).then_some(Message::SelectWorktree(index))),
+                    )
+                });
+        let tab_bar = container(
+            row![
+                text("Worktrees:").size(12),
+                scrollable(worktree_tabs).direction(scrollable::Direction::Horizontal(
+                    scrollable::Scrollbar::new()
+                )),
+            ]
+            .align_y(iced::Alignment::Center)
+            .spacing(10),
+        )
+        .width(Fill)
+        .padding([5, 10])
+        .style(|_theme: &Theme| ui_theme::tab_bar());
+        let active_conversation_id = self
+            .active_agent()
+            .map(|agent| agent.conversation_id.as_str());
+        let session_buttons = self.ordered_session_indices().into_iter().fold(
             column![].spacing(8),
-            |sessions, (index, session)| {
+            |sessions, index| {
+                let session = &self.sessions.records()[index];
                 let display_id = session
                     .binding(self.default_agent)
                     .or_else(|| session.binding(next_provider(self.default_agent)))
@@ -706,17 +1103,34 @@ impl Agency {
                     short_id
                 };
                 let is_active = active_conversation_id == Some(session.conversation_id());
-                let state = if is_active { "ACTIVE" } else { "RESUME" };
-                let name = session.name.as_deref().unwrap_or("Untitled session");
-                let card = button(
-                    column![text(state).size(10), text(name).size(13), text(id).size(10),]
-                        .spacing(3),
-                )
-                .width(Fill)
-                .padding(iced::Padding::from([8, 10]).right(38))
-                .style(move |_theme: &Theme, status| {
-                    ui_theme::session_button(index == self.selected_session, status)
+                let is_running = self
+                    .agents
+                    .iter()
+                    .any(|agent| agent.conversation_id == session.conversation_id);
+                let waiting = self.agents.iter().any(|agent| {
+                    agent.conversation_id == session.conversation_id
+                        && agent.pending_question.is_some()
                 });
+                let (state, badge_status) = if waiting {
+                    ("WAITING FOR INPUT", ui_theme::SessionStatus::Waiting)
+                } else if is_active {
+                    ("ACTIVE", ui_theme::SessionStatus::Active)
+                } else if is_running {
+                    ("RUNNING", ui_theme::SessionStatus::Running)
+                } else {
+                    ("RESUME", ui_theme::SessionStatus::Resume)
+                };
+                let name = session.name.as_deref().unwrap_or("Untitled session");
+                let badge = container(text(state).size(10))
+                    .padding([2, 5])
+                    .style(move |_theme: &Theme| ui_theme::session_status_badge(badge_status));
+                let card =
+                    button(column![badge, text(name).size(13), text(id).size(10),].spacing(3))
+                        .width(Fill)
+                        .padding(iced::Padding::from([8, 10]).right(38))
+                        .style(move |_theme: &Theme, status| {
+                            ui_theme::session_button(index == self.selected_session, status)
+                        });
                 let card = if is_active {
                     card
                 } else {
@@ -751,7 +1165,7 @@ impl Agency {
             .height(Length::Fixed(36.0))
             .padding(8)
             .style(move |_theme: &Theme, status| ui_theme::tool_button(selected, status))
-            .on_press(Message::ShowSidebarTool(tool));
+            .on_press(Message::ToggleActivity(tool));
             let control: Element<'_, Message> = control.into();
             if leader_pending {
                 stack![
@@ -766,7 +1180,35 @@ impl Agency {
                 control
             }
         };
-        let activity_bar = container(
+        let terminal_selected = self.terminal_visible;
+        let terminal_control = button(
+            svg(svg::Handle::from_memory(TERMINAL_ICON))
+                .width(Length::Fixed(19.0))
+                .height(Length::Fixed(19.0))
+                .style(move |_theme: &Theme, _status| ui_theme::tool_icon(terminal_selected)),
+        )
+        .width(Length::Fixed(36.0))
+        .height(Length::Fixed(36.0))
+        .padding(8)
+        .style(move |_theme: &Theme, status| ui_theme::tool_button(terminal_selected, status))
+        .on_press(Message::ToggleTerminalActivity);
+        let terminal_control: Element<'_, Message> = if leader_pending {
+            stack![
+                terminal_control,
+                container(shortcut_badge(
+                    self.keybindings.toggle_terminal_hint().to_owned()
+                ))
+                .padding([2, 3])
+                .align_right(Fill)
+                .align_bottom(Fill),
+            ]
+            .into()
+        } else {
+            terminal_control.into()
+        };
+
+        // The left activity bar contains worktree-scoped tools only.
+        let worktree_activity_bar = container(
             column![
                 tool_button(
                     SidebarTool::Sessions,
@@ -778,6 +1220,7 @@ impl Agency {
                     FOLDER_ICON,
                     self.keybindings.show_explorer_hint().to_owned(),
                 ),
+                terminal_control,
             ]
             .spacing(4)
             .align_x(iced::Alignment::Center),
@@ -785,7 +1228,7 @@ impl Agency {
         .width(Length::Fixed(48.0))
         .height(Fill)
         .padding([8, 6])
-        .style(|_theme: &Theme| ui_theme::rail());
+        .style(|_theme: &Theme| ui_theme::activity_bar());
 
         let panel: Element<'_, Message> = match (self.toolbar_visible, self.sidebar_tool) {
             (false, _) => iced::widget::Space::new().width(Length::Shrink).into(),
@@ -905,10 +1348,11 @@ impl Agency {
         } else {
             iced::widget::Space::new().width(Length::Shrink).into()
         };
-        let toolbar: Element<'_, Message> =
-            row![activity_bar, rail_divider, panel].height(Fill).into();
+        let toolbar: Element<'_, Message> = row![worktree_activity_bar, rail_divider, panel]
+            .height(Fill)
+            .into();
 
-        let content: Element<'_, Message> = if let Some(agent) = &self.agent {
+        let content: Element<'_, Message> = if let Some(agent) = self.active_agent() {
             let input_active = self.keybindings.is_composer_active();
             let header = row![
                 text(&agent.status).size(12),
@@ -951,9 +1395,9 @@ impl Agency {
                                         .wrapping(iced::widget::text::Wrapping::WordOrGlyph)
                                 ]
                                 .spacing(10),
-                                |content, data| {
+                                |content, transcript_image| {
                                     content.push(
-                                        image(image::Handle::from_bytes(data.clone()))
+                                        image(transcript_image.handle.clone())
                                             .width(Fill)
                                             .height(Length::Fixed(240.0))
                                             .content_fit(iced::ContentFit::Contain),
@@ -1045,26 +1489,26 @@ impl Agency {
             } else {
                 row![prompt_text, cursor].spacing(0)
             };
-            let is_thinking = agent.awaiting_agent_content && agent.thinking_since.is_some();
-            let input_label = if let Some(thinking_since) = agent
+            let input_indicator: Element<'_, Message> = if let Some(thinking_since) = agent
                 .thinking_since
                 .filter(|_| agent.awaiting_agent_content)
             {
                 let dots =
                     ".".repeat((thinking_since.elapsed().as_millis() / 350 % 3 + 1) as usize);
-                format!("ACTIVE  •  THINKING{dots}")
+                row![
+                    text("ACTIVE").size(11).color(ui_theme::SUCCESS),
+                    text("•").size(11),
+                    container(text(format!("THINKING{dots}")).size(11))
+                        .padding([3, 8])
+                        .style(|_theme: &Theme| ui_theme::thinking_badge()),
+                ]
+                .spacing(8)
+                .align_y(iced::Alignment::Center)
+                .into()
             } else if agent.awaiting_agent_content {
-                "ACTIVE".to_owned()
+                text("ACTIVE").size(11).color(ui_theme::SUCCESS).into()
             } else {
-                "IDLE".to_owned()
-            };
-            let input_indicator: Element<'_, Message> = if is_thinking {
-                container(text(input_label).size(11))
-                    .padding([3, 8])
-                    .style(|_theme: &Theme| ui_theme::thinking_badge())
-                    .into()
-            } else {
-                text(input_label).size(11).into()
+                text("IDLE").size(11).into()
             };
             let mut input_details = Vec::new();
             if !agent.images.is_empty() {
@@ -1182,7 +1626,26 @@ impl Agency {
                 composer
             };
             content.push(composer).width(Fill).height(Fill).into()
-        } else if self.terminal_visible {
+        } else {
+            container(
+                column![
+                    text("Start with a repository").size(28),
+                    text("Open a local Git repository to create and manage agent workspaces.")
+                        .size(15),
+                    button("Open repository").on_press(Message::OpenRepository),
+                    text("Press <Space> t to open a terminal here.").size(13),
+                    text("<Space> n starts a new session").size(13),
+                ]
+                .spacing(16),
+            )
+            .center_x(Fill)
+            .center_y(Fill)
+            .width(Fill)
+            .height(Fill)
+            .into()
+        };
+
+        let terminal_view: Element<'_, Message> = if self.terminal_visible {
             let terminal = self
                 .active_terminal()
                 .expect("a visible terminal must have a session");
@@ -1208,26 +1671,168 @@ impl Agency {
                 .padding(16)
                 .height(Fill),
             ]
-            .height(Fill)
-            .into()
-        } else {
-            container(
-                column![
-                    text("Start with a repository").size(28),
-                    text("Open a local Git repository to create and manage agent workspaces.")
-                        .size(15),
-                    button("Open repository").on_press(Message::OpenRepository),
-                    text("Press <Space> t to open a terminal here.").size(13),
-                    text("<Space> n starts a new session").size(13),
-                ]
-                .spacing(16),
-            )
-            .center_x(Fill)
-            .center_y(Fill)
             .width(Fill)
             .height(Fill)
             .into()
+        } else {
+            iced::widget::Space::new().width(Length::Shrink).into()
         };
+        let (diff_viewer, diff_activity, diff_control): (
+            Element<'_, Message>,
+            Element<'_, Message>,
+            Element<'_, Message>,
+        ) = if let Some(agent) = self.active_agent() {
+            let state = &agent.diff_state;
+            let viewer: Element<'_, Message> = if state.viewer_visible && !self.terminal_visible {
+                let artifact = state.artifacts.get(state.selected);
+                let title = artifact
+                    .map(|artifact| artifact.title.clone())
+                    .unwrap_or_else(|| "DIFF".to_owned());
+                let description = artifact
+                    .map(|artifact| artifact.description.clone())
+                    .unwrap_or_else(|| "No diff selected".to_owned());
+                let lines = artifact
+                    .map(|artifact| rich_diff(&artifact.diff, (state.viewer_scroll / 20) as usize))
+                    .unwrap_or_else(|| text("No diff selected").into());
+                column![
+                    container(
+                        row![
+                            svg(svg::Handle::from_memory(FILE_ICON))
+                                .width(Length::Fixed(16.0))
+                                .height(Length::Fixed(16.0))
+                                .style(|_theme: &Theme, _status| ui_theme::icon()),
+                            column![text(title).size(13), text(description).size(11)]
+                                .spacing(2)
+                                .width(Fill),
+                        ]
+                        .spacing(8)
+                        .align_y(iced::Alignment::Center)
+                    )
+                    .padding([10, 12])
+                    .width(Fill)
+                    .style(|_theme: &Theme| ui_theme::status_bar()),
+                    rule::horizontal(1),
+                    scrollable(lines).id(DIFF_VIEW_ID).height(Fill).direction(
+                        iced::widget::scrollable::Direction::Both {
+                            vertical: iced::widget::scrollable::Scrollbar::default(),
+                            horizontal: iced::widget::scrollable::Scrollbar::default(),
+                        }
+                    ),
+                    rule::horizontal(1),
+                    container(text("j/k scroll  ·  Enter jump  ·  Ctrl+C close").size(10))
+                        .padding([7, 12])
+                        .width(Fill)
+                        .style(|_theme: &Theme| ui_theme::status_bar()),
+                ]
+                .width(Fill)
+                .height(Fill)
+                .into()
+            } else {
+                iced::widget::Space::new().width(Length::Shrink).into()
+            };
+            let artifacts = state.artifacts.iter().enumerate().fold(
+                column![].spacing(8),
+                |items, (index, artifact)| {
+                    items.push(
+                        button(
+                            column![
+                                text(&artifact.title).size(12),
+                                text(&artifact.description).size(10),
+                            ]
+                            .spacing(3),
+                        )
+                        .width(Fill)
+                        .padding([8, 10])
+                        .style(move |_theme: &Theme, status| {
+                            ui_theme::session_button(index == state.selected, status)
+                        })
+                        .on_press(Message::SelectDiff(index)),
+                    )
+                },
+            );
+            let activity: Element<'_, Message> = if state.activity_visible && !self.terminal_visible
+            {
+                container(
+                    column![
+                        diff_sidebar_header(),
+                        rule::horizontal(1),
+                        scrollable(artifacts).height(Fill),
+                        text("j/k select  ·  Enter open  ·  <leader>d").size(10),
+                    ]
+                    .spacing(12),
+                )
+                .width(Length::Fixed(260.0))
+                .height(Fill)
+                .padding(14)
+                .style(|_theme: &Theme| ui_theme::rail())
+                .into()
+            } else {
+                iced::widget::Space::new().width(Length::Shrink).into()
+            };
+            let selected = state.activity_visible && !self.terminal_visible;
+            let control = button(
+                svg(svg::Handle::from_memory(FILE_ICON))
+                    .width(Length::Fixed(19.0))
+                    .height(Length::Fixed(19.0))
+                    .style(move |_theme: &Theme, _status| ui_theme::tool_icon(selected)),
+            )
+            .width(Length::Fixed(36.0))
+            .height(Length::Fixed(36.0))
+            .padding(8)
+            .style(move |_theme: &Theme, status| ui_theme::tool_button(selected, status))
+            .on_press(Message::ToggleDiffActivity);
+            let count_badge = container(diff_count_badge(state.artifacts.len()))
+                .padding([1, 2])
+                .align_right(Fill)
+                .align_top(Fill);
+            let control: Element<'_, Message> = if leader_pending {
+                stack![
+                    control,
+                    count_badge,
+                    container(shortcut_badge(
+                        self.keybindings.show_diffs_hint().to_owned()
+                    ))
+                    .padding([2, 3])
+                    .align_right(Fill)
+                    .align_bottom(Fill),
+                ]
+                .into()
+            } else {
+                stack![control, count_badge].into()
+            };
+            (viewer, activity, control)
+        } else {
+            (
+                iced::widget::Space::new().width(Length::Shrink).into(),
+                iced::widget::Space::new().width(Length::Shrink).into(),
+                iced::widget::Space::new().width(Length::Shrink).into(),
+            )
+        };
+        // The right activity bar contains active-session-scoped tools only.
+        let session_activity_bar = container(
+            column![diff_control]
+                .spacing(4)
+                .align_x(iced::Alignment::Center),
+        )
+        .width(Length::Fixed(48.0))
+        .height(Fill)
+        .padding([8, 6])
+        .style(|_theme: &Theme| ui_theme::rail());
+
+        let diff_viewer_visible = self
+            .active_agent()
+            .is_some_and(|agent| agent.diff_state.viewer_visible)
+            && !self.terminal_visible;
+        let diff_activity_visible = self
+            .active_agent()
+            .is_some_and(|agent| agent.diff_state.activity_visible)
+            && !self.terminal_visible;
+        let terminal_pane = right_pane(terminal_view, self.terminal_visible, Fill);
+        let diff_viewer_pane = right_pane(diff_viewer, diff_viewer_visible, Fill);
+        let diff_activity_pane =
+            right_pane(diff_activity, diff_activity_visible, Length::Fixed(261.0));
+        let right_activity_pane =
+            right_pane(session_activity_bar.into(), true, Length::Fixed(49.0));
 
         let indicator = self.keybindings.mode_indicator();
         let indicator_color = match indicator {
@@ -1235,7 +1840,6 @@ impl Agency {
             ModeIndicator::Terminal => self.mode_colors.terminal,
             ModeIndicator::Composer => self.mode_colors.agent,
             ModeIndicator::Leader => self.mode_colors.leader,
-            ModeIndicator::Escape => self.mode_colors.escape,
         };
         let indicator_text_color = contrasting_text(indicator_color);
         let mode_indicator = container(text(indicator.label()).size(12))
@@ -1254,23 +1858,36 @@ impl Agency {
                 .padding([3, 8])
                 .style(|_theme: &Theme| ui_theme::agent_badge());
 
+        let mouse_notice_active = self.mouse_notice_until.is_some();
+        let status_notice = if mouse_notice_active {
+            MOUSE_CHASTISEMENT
+        } else {
+            self.notice.as_deref().unwrap_or("Esc returns to NORMAL")
+        };
         let status = row![
             mode_indicator,
             agent_indicator,
             text(self.cwd.display().to_string()).size(12),
-            text(
-                self.notice
-                    .as_deref()
-                    .unwrap_or("Ctrl-\\ Ctrl-N returns to NORMAL"),
-            )
-            .size(12),
+            text(status_notice)
+                .size(12)
+                .color_maybe(mouse_notice_active.then_some(ui_theme::DANGER)),
         ]
         .spacing(24);
 
         let application: Element<'_, Message> = column![
-            row![toolbar, rule::vertical(1), content]
-                .width(Fill)
-                .height(Fill),
+            tab_bar,
+            rule::horizontal(1),
+            row![
+                toolbar,
+                rule::vertical(1),
+                content,
+                terminal_pane,
+                diff_viewer_pane,
+                diff_activity_pane,
+                right_activity_pane
+            ]
+            .width(Fill)
+            .height(Fill),
             rule::horizontal(1),
             container(status)
                 .width(Fill)
@@ -1348,6 +1965,18 @@ fn encode_png(width: u32, height: u32, rgba: &[u8]) -> Result<Vec<u8>, String> {
     Ok(output)
 }
 
+fn toggled_activity(
+    current: SidebarTool,
+    visible: bool,
+    requested: SidebarTool,
+) -> (SidebarTool, bool) {
+    if visible && current == requested {
+        (current, false)
+    } else {
+        (requested, true)
+    }
+}
+
 fn numeric_choice(
     key: &keyboard::Key,
     physical_key: keyboard::key::Physical,
@@ -1382,6 +2011,27 @@ fn numeric_choice(
         })
 }
 
+#[cfg(test)]
+mod activity_tests {
+    use super::{SidebarTool, toggled_activity};
+
+    #[test]
+    fn requesting_the_open_activity_closes_it() {
+        assert_eq!(
+            toggled_activity(SidebarTool::Sessions, true, SidebarTool::Sessions),
+            (SidebarTool::Sessions, false)
+        );
+    }
+
+    #[test]
+    fn requesting_another_activity_switches_to_it() {
+        assert_eq!(
+            toggled_activity(SidebarTool::Sessions, true, SidebarTool::Explorer),
+            (SidebarTool::Explorer, true)
+        );
+    }
+}
+
 fn sidebar_header(label: &'static str, icon: &'static [u8]) -> Element<'static, Message> {
     row![
         svg(svg::Handle::from_memory(icon))
@@ -1405,10 +2055,118 @@ fn sidebar_header(label: &'static str, icon: &'static [u8]) -> Element<'static, 
     .into()
 }
 
+fn diff_sidebar_header() -> Element<'static, Message> {
+    row![
+        svg(svg::Handle::from_memory(FILE_ICON))
+            .width(Length::Fixed(17.0))
+            .height(Length::Fixed(17.0))
+            .style(|_theme: &Theme, _status| ui_theme::icon()),
+        text("DIFFS").size(11),
+        iced::widget::Space::new().width(Fill),
+        button(
+            svg(svg::Handle::from_memory(PANEL_RIGHT_CLOSE_ICON))
+                .width(Length::Fixed(16.0))
+                .height(Length::Fixed(16.0))
+                .style(|_theme: &Theme, _status| ui_theme::icon())
+        )
+        .padding(5)
+        .style(|_theme: &Theme, status| ui_theme::icon_button(status))
+        .on_press(Message::ToggleDiffActivity),
+    ]
+    .align_y(iced::Alignment::Center)
+    .spacing(8)
+    .into()
+}
+
+fn rich_diff(diff: &str, skipped: usize) -> Element<'static, Message> {
+    let lines = renderable_diff_lines(diff)
+        .into_iter()
+        .filter(|line| line.kind != DiffLineKind::Metadata)
+        .collect::<Vec<_>>();
+    let width = (lines
+        .iter()
+        .map(|line| line.content.chars().count())
+        .max()
+        .unwrap_or_default() as f32
+        * 7.5
+        + 110.0)
+        .max(900.0);
+
+    lines
+        .into_iter()
+        .skip(skipped)
+        .fold(column![].spacing(0), |lines, line| {
+            let marker = match line.kind {
+                DiffLineKind::Addition => "+",
+                DiffLineKind::Deletion => "−",
+                DiffLineKind::Hunk => "◆",
+                DiffLineKind::Metadata => "·",
+                DiffLineKind::Context => " ",
+            };
+            let number = |number: Option<usize>| {
+                container(
+                    text(number.map_or_else(String::new, |number| number.to_string()))
+                        .font(Font::MONOSPACE)
+                        .size(11),
+                )
+                .width(Length::Fixed(40.0))
+                .padding([3, 6])
+                .align_x(iced::alignment::Horizontal::Right)
+                .style(|_theme: &Theme| ui_theme::diff_gutter())
+            };
+            let content = row![
+                number(line.old_number),
+                number(line.new_number),
+                container(text(marker).font(Font::MONOSPACE).size(12))
+                    .width(Length::Fixed(22.0))
+                    .padding([3, 6]),
+                container(
+                    text(line.content)
+                        .font(Font::MONOSPACE)
+                        .size(12)
+                        .wrapping(iced::widget::text::Wrapping::None),
+                )
+                .padding([3, 6])
+                .width(Fill),
+            ]
+            .align_y(iced::Alignment::Center);
+
+            lines.push(
+                container(content)
+                    .width(Length::Fixed(width))
+                    .style(move |_theme: &Theme| ui_theme::diff_line(line.kind)),
+            )
+        })
+        .width(Length::Fixed(width))
+        .into()
+}
+
+fn right_pane<'a>(
+    content: Element<'a, Message>,
+    visible: bool,
+    width: impl Into<Length>,
+) -> Element<'a, Message> {
+    if visible {
+        row![rule::vertical(1), content]
+            .width(width)
+            .height(Fill)
+            .into()
+    } else {
+        iced::widget::Space::new().width(Length::Shrink).into()
+    }
+}
+
 fn shortcut_badge(key: String) -> Element<'static, Message> {
     container(text(key).font(Font::MONOSPACE).size(11))
         .padding([2, 5])
         .style(|_theme: &Theme| ui_theme::shortcut_badge())
+        .into()
+}
+
+fn diff_count_badge(count: usize) -> Element<'static, Message> {
+    container(text(count.to_string()).font(Font::MONOSPACE).size(10))
+        .padding([1, 4])
+        .style(|_theme: &Theme| ui_theme::counter_badge())
         .into()
 }
 
@@ -1477,6 +2235,9 @@ impl AgentView {
     fn poll(&mut self) -> Vec<(Provider, String, Option<String>, Option<String>)> {
         let mut updates = Vec::new();
         let events = self.session.try_events().collect::<Vec<_>>();
+        if !events.is_empty() {
+            self.last_changed_at_millis = unix_time_millis();
+        }
         for event in events {
             match event {
                 AgentEvent::SessionStarted { id, .. } => {
@@ -1533,12 +2294,18 @@ impl AgentView {
     fn apply_conversation_update(&mut self, update: ConversationUpdate) {
         match update {
             ConversationUpdate::Append { mut event } => {
-                if let EventPayload::ToolCall { name, .. } = &event.payload {
+                if let EventPayload::ToolCall { name, input, .. } = &event.payload {
                     self.thinking_since = if name.eq_ignore_ascii_case("reasoning") {
                         Some(Instant::now())
                     } else {
                         None
                     };
+                    if self
+                        .diff_state
+                        .capture(&event.id, input, self.transcript.len())
+                    {
+                        let _ = self.diff_state.save(&self.session_directory);
+                    }
                 }
                 if event.parent_id.is_none() {
                     event.parent_id = self
@@ -1590,11 +2357,29 @@ impl AgentView {
     }
 
     fn rebuild_transcript(&mut self) {
+        let mut transcript_index = 0;
+        let mut captured = false;
+        for event in &self.conversation.events {
+            if let EventPayload::ToolCall { input, .. } = &event.payload {
+                captured |= self.diff_state.capture(&event.id, input, transcript_index);
+            }
+            if !matches!(
+                &event.payload,
+                EventPayload::ToolCall { name, .. } if name.eq_ignore_ascii_case("reasoning")
+            ) {
+                transcript_index += 1;
+            }
+        }
+        if captured {
+            let _ = self.diff_state.save(&self.session_directory);
+        }
+        let cache = &mut self.image_cache;
+        let cache_directory = &self.image_cache_directory;
         self.transcript = self
             .conversation
             .events
             .iter()
-            .filter_map(transcript_entry)
+            .filter_map(|event| transcript_entry(event, cache, cache_directory))
             .collect();
     }
 
@@ -1713,13 +2498,26 @@ impl AgentView {
                     message,
                     attachments,
                     images,
-                } => message.len() + attachments + images.iter().map(Vec::len).sum::<usize>(),
+                } => {
+                    message.len()
+                        + attachments
+                        + images.iter().map(|image| image.data.len()).sum::<usize>()
+                }
                 TranscriptEntry::Assistant { source, .. } => source.len(),
                 TranscriptEntry::CommandExecution { source, .. } => source.len(),
                 TranscriptEntry::Activity(message) => message.len(),
             })
             .sum()
     }
+}
+
+fn unix_time_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .try_into()
+        .unwrap_or(u64::MAX)
 }
 
 impl TranscriptEntry {
@@ -1735,7 +2533,11 @@ impl TranscriptEntry {
     }
 }
 
-fn transcript_entry(event: &ConversationEvent) -> Option<TranscriptEntry> {
+fn transcript_entry(
+    event: &ConversationEvent,
+    image_cache: &mut HashMap<String, TranscriptImage>,
+    image_cache_directory: &std::path::Path,
+) -> Option<TranscriptEntry> {
     match &event.payload {
         EventPayload::Message { role, content } => {
             let text = content
@@ -1748,8 +2550,15 @@ fn transcript_entry(event: &ConversationEvent) -> Option<TranscriptEntry> {
                 .join("\n");
             let images = content
                 .iter()
-                .filter_map(|block| match block {
-                    ContentBlock::Image { data, .. } => STANDARD.decode(data).ok(),
+                .enumerate()
+                .filter_map(|(index, block)| match block {
+                    ContentBlock::Image { data, .. } => cached_transcript_image(
+                        image_cache,
+                        image_cache_directory,
+                        &event.id,
+                        index,
+                        data,
+                    ),
                     _ => None,
                 })
                 .collect::<Vec<_>>();
@@ -1772,6 +2581,23 @@ fn transcript_entry(event: &ConversationEvent) -> Option<TranscriptEntry> {
         EventPayload::ToolCall { name, input, .. } => {
             if name.eq_ignore_ascii_case("reasoning") {
                 return None;
+            }
+            if input.get("type").and_then(serde_json::Value::as_str) == Some("fileChange") {
+                let status = input
+                    .get("status")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("completed");
+                let changes = file_changes(input);
+                let message = if changes.is_empty() {
+                    format!("[file change {status}] No file changes were applied")
+                } else {
+                    changes
+                        .iter()
+                        .map(|change| format!("[file] {} — {}", change.path, change.description))
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                };
+                return Some(TranscriptEntry::Activity(message));
             }
             let kind = event
                 .native
@@ -1806,6 +2632,50 @@ fn transcript_entry(event: &ConversationEvent) -> Option<TranscriptEntry> {
         EventPayload::Summary { text } => {
             Some(TranscriptEntry::Activity(format!("[summary] {text}")))
         }
+    }
+}
+
+fn cached_transcript_image(
+    cache: &mut HashMap<String, TranscriptImage>,
+    cache_directory: &std::path::Path,
+    event_id: &str,
+    index: usize,
+    encoded: &str,
+) -> Option<TranscriptImage> {
+    let key = format!("{event_id}:{index}");
+    if let Some(image) = cache.get(&key) {
+        return Some(image.clone());
+    }
+
+    let filename = format!("{}-{index}.image", safe_filename(event_id));
+    let path = cache_directory.join(filename);
+    let data = fs::read(&path)
+        .ok()
+        .or_else(|| STANDARD.decode(encoded).ok())?;
+    let image = TranscriptImage::new(data.clone());
+    cache.insert(key, image.clone());
+
+    if !path.exists() && fs::create_dir_all(cache_directory).is_ok() {
+        let _ = fs::write(path, data);
+    }
+    Some(image)
+}
+
+fn safe_filename(value: &str) -> String {
+    let encoded = value
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.') {
+                character
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    if encoded.is_empty() {
+        "event".to_owned()
+    } else {
+        encoded
     }
 }
 
@@ -1897,7 +2767,7 @@ mod tests {
             native: None,
         };
 
-        assert!(transcript_entry(&event).is_none());
+        assert!(transcript_entry(&event, &mut HashMap::new(), &std::env::temp_dir()).is_none());
     }
 
     #[test]
@@ -1918,10 +2788,19 @@ mod tests {
             native: None,
         };
 
-        let Some(TranscriptEntry::User { images, .. }) = transcript_entry(&event) else {
+        let cache_directory =
+            std::env::temp_dir().join(format!("agency-image-cache-{}", std::process::id()));
+        let mut cache = HashMap::new();
+        let Some(TranscriptEntry::User { images, .. }) =
+            transcript_entry(&event, &mut cache, &cache_directory)
+        else {
             unreachable!();
         };
-        assert_eq!(images, vec![png]);
+        assert_eq!(images.len(), 1);
+        assert_eq!(images[0].data, png);
+        assert_eq!(cache.len(), 1);
+        assert!(cache_directory.join("user-image-1-0.image").is_file());
+        std::fs::remove_dir_all(cache_directory).unwrap();
     }
 
     #[test]
