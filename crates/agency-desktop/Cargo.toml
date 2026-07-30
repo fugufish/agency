@@ -1,0 +1,21 @@
+[package]
+name = "agency-desktop"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+arboard = { version = "3.6.1", features = ["image-data", "wayland-data-control"] }
+agency-agents = { path = "../agency-agents" }
+agency-mux = { path = "../agency-mux" }
+agency-translator-api = { path = "../agency-translator-api" }
+agency-translators = { path = "../agency-translators" }
+base64 = "0.22"
+iced.workspace = true
+libghostty-vt.workspace = true
+png = "0.18"
+serde = { version = "1.0", features = ["derive"] }
+serde_json.workspace = true
+toml = "0.9"
