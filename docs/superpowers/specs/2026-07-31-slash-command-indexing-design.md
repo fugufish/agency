@@ -19,10 +19,12 @@ That misses most of what the agents can actually run:
   of each plugin is live. A plugin can have several versions on disk at once.
 - **Namespacing is absent.** Plugin entries are invoked as
   `/superpowers:brainstorming`, not `/brainstorming`.
-- **Codex plugins are invisible.** Codex installs under
-  `~/.codex/plugins/cache/<marketplace>/<plugin>/<version>/` and declares its
-  skills path in `.codex-plugin/plugin.json`. Codex prompts in
-  `~/.codex/prompts` are also unindexed.
+- **Codex sources are wrong or missing.** Codex skills live in `~/.agents/skills`
+  and `<repo>/.agents/skills`, not the `.codex/skills` paths currently scanned.
+  Codex plugins install under
+  `~/.codex/plugins/cache/<marketplace>/<plugin>/<version>/` and declare their
+  skills path in `.codex-plugin/plugin.json`. Codex prompts in `~/.codex/prompts`
+  are also unindexed.
 - **Descriptions are wrong.** `push_agent_completion` takes the first line that
   is neither empty nor `---`. Every real skill and command file opens with YAML
   frontmatter, so this yields `name: brainstorming` instead of the description
@@ -93,47 +95,62 @@ as they do today, because their insertions differ.
 
 ### Claude
 
-Sources in precedence order; a later source shadows an earlier one holding an
-identical fully qualified name.
+Sources and their names:
 
 | Source | Location | Name |
 |---|---|---|
 | Built-ins | hardcoded list | `/review`, `/security-review`, … |
-| Plugin skills | `<installPath>/skills/<name>/SKILL.md` | `/<plugin>:<name>` |
-| Plugin commands | `<installPath>/commands/**/<name>.md` | `/<plugin>:<name>`, nested directories add segments |
-| Personal | `~/.claude/{skills,commands}` | `/<name>`, nested directories give `/<dir>:<name>` |
-| Project | `<workspace>/.claude/{skills,commands}` | as above |
+| Personal skills | `~/.claude/skills/<dir>/SKILL.md` | `/<dir>` |
+| Personal commands | `~/.claude/commands/**/<file>.md` | `/<file>` |
+| Project skills | `<workspace>/.claude/skills/<dir>/SKILL.md` | `/<dir>` |
+| Project commands | `<workspace>/.claude/commands/**/<file>.md` | `/<file>` |
+| Plugin skills | `<installPath>/skills/<dir>/SKILL.md` | `/<plugin>:<frontmatter name, else dir>` |
+| Plugin root skill | `<installPath>/SKILL.md` | `/<plugin>:<frontmatter name, else plugin>` |
+| Plugin commands | `<installPath>/commands/**/<file>.md` | `/<plugin>:<file>` |
+
+Naming rules follow Claude Code's documented behavior. For personal and project
+entries the frontmatter `name` is a display label only — the command comes from
+the directory or file name. For plugin skills, frontmatter `name` replaces the
+last segment while the plugin prefix stays. A plugin with a root `SKILL.md`, no
+`skills/` directory, and no `skills` manifest key is a single-skill plugin.
+
+Shadowing, again per Claude Code: personal overrides project, and either
+overrides a built-in of the same name. A skill beats a command of the same name.
+Plugin entries are namespaced and so never collide with the other levels.
+
+The plugin manifest's component path fields are honored: `commands` **replaces**
+the default `commands/` scan, while `skills` **adds to** the default `skills/`
+scan. Paths are relative to the plugin root and may be a string or an array.
 
 `<installPath>` is read from `~/.claude/plugins/installed_plugins.json`, which
 records the resolved install path per plugin. Reading it avoids guessing which
-of several on-disk versions is live.
+of several on-disk versions is live, and its keys are the `plugin@marketplace`
+form that `enabledPlugins` also uses.
 
-Enablement comes from `enabledPlugins` across the settings chain — user
-`settings.json`, user `settings.local.json`, project `.claude/settings.json`,
-project `.claude/settings.local.json` — with later files overriding earlier
-ones. A plugin absent from every file counts as enabled. An explicit `false`
-drops all of that plugin's entries.
-
-Claude Code's documented settings precedence is authoritative here. Confirm it
-against the current documentation during implementation rather than inferring
-it from a single local file.
+Enablement resolves in this order: an `enabledPlugins` entry at any settings
+scope wins; failing that, `defaultEnabled` in the plugin's `plugin.json`; failing
+that, enabled. Settings scopes, in increasing precedence, are
+`~/.claude/settings.json`, `<workspace>/.claude/settings.json`, and
+`<workspace>/.claude/settings.local.json`. Managed enterprise settings outrank
+all of these but are out of scope; `defaultEnabled` on a marketplace entry
+outranks the one in `plugin.json` and is likewise out of scope.
 
 ### Codex
 
-- `~/.codex/skills` and `<workspace>/.codex/skills`
-- `~/.codex/prompts/*.md`
+- `~/.agents/skills` and `<workspace>/.agents/skills` — the documented personal
+  and repository skill locations
+- `~/.codex/skills` and `<workspace>/.codex/skills` — kept so an older layout
+  still resolves; both are absent on the current machine
+- `~/.codex/prompts/*.md`, invoked as `/prompts:<name>`. Custom prompts are
+  deprecated in favor of skills but still load.
 - Plugin skills from `~/.codex/plugins/cache/<marketplace>/<plugin>/<version>/`,
   reading each `.codex-plugin/plugin.json` and following its declared `skills`
   path rather than assuming a fixed directory
 
-Codex invocations keep the existing `$name` form.
-
-Local ground truth for Codex is thin: `~/.codex/prompts` and `~/.codex/skills`
-are both empty, and the one installed plugin ships only skills. Nested prompt
-naming and whether Codex namespaces plugin skills are unverified. Confirm both
-against Codex's documentation before implementing that half; if namespacing
-cannot be confirmed, index Codex plugin skills unnamespaced and note the
-limitation.
+Codex skills are mentioned with `$name`, which is the existing insertion form.
+Codex does not namespace plugin-provided skills, so they are indexed under their
+bare names. `/etc/codex/skills` is documented as a machine-wide location and is
+out of scope.
 
 ### Descriptions and arguments
 
@@ -195,10 +212,14 @@ Fixture trees in a temporary directory covering:
 
 - An enabled plugin, indexed with its namespace
 - A disabled plugin, absent from the catalog
+- A plugin disabled only by `defaultEnabled: false`, and the same plugin
+  re-enabled by an `enabledPlugins` entry
 - A plugin with three versions on disk, indexed only at the path
   `installed_plugins.json` names
-- Nested command directories producing multi-segment names
-- A project-level entry shadowing a personal entry of the same name
+- A plugin skill whose frontmatter `name` replaces the last segment
+- A plugin manifest whose `commands` key replaces the default scan and whose
+  `skills` key adds to it
+- A personal entry shadowing a project entry of the same name
 - An unreadable entry that does not sink the rest of the catalog
 
 `claude_built_ins_are_available_and_can_be_overridden` moves here from the
