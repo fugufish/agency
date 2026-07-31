@@ -90,17 +90,29 @@ fn installed_plugins(home: &Path) -> Vec<CodexPlugin> {
             let Ok(versions) = fs::read_dir(plugin.path()) else {
                 continue;
             };
-            for version in versions.flatten() {
-                let install_path = version.path();
-                if !install_path.join(".codex-plugin/plugin.json").is_file() {
-                    continue;
-                }
-                found.push(CodexPlugin {
-                    name: plugin.file_name().to_string_lossy().into_owned(),
-                    marketplace: marketplace.file_name().to_string_lossy().into_owned(),
-                    skill_roots: skill_roots(&install_path),
-                });
-            }
+            // Codex ships no live-version pointer the way Claude's
+            // installed_plugins.json does, so the highest-sorted version
+            // directory stands in for one: without it, scanning every
+            // version would leave stale skills from old versions in the
+            // catalog, and a same-named skill across versions would resolve
+            // by read_dir order, which is not deterministic. This is
+            // lexicographic, not semver — a scheme where "0.9.0" sorts above
+            // "0.10.0" would pick the wrong directory — but Codex gives us
+            // nothing else to go on.
+            let mut version_dirs: Vec<PathBuf> = versions
+                .flatten()
+                .map(|version| version.path())
+                .filter(|install_path| install_path.join(".codex-plugin/plugin.json").is_file())
+                .collect();
+            version_dirs.sort_by(|left, right| left.file_name().cmp(&right.file_name()));
+            let Some(install_path) = version_dirs.pop() else {
+                continue;
+            };
+            found.push(CodexPlugin {
+                name: plugin.file_name().to_string_lossy().into_owned(),
+                marketplace: marketplace.file_name().to_string_lossy().into_owned(),
+                skill_roots: skill_roots(&install_path),
+            });
         }
     }
     found.sort_by(|left, right| {
@@ -206,6 +218,33 @@ mod tests {
         fs::remove_dir_all(workspace).unwrap();
     }
 
+    /// Pins the precedence `catalog` and `push` actually implement: root
+    /// entries are scanned workspace-first, then home, and `push` lets the
+    /// later write win, so a personal skill shadows a project skill of the
+    /// same name. This is a regression net, not a new rule — if the roots
+    /// array in `catalog` is ever reordered by accident, this test should
+    /// catch it.
+    #[test]
+    fn a_personal_skill_shadows_a_project_skill_of_the_same_name() {
+        let home = scratch("shadow-personal-home");
+        let workspace = scratch("shadow-personal-workspace");
+        skill(workspace.join(".agents/skills"), "shared", "Project version");
+        skill(home.join(".agents/skills"), "shared", "Personal version");
+
+        let commands = catalog(&home, &workspace);
+
+        assert_eq!(
+            commands.iter().filter(|command| command.name == "shared").count(),
+            1
+        );
+        let shared = named(&commands, "shared").unwrap();
+        assert_eq!(shared.description, "Personal version");
+        assert_eq!(shared.origin, CommandOrigin::Personal);
+
+        fs::remove_dir_all(home).unwrap();
+        fs::remove_dir_all(workspace).unwrap();
+    }
+
     /// The `.codex/skills` layout is not documented any more, but files left
     /// there should keep working.
     #[test]
@@ -263,6 +302,72 @@ mod tests {
                 marketplace: "openai".to_owned(),
             }
         );
+
+        fs::remove_dir_all(home).unwrap();
+        fs::remove_dir_all(workspace).unwrap();
+    }
+
+    /// Pins the other half of the precedence `catalog` implements: plugins
+    /// are scanned last, so a plugin skill shadows a personal skill of the
+    /// same bare name, even though Codex does not namespace plugin skills.
+    /// This is a regression net, not a new rule.
+    #[test]
+    fn a_plugin_skill_shadows_a_personal_skill_of_the_same_name() {
+        let home = scratch("shadow-plugin-home");
+        let workspace = scratch("shadow-plugin-workspace");
+        skill(home.join(".agents/skills"), "shared", "Personal version");
+        let install = home.join(".codex/plugins/cache/openai/templates/0.1.0");
+        write(
+            install.join(".codex-plugin/plugin.json"),
+            r#"{"name":"templates","skills":"./skills/"}"#,
+        );
+        skill(install.join("skills"), "shared", "Plugin version");
+
+        let commands = catalog(&home, &workspace);
+
+        assert_eq!(
+            commands.iter().filter(|command| command.name == "shared").count(),
+            1
+        );
+        let shared = named(&commands, "shared").unwrap();
+        assert_eq!(shared.description, "Plugin version");
+        assert_eq!(
+            shared.origin,
+            CommandOrigin::Plugin {
+                plugin: "templates".to_owned(),
+                marketplace: "openai".to_owned(),
+            }
+        );
+
+        fs::remove_dir_all(home).unwrap();
+        fs::remove_dir_all(workspace).unwrap();
+    }
+
+    /// Codex ships no live-version pointer, so `installed_plugins` has to
+    /// pick one version directory itself. Only the highest-sorted version
+    /// should be scanned: an older version's skill must not survive an
+    /// update, and a same-named skill in both versions must resolve to the
+    /// newer one rather than to `read_dir` order.
+    #[test]
+    fn only_the_highest_version_of_a_plugin_is_scanned() {
+        let home = scratch("versions-home");
+        let workspace = scratch("versions-workspace");
+        let cache = home.join(".codex/plugins/cache/openai/templates");
+        write(
+            cache.join("0.1.0/.codex-plugin/plugin.json"),
+            r#"{"name":"templates","skills":"./skills/"}"#,
+        );
+        skill(cache.join("0.1.0/skills"), "old-only", "From the old version");
+        write(
+            cache.join("0.2.0/.codex-plugin/plugin.json"),
+            r#"{"name":"templates","skills":"./skills/"}"#,
+        );
+        skill(cache.join("0.2.0/skills"), "new-only", "From the new version");
+
+        let commands = catalog(&home, &workspace);
+
+        assert!(named(&commands, "new-only").is_some());
+        assert!(named(&commands, "old-only").is_none());
 
         fs::remove_dir_all(home).unwrap();
         fs::remove_dir_all(workspace).unwrap();
