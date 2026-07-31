@@ -9,6 +9,8 @@ use agency_translator_api::{
 };
 use serde_json::{Value, json};
 
+mod commands;
+
 const CLIENT: &str = "claude-code";
 const LIVE_ASSISTANT: &str = "claude-live-assistant";
 
