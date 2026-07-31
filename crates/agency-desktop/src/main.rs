@@ -44,6 +44,7 @@ use agency_translator_api::{
     ClientId, ContentBlock, Conversation, ConversationEvent, ConversationUpdate, EventPayload,
     MessageRole, tools,
 };
+use agency_translator_api::commands::AgentCommand;
 use config::{DefaultAgent, GlobalConfig, ModeColors, WindowState};
 use diffs::{DiffLineKind, DiffSessionState, file_changes, renderable_diff_lines};
 use keybindings::{
@@ -54,8 +55,8 @@ use plugins::{PluginInstallEntry, PluginInstallEvent, PluginInstalls, Transcript
 use sessions::{SessionRegistry, name_from_prompt, new_conversation_id};
 use slash_commands::{
     ComposerState, INIT_AGENT_PROMPT, SlashCommand, SlashCommandCompletion, SlashCompletionState,
-    TabCompletion, completion_count, discover_agent_commands, initialize_workspace, load_codex_mcp,
-    merge_catalog, parse_slash_command, slash_command_completions, tab_completion,
+    TabCompletion, agency_commands, completion_count, discover_agent_commands, initialize_workspace,
+    load_codex_mcp, merge_catalog, parse_slash_command, slash_command_completions, tab_completion,
 };
 use terminal::TerminalSession;
 use worktrees::Worktree;
@@ -551,7 +552,7 @@ fn run_desktop() -> iced::Result {
         _ => window::Position::Default,
     };
 
-    iced::application(Agency::default, Agency::update, Agency::view)
+    iced::application(Agency::boot, Agency::update, Agency::view)
         .title("Agency")
         .theme(Agency::theme)
         .subscription(Agency::subscription)
@@ -863,6 +864,11 @@ enum AppEvent {
     /// The composer's prompt text changed. Published *after* the change lands so
     /// every prompt-derived affordance re-reads the text as it stands now.
     ComposerPromptChanged,
+    /// Ask the configured agents what they can run here. Published at startup,
+    /// on worktree switch, and after an install changes what is on disk.
+    SlashCatalogRequested,
+    SlashCatalogLoaded(Vec<(Provider, AgentCommand)>),
+    SlashCatalogFailed(String),
     PluginInstallRequested {
         conversation_id: String,
         source: String,
@@ -930,8 +936,7 @@ impl Default for Agency {
             Err(error) => (SessionRegistry::empty(&cwd), Some(error)),
         };
         let rpc_capabilities = SessionCapabilities::default();
-        let slash_command_catalog =
-            merge_catalog(discover_agent_commands(&configured_agents, &cwd));
+        let slash_command_catalog = agency_commands();
         let (rpc_server, rpc_notice) = match RpcServer::start(rpc_capabilities.clone()) {
             Ok(server) => (Some(server), None),
             Err(error) => (None, Some(error)),
@@ -983,6 +988,13 @@ impl Default for Agency {
 }
 
 impl Agency {
+    /// iced's boot hook. The catalog starts with Agency's own commands and the
+    /// agent half is requested immediately, so the composer is usable while
+    /// the first index runs.
+    fn boot() -> (Self, Task<AppEvent>) {
+        (Self::default(), Task::done(AppEvent::SlashCatalogRequested))
+    }
+
     fn activate_focused_context(&mut self) {
         self.keybindings
             .activate_context(self.interaction.focus.context());
@@ -1269,6 +1281,34 @@ impl Agency {
                     None => {}
                 }
             }
+            AppEvent::SlashCatalogRequested => {
+                let workspace = self.cwd.clone();
+                let providers = self.configured_agents.clone();
+                return Task::perform(
+                    async move {
+                        // Discovery reads hundreds of directories under the
+                        // plugin caches. Running it on the async runtime would
+                        // stall every other effect for as long as it takes.
+                        tokio::task::spawn_blocking(move || {
+                            discover_agent_commands(&providers, &workspace)
+                        })
+                        .await
+                        .map_err(|error| format!("Could not index agent commands: {error}"))
+                    },
+                    |result| match result {
+                        Ok(commands) => AppEvent::SlashCatalogLoaded(commands),
+                        Err(error) => AppEvent::SlashCatalogFailed(error),
+                    },
+                );
+            }
+            AppEvent::SlashCatalogLoaded(commands) => {
+                self.slash_command_catalog = merge_catalog(commands);
+            }
+            AppEvent::SlashCatalogFailed(error) => {
+                // A stale catalog is more useful than an empty one, so the
+                // previous entries stay.
+                self.notice = Some(error);
+            }
             AppEvent::PluginInstallRequested {
                 conversation_id,
                 source,
@@ -1320,6 +1360,9 @@ impl Agency {
                             status.label().to_lowercase()
                         ),
                     });
+                    // An install changes what is on disk, so the catalog it
+                    // was built from is now stale.
+                    self.emit(AppEvent::SlashCatalogRequested);
                 }
                 let conversation_id = event.conversation_id().to_owned();
                 let changed = self
@@ -2146,6 +2189,7 @@ impl Agency {
             agent.mcp_status = McpStatus::Waiting;
         }
         self.mcp_servers = servers;
+        self.emit(AppEvent::SlashCatalogRequested);
         self.notice = Some(format!(
             "Added MCP server {name:?} to {} connected agent{}",
             self.agents.len(),
@@ -2292,8 +2336,8 @@ impl Agency {
 
         self.active_worktree = index;
         self.cwd = cwd;
-        self.slash_command_catalog =
-            merge_catalog(discover_agent_commands(&self.configured_agents, &self.cwd));
+        self.slash_command_catalog = agency_commands();
+        self.emit(AppEvent::SlashCatalogRequested);
         self.overlays.slash.close();
         self.sessions = sessions;
         for agent in &self.agents {
@@ -6407,6 +6451,7 @@ fn fenced_command(command: &str, language: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use agency_translator_api::commands::AgentCommand;
 
     #[test]
     fn event_bus_preserves_publish_order_for_follow_up_events() {
@@ -6999,6 +7044,67 @@ mod tests {
         assert_eq!(
             agency_mcp_server_state([McpStatus::Connected, McpStatus::Disconnected]),
             McpServerState::Error
+        );
+    }
+
+    fn agent_command(name: &str) -> AgentCommand {
+        AgentCommand {
+            name: name.to_owned(),
+            description: "Does a thing".to_owned(),
+            invocation: format!("/{name} "),
+            argument_hint: None,
+            origin: agency_translator_api::commands::CommandOrigin::Personal,
+        }
+    }
+
+    #[test]
+    fn a_loaded_catalog_replaces_the_agent_half_and_keeps_agency_commands() {
+        let mut catalog = slash_commands::agency_commands();
+        let agency_count = catalog.len();
+
+        catalog = slash_commands::merge_catalog(vec![(Provider::Claude, agent_command("deploy"))]);
+
+        assert_eq!(catalog.len(), agency_count + 1);
+        assert!(catalog.iter().any(|completion| completion.command == "/init"));
+        assert!(catalog.iter().any(|completion| completion.command == "/deploy"));
+
+        // A second load replaces the first rather than accumulating.
+        catalog = slash_commands::merge_catalog(vec![(Provider::Claude, agent_command("audit"))]);
+        assert_eq!(catalog.len(), agency_count + 1);
+        assert!(!catalog.iter().any(|completion| completion.command == "/deploy"));
+    }
+
+    #[test]
+    // Overwriting one field of a freshly defaulted `Agency` is exactly the
+    // scenario under test (a catalog already populated before a failed
+    // reload), not a struct clippy should rewrite into initializer syntax.
+    #[allow(clippy::field_reassign_with_default)]
+    fn a_failed_load_leaves_the_previous_catalog_in_place() {
+        let mut agency = Agency::default();
+        agency.slash_command_catalog =
+            slash_commands::merge_catalog(vec![(Provider::Claude, agent_command("deploy"))]);
+        let before = agency.slash_command_catalog.clone();
+
+        let _ = agency.reduce_event(AppEvent::SlashCatalogFailed("disk on fire".to_owned()));
+
+        assert_eq!(agency.slash_command_catalog, before);
+        assert_eq!(agency.notice.as_deref(), Some("disk on fire"));
+    }
+
+    #[test]
+    fn a_loaded_catalog_is_stored_and_clears_no_notice() {
+        let mut agency = Agency::default();
+
+        let _ = agency.reduce_event(AppEvent::SlashCatalogLoaded(vec![(
+            Provider::Claude,
+            agent_command("deploy"),
+        )]));
+
+        assert!(
+            agency
+                .slash_command_catalog
+                .iter()
+                .any(|completion| completion.command == "/deploy")
         );
     }
 }
