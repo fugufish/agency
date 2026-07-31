@@ -125,7 +125,31 @@ pub fn slash_command_completions<'a>(
     let input = input.trim_start();
     catalog
         .iter()
-        .filter(move |completion| input.starts_with('/') && completion.command.starts_with(input))
+        .filter(move |completion| matches(&completion.command, input))
+}
+
+/// Whether `input` finds `command`.
+///
+/// Plugin entries are namespaced — `/superpowers:brainstorming` — so matching
+/// on the whole command alone would force the user to remember which plugin
+/// owns a command before they could find it. Each `:`-delimited segment is
+/// also offered as a starting point, which keeps the match predictable: a
+/// query always prefixes *something*, never an arbitrary subsequence.
+pub fn matches(command: &str, input: &str) -> bool {
+    let Some(typed) = input.strip_prefix('/') else {
+        return false;
+    };
+    let Some(command) = command.strip_prefix('/') else {
+        return false;
+    };
+    command
+        .split(':')
+        .scan(0, |offset, segment| {
+            let start = *offset;
+            *offset += segment.len() + 1;
+            Some(&command[start..])
+        })
+        .any(|segment| segment.starts_with(typed))
 }
 
 /// What the composer looks like to the completion list. The overlay borrows
@@ -928,5 +952,53 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(insights.len(), 1);
         assert!(!insights[0].built_in);
+    }
+
+    #[test]
+    fn a_segment_of_a_namespaced_command_matches() {
+        let catalog = vec![
+            completion("/superpowers:brainstorming"),
+            completion("/hookify:configure"),
+        ];
+
+        // The whole command still matches by prefix.
+        assert_eq!(completion_count(&catalog, "/super"), 1);
+        assert_eq!(completion_count(&catalog, "/superpowers:b"), 1);
+        // And so does the part after the namespace.
+        assert_eq!(completion_count(&catalog, "/brain"), 1);
+        assert_eq!(completion_count(&catalog, "/configure"), 1);
+        // A bare slash still matches everything.
+        assert_eq!(completion_count(&catalog, "/"), 2);
+        // Nonsense still matches nothing.
+        assert_eq!(completion_count(&catalog, "/zzz"), 0);
+    }
+
+    /// A segment match is not a prefix, so there is nothing for Tab to fill in
+    /// common across divergent matches — it falls through to accepting the
+    /// highlighted row, which is the existing behaviour.
+    #[test]
+    fn tab_fills_a_unique_segment_match_and_accepts_an_ambiguous_one() {
+        let catalog = vec![
+            completion("/superpowers:brainstorming"),
+            completion("/hookify:brainstorming-lite"),
+        ];
+
+        assert_eq!(
+            tab_completion(&catalog, "/superpowers:b", 0),
+            Some(TabCompletion::Fill("/superpowers:brainstorming".to_owned()))
+        );
+        assert_eq!(
+            tab_completion(&catalog, "/brain", 1),
+            Some(TabCompletion::Accept(completion("/hookify:brainstorming-lite")))
+        );
+    }
+
+    #[test]
+    fn matching_requires_a_leading_slash_and_a_segment_boundary() {
+        assert!(matches("/superpowers:brainstorming", "/brain"));
+        assert!(matches("/superpowers:brainstorming", "/superpowers"));
+        // "storming" starts mid-segment, so it does not match.
+        assert!(!matches("/superpowers:brainstorming", "/storming"));
+        assert!(!matches("/superpowers:brainstorming", "brain"));
     }
 }
