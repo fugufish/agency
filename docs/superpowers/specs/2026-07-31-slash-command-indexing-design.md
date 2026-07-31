@@ -104,8 +104,8 @@ Sources and their names:
 | Personal commands | `~/.claude/commands/**/<file>.md` | `/<file>` |
 | Project skills | `<workspace>/.claude/skills/<dir>/SKILL.md` | `/<dir>` |
 | Project commands | `<workspace>/.claude/commands/**/<file>.md` | `/<file>` |
-| Plugin skills | `<installPath>/skills/<dir>/SKILL.md` | `/<plugin>:<frontmatter name, else dir>` |
-| Plugin root skill | `<installPath>/SKILL.md` | `/<plugin>:<frontmatter name, else plugin>` |
+| Plugin skills | `<installPath>/skills/<dir>/SKILL.md` | `/<plugin>:<frontmatter name if command-shaped, else dir>` |
+| Plugin root skill | `<installPath>/SKILL.md` | `/<plugin>:<frontmatter name if command-shaped, else plugin>` |
 | Plugin commands | `<installPath>/commands/**/<file>.md` | `/<plugin>:<file>` |
 
 Naming rules follow Claude Code's documented behavior. For personal and project
@@ -113,6 +113,14 @@ entries the frontmatter `name` is a display label only — the command comes fro
 the directory or file name. For plugin skills, frontmatter `name` replaces the
 last segment while the plugin prefix stays. A plugin with a root `SKILL.md`, no
 `skills/` directory, and no `skills` manifest key is a single-skill plugin.
+
+The rename rule needs a guard the documentation does not state. It assumes a
+command-shaped `name`, but real plugins ship human-readable display names: the
+installed `hookify` plugin's `skills/writing-rules/SKILL.md` carries
+`name: Writing Hookify Rules`, and Claude Code still invokes it as
+`/hookify:writing-rules`. So the frontmatter `name` is honored only when it is
+non-empty and contains no whitespace; otherwise the directory name wins. Without
+this the catalog lists a command nobody can type and omits the one that works.
 
 Shadowing, again per Claude Code: personal overrides project, and either
 overrides a built-in of the same name. A skill beats a command of the same name.
