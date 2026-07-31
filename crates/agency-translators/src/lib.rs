@@ -2,11 +2,23 @@ pub mod claude;
 pub mod codex;
 pub mod native;
 
+use agency_translator_api::commands::CommandCatalog;
 use agency_translator_api::{
     ClientId, ExportResult, ImportResult, NativeArtifact, SessionTranslator, TranslationError,
 };
 
 pub fn built_in(client: &ClientId) -> Option<Box<dyn SessionTranslator>> {
+    match client.0.as_str() {
+        "claude-code" => Some(Box::new(claude::ClaudeTranslator::default())),
+        "codex" => Some(Box::new(codex::CodexTranslator)),
+        _ => None,
+    }
+}
+
+/// The command catalog for a client, when one is registered. This is the same
+/// registry as [`built_in`], kept separate because a translator may know how
+/// to read a transcript without knowing how to enumerate commands.
+pub fn command_catalog(client: &ClientId) -> Option<Box<dyn CommandCatalog>> {
     match client.0.as_str() {
         "claude-code" => Some(Box::new(claude::ClaudeTranslator::default())),
         "codex" => Some(Box::new(codex::CodexTranslator)),
@@ -68,5 +80,12 @@ mod tests {
         assert_eq!(items.len(), 2);
         assert_eq!(items[0]["role"], "user");
         assert_eq!(items[1]["role"], "assistant");
+    }
+
+    #[test]
+    fn both_built_in_clients_expose_a_command_catalog() {
+        assert!(command_catalog(&ClientId::new("claude-code")).is_some());
+        assert!(command_catalog(&ClientId::new("codex")).is_some());
+        assert!(command_catalog(&ClientId::new("nobody")).is_none());
     }
 }

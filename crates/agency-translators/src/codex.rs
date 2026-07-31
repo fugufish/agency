@@ -1,3 +1,6 @@
+use std::path::{Path, PathBuf};
+
+use agency_translator_api::commands::{AgentCommand, CommandCatalog};
 use agency_translator_api::{
     ClientId, ContentBlock, Conversation, ConversationEvent, ConversationUpdate, EventPayload,
     ExportResult, ImportResult, LiveEventTranslator, MessageRole, NativeArtifact, NativeEnvelope,
@@ -5,6 +8,8 @@ use agency_translator_api::{
     TranslatorDescriptor, tools,
 };
 use serde_json::{Value, json};
+
+mod commands;
 
 const CLIENT: &str = "codex";
 
@@ -82,6 +87,15 @@ impl LiveEventTranslator for CodexTranslator {
             }
             _ => Ok(Vec::new()),
         }
+    }
+}
+
+impl CommandCatalog for CodexTranslator {
+    fn commands(&self, workspace: &Path) -> Vec<AgentCommand> {
+        let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
+            return Vec::new();
+        };
+        commands::catalog(&home, workspace)
     }
 }
 
