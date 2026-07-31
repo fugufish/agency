@@ -2038,7 +2038,7 @@ impl Agency {
                 );
                 return;
             }
-            if agent.session.provider() != provider {
+            if command_needs_agent_switch(agent.session.provider(), provider) {
                 self.start_agent(provider);
                 if !self
                     .active_agent()
@@ -5573,6 +5573,17 @@ fn collect_explorer_entries(
     }
 }
 
+/// Whether an accepted agent command has to be sent somewhere other than the
+/// agent the composer is pointed at.
+///
+/// The catalog lists every configured agent's commands in one list, so picking
+/// a Claude Code skill while Codex is focused is ordinary. Sending it where it
+/// was typed would hand Codex a command it has never heard of, so the submit
+/// path routes it to the agent that owns it instead.
+fn command_needs_agent_switch(active: Provider, command: Provider) -> bool {
+    active != command
+}
+
 fn window_geometry(id: window::Id, close_after: bool) -> Task<AppEvent> {
     window::size(id).then(move |size| {
         window::position(id).then(move |position| {
@@ -7108,6 +7119,58 @@ mod tests {
             argument_hint: None,
             origin: agency_translator_api::commands::CommandOrigin::Personal,
         }
+    }
+
+    /// A command belonging to another agent has to be routed there rather than
+    /// sent where it was typed.
+    #[test]
+    fn a_command_from_another_agent_needs_a_switch() {
+        assert!(command_needs_agent_switch(
+            Provider::Codex,
+            Provider::Claude
+        ));
+        assert!(command_needs_agent_switch(
+            Provider::Claude,
+            Provider::Codex
+        ));
+        assert!(!command_needs_agent_switch(
+            Provider::Claude,
+            Provider::Claude
+        ));
+        assert!(!command_needs_agent_switch(
+            Provider::Codex,
+            Provider::Codex
+        ));
+    }
+
+    /// The routing decision is only as good as the provider the catalog stamps
+    /// on each row, so this pins the two together: a Claude entry picked while
+    /// Codex is focused must route away, and Agency's own commands must carry no
+    /// provider at all so they never reach the switch.
+    #[test]
+    fn the_catalog_stamps_the_provider_that_routing_depends_on() {
+        let catalog = slash_commands::merge_catalog(vec![
+            (Provider::Claude, agent_command("superpowers:brainstorming")),
+            (Provider::Codex, agent_command("review")),
+        ]);
+
+        let brainstorming = catalog
+            .iter()
+            .find(|completion| completion.command == "/superpowers:brainstorming")
+            .expect("the Claude entry should be listed");
+        let owner = brainstorming
+            .provider
+            .expect("an agent command must name its owner or it cannot be routed");
+        assert_eq!(owner, Provider::Claude);
+        assert!(command_needs_agent_switch(Provider::Codex, owner));
+        assert!(!command_needs_agent_switch(Provider::Claude, owner));
+
+        // Agency handles its own commands, so there is nobody to switch to.
+        let init = catalog
+            .iter()
+            .find(|completion| completion.command == "/init")
+            .expect("Agency's own commands are always listed");
+        assert_eq!(init.provider, None);
     }
 
     // `slash_commands::tests::agency_commands_are_always_offered` and
