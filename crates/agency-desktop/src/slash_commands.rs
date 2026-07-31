@@ -21,7 +21,8 @@ pub enum SlashCommand {
     },
 }
 
-pub const PLUGIN_INSTALL_USAGE: &str = "Usage: /plugin install [--agent <codex|claude>] <url>";
+pub const PLUGIN_INSTALL_USAGE: &str =
+    "Usage: /plugin install [--agent <codex|claude>] <plugin[@marketplace] | marketplace source>";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SlashCommandCompletion {
@@ -68,7 +69,9 @@ pub fn slash_command_catalog(cwd: &Path) -> Vec<SlashCommandCompletion> {
         },
         SlashCommandCompletion {
             command: "/plugin install".to_owned(),
-            description: "Install a plugin source for every configured agent".to_owned(),
+            description:
+                "Install a plugin, or add a marketplace source, for every configured agent"
+                    .to_owned(),
             insertion: "/plugin install ".to_owned(),
             provider: None,
             built_in: false,
@@ -263,14 +266,15 @@ fn parse_plugin_install(arguments: &[&str]) -> Result<SlashCommand, String> {
     let mut arguments = arguments.iter().copied();
 
     while let Some(argument) = arguments.next() {
-        let named_agent =
-            if argument == "--agent" {
-                Some(arguments.next().ok_or_else(|| {
-                    "Usage: /plugin install --agent <codex|claude> <url>".to_owned()
-                })?)
-            } else {
-                argument.strip_prefix("--agent=")
-            };
+        let named_agent = if argument == "--agent" {
+            Some(
+                arguments
+                    .next()
+                    .ok_or_else(|| PLUGIN_INSTALL_USAGE.to_owned())?,
+            )
+        } else {
+            argument.strip_prefix("--agent=")
+        };
 
         match named_agent {
             Some(name) => {
@@ -513,7 +517,7 @@ mod tests {
         );
         assert_eq!(
             parse_slash_command("/plugin install url --agent").unwrap_err(),
-            "Usage: /plugin install --agent <codex|claude> <url>"
+            PLUGIN_INSTALL_USAGE
         );
         assert_eq!(
             parse_slash_command("/plugin install --scope user url").unwrap_err(),

@@ -1165,7 +1165,8 @@ impl Agency {
                     self.plugin_installs
                         .start(&conversation_id, &source, &targets, &self.cwd);
                 self.notice = Some(format!(
-                    "Installing plugin source {source} with {}",
+                    "Installing {} with {}",
+                    plugins::install_kind(&source).describe(&source),
                     targets
                         .iter()
                         .map(|provider| provider.label())
@@ -1179,6 +1180,7 @@ impl Agency {
             AppEvent::PluginInstall(event) => {
                 if let PluginInstallEvent::Finished {
                     provider,
+                    kind,
                     status,
                     detail,
                     ..
@@ -1191,9 +1193,14 @@ impl Agency {
                                 provider.label()
                             )
                         }
-                        (plugins::InstallStatus::Installed, None) => {
-                            format!("{} installed the plugin source", provider.label())
-                        }
+                        (plugins::InstallStatus::Installed, None) => match kind {
+                            plugins::InstallKind::Marketplace => {
+                                format!("{} added the marketplace source", provider.label())
+                            }
+                            plugins::InstallKind::Plugin => {
+                                format!("{} installed the plugin", provider.label())
+                            }
+                        },
                         (status, None) => format!(
                             "{} plugin install {}",
                             provider.label(),

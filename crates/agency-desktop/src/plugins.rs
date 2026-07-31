@@ -5,11 +5,72 @@ use agency_mux::CommandSpec;
 
 use crate::terminal::{HeadlessOutcome, HeadlessTerminal};
 
-/// The command Agency runs to install a plugin source for an agent. Both
-/// providers register plugin sources the same way, so the command stays
-/// provider-neutral apart from the executable.
+/// What one `/plugin install <source>` asks an agent to do. Registering a
+/// marketplace and installing a plugin from an already registered marketplace
+/// are separate operations in both agent CLIs, so Agency picks between them
+/// from the shape of the source.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InstallKind {
+    /// A marketplace source: an HTTPS or SSH Git URL, a relative or absolute
+    /// local path, or `owner/repo[@ref]`.
+    Marketplace,
+    /// A plugin selector: `plugin` or `plugin@marketplace`.
+    Plugin,
+}
+
+impl InstallKind {
+    /// How the operation reads in a notice, as a verb phrase.
+    pub fn describe(self, source: &str) -> String {
+        match self {
+            Self::Marketplace => format!("marketplace source {source}"),
+            Self::Plugin => format!("plugin {source}"),
+        }
+    }
+}
+
+/// Classifies what a user typed after `/plugin install`. Marketplace sources
+/// are the only sources that carry a path separator, a scheme, or an SSH
+/// prefix; a plugin selector is a bare name optionally qualified by the
+/// marketplace it comes from. A local marketplace directory must therefore be
+/// written as a path (`./marketplace`), matching how both agent CLIs document
+/// their own marketplace sources.
+pub fn install_kind(source: &str) -> InstallKind {
+    let looks_like_marketplace = source.contains("://")
+        || source.starts_with("git@")
+        || source.starts_with('~')
+        || source.contains('/')
+        || source.ends_with(".git");
+    if looks_like_marketplace {
+        InstallKind::Marketplace
+    } else {
+        InstallKind::Plugin
+    }
+}
+
+/// The command Agency runs for one agent. Both agents register marketplaces
+/// with `plugin marketplace add`, but they spell the install step differently:
+/// Claude Code uses `plugin install`, Codex uses `plugin add`. Running the
+/// wrong verb fails, so the subcommand is resolved per provider rather than
+/// shared.
 pub fn install_command(provider: Provider, source: &str) -> CommandSpec {
-    CommandSpec::new(provider.command(), ["plugin", "marketplace", "add", source])
+    match install_kind(source) {
+        InstallKind::Marketplace => {
+            CommandSpec::new(provider.command(), ["plugin", "marketplace", "add", source])
+        }
+        InstallKind::Plugin => CommandSpec::new(
+            provider.command(),
+            ["plugin", install_verb(provider), source],
+        ),
+    }
+}
+
+/// The subcommand each agent uses to install a plugin from a registered
+/// marketplace.
+fn install_verb(provider: Provider) -> &'static str {
+    match provider {
+        Provider::Claude => "install",
+        Provider::Codex => "add",
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -49,6 +110,7 @@ pub enum PluginInstallEvent {
         id: u64,
         conversation_id: String,
         provider: Provider,
+        kind: InstallKind,
         status: InstallStatus,
         detail: Option<String>,
     },
@@ -83,6 +145,7 @@ struct Run {
     id: u64,
     conversation_id: String,
     provider: Provider,
+    kind: InstallKind,
     terminal: HeadlessTerminal,
     output: String,
 }
@@ -97,11 +160,13 @@ impl PluginInstalls {
         cwd: &Path,
     ) -> Vec<PluginInstallEvent> {
         let mut events = Vec::new();
+        let kind = install_kind(source);
 
         for provider in targets.iter().copied() {
             self.spawn(
                 conversation_id,
                 provider,
+                kind,
                 install_command(provider, source),
                 cwd,
                 &mut events,
@@ -117,6 +182,7 @@ impl PluginInstalls {
         &mut self,
         conversation_id: &str,
         provider: Provider,
+        kind: InstallKind,
         command: CommandSpec,
         cwd: &Path,
         events: &mut Vec<PluginInstallEvent>,
@@ -135,6 +201,7 @@ impl PluginInstalls {
                 id,
                 conversation_id: conversation_id.to_owned(),
                 provider,
+                kind,
                 terminal,
                 output: String::new(),
             }),
@@ -142,6 +209,7 @@ impl PluginInstalls {
                 id,
                 conversation_id: conversation_id.to_owned(),
                 provider,
+                kind,
                 status: InstallStatus::Failed,
                 detail: Some(error),
             }),
@@ -183,6 +251,7 @@ impl PluginInstalls {
                 id: run.id,
                 conversation_id: run.conversation_id.clone(),
                 provider: run.provider,
+                kind: run.kind,
                 status,
                 detail,
             });
@@ -290,15 +359,42 @@ mod tests {
     }
 
     #[test]
-    fn installs_run_the_same_command_for_every_agent() {
-        assert_eq!(
-            install_command(Provider::Claude, "https://example.com/plugins").display(),
-            "claude plugin marketplace add https://example.com/plugins"
-        );
-        assert_eq!(
-            install_command(Provider::Codex, "owner/repo").display(),
-            "codex plugin marketplace add owner/repo"
-        );
+    fn marketplace_sources_are_registered_the_same_way_by_every_agent() {
+        for source in [
+            "https://example.com/plugins",
+            "git@github.com:owner/repo.git",
+            "owner/repo@main",
+            "./marketplace",
+            "/srv/marketplace",
+            "~/marketplace",
+        ] {
+            assert_eq!(install_kind(source), InstallKind::Marketplace, "{source}");
+            assert_eq!(
+                install_command(Provider::Claude, source).display(),
+                format!("claude plugin marketplace add {source}")
+            );
+            assert_eq!(
+                install_command(Provider::Codex, source).display(),
+                format!("codex plugin marketplace add {source}")
+            );
+        }
+    }
+
+    /// Claude Code installs a plugin with `plugin install`, Codex with
+    /// `plugin add`. Sharing one verb makes the install fail for one of them.
+    #[test]
+    fn plugin_selectors_use_each_agents_own_install_subcommand() {
+        for source in ["superpowers", "superpowers@superpowers-marketplace"] {
+            assert_eq!(install_kind(source), InstallKind::Plugin, "{source}");
+            assert_eq!(
+                install_command(Provider::Claude, source).display(),
+                format!("claude plugin install {source}")
+            );
+            assert_eq!(
+                install_command(Provider::Codex, source).display(),
+                format!("codex plugin add {source}")
+            );
+        }
     }
 
     #[test]
@@ -341,6 +437,7 @@ mod tests {
                 id: 2,
                 conversation_id: "conversation".to_owned(),
                 provider: Provider::Codex,
+                kind: InstallKind::Marketplace,
                 status: InstallStatus::Failed,
                 detail: Some("Codex exited with status 1".to_owned()),
             },
@@ -380,6 +477,7 @@ mod tests {
         let id = installs.spawn(
             "conversation",
             Provider::Codex,
+            InstallKind::Marketplace,
             CommandSpec::new("agency-agent-that-does-not-exist", ["plugin"]),
             Path::new("."),
             &mut events,
