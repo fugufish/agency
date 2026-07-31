@@ -40,11 +40,11 @@ use agency_rpc::{
     ENV_CONVERSATION_ID, ENV_MCP_COMMAND, ENV_RPC_SOCKET, ENV_SESSION_TOKEN,
     Response as RpcResponse, Server as RpcServer, SessionCapabilities, SessionContext,
 };
+use agency_translator_api::commands::AgentCommand;
 use agency_translator_api::{
     ClientId, ContentBlock, Conversation, ConversationEvent, ConversationUpdate, EventPayload,
     MessageRole, tools,
 };
-use agency_translator_api::commands::AgentCommand;
 use config::{DefaultAgent, GlobalConfig, ModeColors, WindowState};
 use diffs::{DiffLineKind, DiffSessionState, file_changes, renderable_diff_lines};
 use keybindings::{
@@ -55,8 +55,9 @@ use plugins::{PluginInstallEntry, PluginInstallEvent, PluginInstalls, Transcript
 use sessions::{SessionRegistry, name_from_prompt, new_conversation_id};
 use slash_commands::{
     ComposerState, INIT_AGENT_PROMPT, SlashCommand, SlashCommandCompletion, SlashCompletionState,
-    TabCompletion, agency_commands, completion_count, discover_agent_commands, initialize_workspace,
-    load_codex_mcp, merge_catalog, parse_slash_command, slash_command_completions, tab_completion,
+    TabCompletion, agency_commands, completion_count, discover_agent_commands,
+    initialize_workspace, load_codex_mcp, merge_catalog, parse_slash_command,
+    slash_command_completions, tab_completion,
 };
 use terminal::TerminalSession;
 use worktrees::Worktree;
@@ -898,8 +899,13 @@ enum AppEvent {
     SelectAgent(Provider),
 }
 
-impl Default for Agency {
-    fn default() -> Self {
+impl Agency {
+    /// Shared by `Default` and the test-only constructor below. `spawn_agent_and_rpc`
+    /// gates the two effects a unit test must never trigger: binding the RPC unix
+    /// socket and spawning a real `codex`/`claude` child process. Everything else
+    /// (config load, worktree discovery, session registry) is read-only and safe
+    /// to run in either path.
+    fn build(spawn_agent_and_rpc: bool) -> Self {
         let (config, notice) = match GlobalConfig::load() {
             Ok(config) => (config, None),
             Err(error) => (GlobalConfig::default(), Some(error)),
@@ -937,9 +943,13 @@ impl Default for Agency {
         };
         let rpc_capabilities = SessionCapabilities::default();
         let slash_command_catalog = agency_commands();
-        let (rpc_server, rpc_notice) = match RpcServer::start(rpc_capabilities.clone()) {
-            Ok(server) => (Some(server), None),
-            Err(error) => (None, Some(error)),
+        let (rpc_server, rpc_notice) = if spawn_agent_and_rpc {
+            match RpcServer::start(rpc_capabilities.clone()) {
+                Ok(server) => (Some(server), None),
+                Err(error) => (None, Some(error)),
+            }
+        } else {
+            (None, None)
         };
 
         let mut agency = Self {
@@ -979,11 +989,43 @@ impl Default for Agency {
             plugin_installs: PluginInstalls::default(),
         };
         let startup_notice = agency.notice.take();
-        agency.start_agent(default_agent);
+        if spawn_agent_and_rpc {
+            agency.start_agent(default_agent);
+        }
         if agency.notice.is_none() {
             agency.notice = startup_notice;
         }
         agency
+    }
+}
+
+impl Default for Agency {
+    fn default() -> Self {
+        Self::build(true)
+    }
+}
+
+#[cfg(test)]
+impl Agency {
+    /// `Default` binds a real RPC socket and spawns a real agent process, which a
+    /// unit test must never do: nothing frees either when the test ends, so a
+    /// full suite run leaks a child process per test, and parallel tests race
+    /// over the same pid-derived socket path. Reducer tests that only care about
+    /// state transitions use this instead.
+    fn for_testing() -> Self {
+        Self::build(false)
+    }
+
+    /// Reducer tests call `reduce_event` directly rather than `update`, so
+    /// nothing else drains the bus for them. This gives a test the same view
+    /// `update`'s loop would have had, without processing the follow-up events
+    /// (which would blur "did this handler publish X" into "what did X do").
+    fn drain_events(&mut self) -> Vec<AppEvent> {
+        let mut events = Vec::new();
+        while let Some(envelope) = self.event_bus.next() {
+            events.push(envelope.event);
+        }
+        events
     }
 }
 
@@ -2135,6 +2177,13 @@ impl Agency {
             return Err(format!("MCP server {name:?} is already connected"));
         }
         let server = load_codex_mcp(name)?;
+        self.connect_mcp_server(name, server)
+    }
+
+    /// Everything after Codex has confirmed the server exists, split out from
+    /// `add_mcp_server` so a test can exercise the reconnect-and-refresh
+    /// behavior without shelling out to a real `codex` binary.
+    fn connect_mcp_server(&mut self, name: &str, server: McpServer) -> Result<(), String> {
         if !server.enabled {
             return Err(format!("MCP server {name:?} is disabled in Codex"));
         }
@@ -7057,32 +7106,46 @@ mod tests {
         }
     }
 
+    // `slash_commands::tests::agency_commands_are_always_offered` and
+    // `a_translator_command_keeps_its_invocation_and_origin` already cover
+    // `merge_catalog`'s pure behavior (agency commands always present, agent
+    // commands take their own invocation). The reducer tests below instead
+    // pin how `Agency` *uses* that function: that loading is a replace, not
+    // an accumulate, and that failure leaves the prior state alone.
+
     #[test]
-    fn a_loaded_catalog_replaces_the_agent_half_and_keeps_agency_commands() {
-        let mut catalog = slash_commands::agency_commands();
-        let agency_count = catalog.len();
+    fn a_second_loaded_catalog_replaces_the_first_rather_than_accumulating() {
+        let mut agency = Agency::for_testing();
 
-        catalog = slash_commands::merge_catalog(vec![(Provider::Claude, agent_command("deploy"))]);
+        let _ = agency.reduce_event(AppEvent::SlashCatalogLoaded(vec![(
+            Provider::Claude,
+            agent_command("deploy"),
+        )]));
+        let _ = agency.reduce_event(AppEvent::SlashCatalogLoaded(vec![(
+            Provider::Claude,
+            agent_command("audit"),
+        )]));
 
-        assert_eq!(catalog.len(), agency_count + 1);
-        assert!(catalog.iter().any(|completion| completion.command == "/init"));
-        assert!(catalog.iter().any(|completion| completion.command == "/deploy"));
-
-        // A second load replaces the first rather than accumulating.
-        catalog = slash_commands::merge_catalog(vec![(Provider::Claude, agent_command("audit"))]);
-        assert_eq!(catalog.len(), agency_count + 1);
-        assert!(!catalog.iter().any(|completion| completion.command == "/deploy"));
+        assert!(
+            agency
+                .slash_command_catalog
+                .iter()
+                .any(|completion| completion.command == "/audit")
+        );
+        assert!(
+            !agency
+                .slash_command_catalog
+                .iter()
+                .any(|completion| completion.command == "/deploy")
+        );
     }
 
     #[test]
-    // Overwriting one field of a freshly defaulted `Agency` is exactly the
-    // scenario under test (a catalog already populated before a failed
-    // reload), not a struct clippy should rewrite into initializer syntax.
-    #[allow(clippy::field_reassign_with_default)]
     fn a_failed_load_leaves_the_previous_catalog_in_place() {
-        let mut agency = Agency::default();
-        agency.slash_command_catalog =
+        let mut agency = Agency::for_testing();
+        let loaded =
             slash_commands::merge_catalog(vec![(Provider::Claude, agent_command("deploy"))]);
+        agency.slash_command_catalog = loaded;
         let before = agency.slash_command_catalog.clone();
 
         let _ = agency.reduce_event(AppEvent::SlashCatalogFailed("disk on fire".to_owned()));
@@ -7092,8 +7155,9 @@ mod tests {
     }
 
     #[test]
-    fn a_loaded_catalog_is_stored_and_clears_no_notice() {
-        let mut agency = Agency::default();
+    fn a_loaded_catalog_is_stored_and_leaves_any_existing_notice_untouched() {
+        let mut agency = Agency::for_testing();
+        agency.notice = Some("unrelated notice".to_owned());
 
         let _ = agency.reduce_event(AppEvent::SlashCatalogLoaded(vec![(
             Provider::Claude,
@@ -7105,6 +7169,124 @@ mod tests {
                 .slash_command_catalog
                 .iter()
                 .any(|completion| completion.command == "/deploy")
+        );
+        // Unlike SlashCatalogFailed, a successful load has no notice of its
+        // own to report, and must not clobber one set by something else.
+        assert_eq!(agency.notice.as_deref(), Some("unrelated notice"));
+    }
+
+    #[test]
+    fn a_loaded_or_failed_catalog_publishes_no_follow_up_events() {
+        // Both handlers only assign a field; if either started publishing
+        // events, a loaded/failed catalog could re-trigger its own reload.
+        let mut agency = Agency::for_testing();
+
+        let _ = agency.reduce_event(AppEvent::SlashCatalogLoaded(Vec::new()));
+        assert!(agency.drain_events().is_empty());
+
+        let _ = agency.reduce_event(AppEvent::SlashCatalogFailed("disk on fire".to_owned()));
+        assert!(agency.drain_events().is_empty());
+    }
+
+    #[test]
+    fn switching_worktrees_reseeds_agency_commands_and_requests_a_reload() {
+        let mut agency = Agency::for_testing();
+        agency.slash_command_catalog =
+            slash_commands::merge_catalog(vec![(Provider::Claude, agent_command("deploy"))]);
+
+        let other_root =
+            std::env::temp_dir().join(format!("agency-worktree-switch-{}", std::process::id()));
+        std::fs::create_dir_all(&other_root).unwrap();
+        agency.worktrees.push(Worktree {
+            label: "other".to_owned(),
+            path: other_root.clone(),
+            branch: None,
+        });
+        let other_index = agency.worktrees.len() - 1;
+        assert_ne!(other_index, agency.active_worktree);
+
+        let _ = agency.reduce_event(AppEvent::SelectWorktree(other_index));
+
+        // The agent half is stale the instant cwd changes, so the catalog
+        // drops back to what's always available while the reload is pending.
+        assert_eq!(
+            agency.slash_command_catalog,
+            slash_commands::agency_commands()
+        );
+        assert!(
+            agency
+                .drain_events()
+                .iter()
+                .any(|event| matches!(event, AppEvent::SlashCatalogRequested))
+        );
+
+        std::fs::remove_dir_all(&other_root).unwrap();
+    }
+
+    #[test]
+    fn a_finished_plugin_install_requests_a_reload_but_other_plugin_events_do_not() {
+        let mut agency = Agency::for_testing();
+        let finished = PluginInstallEvent::Finished {
+            id: 1,
+            conversation_id: "conversation".to_owned(),
+            provider: Provider::Claude,
+            kind: plugins::InstallKind::Plugin,
+            status: plugins::InstallStatus::Installed,
+            detail: None,
+        };
+
+        let _ = agency.reduce_event(AppEvent::PluginInstall(finished));
+
+        assert!(
+            agency
+                .drain_events()
+                .iter()
+                .any(|event| matches!(event, AppEvent::SlashCatalogRequested))
+        );
+
+        // Output streams one event per chunk of terminal text; re-indexing on
+        // every chunk would make every plugin install feel like it stalls.
+        let output = PluginInstallEvent::Output {
+            id: 1,
+            conversation_id: "conversation".to_owned(),
+            provider: Provider::Claude,
+            output: "installing...".to_owned(),
+        };
+
+        let _ = agency.reduce_event(AppEvent::PluginInstall(output));
+
+        assert!(
+            !agency
+                .drain_events()
+                .iter()
+                .any(|event| matches!(event, AppEvent::SlashCatalogRequested))
+        );
+    }
+
+    #[test]
+    fn connecting_an_mcp_server_requests_a_reload() {
+        // `add_mcp_server` itself shells out to a real `codex` binary to look
+        // the server up; `connect_mcp_server` is everything after that lookup
+        // succeeds, which is what actually wires the reload trigger in.
+        let mut agency = Agency::for_testing();
+        let server = McpServer {
+            name: "example".to_owned(),
+            enabled: true,
+            transport: McpTransport::Stdio {
+                command: "example-mcp".to_owned(),
+                args: Vec::new(),
+                env: None,
+                cwd: None,
+            },
+        };
+
+        agency.connect_mcp_server("example", server).unwrap();
+
+        assert!(
+            agency
+                .drain_events()
+                .iter()
+                .any(|event| matches!(event, AppEvent::SlashCatalogRequested))
         );
     }
 }
