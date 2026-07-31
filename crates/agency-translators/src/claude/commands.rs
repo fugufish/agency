@@ -11,6 +11,8 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use agency_translator_api::commands::{AgentCommand, CommandOrigin};
+use agency_translator_api::discovery::{self, DiscoveredFile};
 use serde_json::Value;
 
 /// A plugin as `installed_plugins.json` records it.
@@ -148,6 +150,192 @@ fn paths(install_path: &Path, value: Option<&Value>) -> Option<Vec<PathBuf>> {
 
 fn read_json(path: &Path) -> Option<Value> {
     serde_json::from_str(&fs::read_to_string(path).ok()?).ok()
+}
+
+/// The commands Claude Code ships. Only the ones that make sense to send from
+/// Agency's composer are listed: session controls such as `/exit` or `/login`
+/// act on Claude Code's own terminal UI, which Agency does not present. Claude
+/// Code's `/init` is omitted because Agency owns that command.
+const BUILT_INS: [(&str, &str); 27] = [
+    ("agents", "Create or manage subagents"),
+    ("batch", "Orchestrate large-scale changes across a codebase in parallel"),
+    ("claude-api", "Load Claude API reference material"),
+    ("code-review", "Review the current diff for bugs and cleanup opportunities"),
+    ("compact", "Free up context by summarizing the conversation"),
+    ("context", "Visualize current context usage"),
+    ("cost", "Show token usage and costs for the current session"),
+    ("dataviz", "Design guidance for charts, graphs, and dashboards"),
+    ("debug", "Enable debug logging and troubleshoot issues"),
+    ("deep-research", "Fan out web searches and synthesize a cited report"),
+    ("design-sync", "Convert a React design system and upload it to Claude Design"),
+    ("diff", "Open an interactive diff viewer for uncommitted changes"),
+    ("doctor", "Run a setup checkup that diagnoses and fixes issues"),
+    ("export", "Export the current conversation as plain text"),
+    ("fewer-permission-prompts", "Add an allowlist to reduce permission prompts"),
+    ("goal", "Set a goal to keep working until a condition is met"),
+    ("hooks", "View hook configurations for tool events"),
+    ("insights", "Generate a usage insights report"),
+    ("loop", "Run a prompt repeatedly while the session stays open"),
+    ("mcp", "Manage MCP server connections"),
+    ("memory", "Edit CLAUDE.md memory files"),
+    ("model", "Switch the model for this session"),
+    ("permissions", "View and manage permission rules"),
+    ("rewind", "Roll code and conversation back to a checkpoint"),
+    ("status", "Show the current session status and model"),
+    ("usage", "Show token usage and costs for the current session"),
+    ("verify", "Verify code correctness and best practices"),
+];
+
+/// Every command Claude Code can run in `workspace`.
+///
+/// Sources are pushed in increasing precedence and a later entry replaces an
+/// earlier one of the same name. Claude Code resolves a clash in favour of the
+/// personal entry over the project one, and a skill over a command, so the
+/// order below is built-ins, project commands, project skills, personal
+/// commands, personal skills. Plugin entries are namespaced and cannot clash,
+/// so they are appended last without participating in the shadowing.
+pub(super) fn catalog(home: &Path, workspace: &Path) -> Vec<AgentCommand> {
+    let mut commands = BUILT_INS
+        .into_iter()
+        .map(|(name, description)| command(name.to_owned(), description.to_owned(), None, CommandOrigin::BuiltIn))
+        .collect::<Vec<_>>();
+
+    for (root, origin) in [
+        (workspace.join(".claude"), CommandOrigin::Project),
+        (home.join(".claude"), CommandOrigin::Personal),
+    ] {
+        for file in discovery::command_files(&root.join("commands")) {
+            push(&mut commands, local(file, origin.clone()));
+        }
+        for file in discovery::skill_directories(&root.join("skills")) {
+            push(&mut commands, local(file, origin.clone()));
+        }
+    }
+
+    let enabled = enabled_plugins(home, workspace);
+    for plugin in installed_plugins(home) {
+        let manifest = manifest(&plugin.install_path);
+        if !is_enabled(&plugin, &enabled, &manifest) {
+            continue;
+        }
+        commands.extend(plugin_commands(&plugin, &manifest));
+    }
+
+    commands
+}
+
+/// One plugin's contribution, already namespaced.
+fn plugin_commands(plugin: &InstalledPlugin, manifest: &Manifest) -> Vec<AgentCommand> {
+    let origin = CommandOrigin::Plugin {
+        plugin: plugin.name.clone(),
+        marketplace: plugin.marketplace.clone(),
+    };
+    let mut commands = Vec::new();
+
+    // `commands` in the manifest replaces the default directory; `skills` adds
+    // to it. The asymmetry is Claude Code's, not ours.
+    let command_roots = manifest
+        .commands
+        .clone()
+        .unwrap_or_else(|| vec![plugin.install_path.join("commands")]);
+    for root in command_roots {
+        // A manifest entry may name a single file rather than a directory.
+        let files = if root.is_file() {
+            root.file_stem()
+                .map(|stem| DiscoveredFile {
+                    name: stem.to_string_lossy().into_owned(),
+                    path: root.clone(),
+                })
+                .into_iter()
+                .collect()
+        } else {
+            discovery::command_files(&root)
+        };
+        for file in files {
+            let contents = read(&file.path);
+            commands.push(command(
+                format!("{}:{}", plugin.name, file.name),
+                discovery::describe(&contents),
+                discovery::frontmatter(&contents).argument_hint,
+                origin.clone(),
+            ));
+        }
+    }
+
+    let mut skill_roots = vec![plugin.install_path.join("skills")];
+    skill_roots.extend(manifest.skills.iter().cloned());
+    let mut found_any_skill = false;
+    for root in skill_roots {
+        for file in discovery::skill_directories(&root) {
+            found_any_skill = true;
+            let contents = read(&file.path);
+            let parsed = discovery::frontmatter(&contents);
+            // In a plugin skill the frontmatter name replaces the last segment
+            // and the plugin prefix stays in place.
+            let segment = parsed.name.clone().unwrap_or(file.name);
+            commands.push(command(
+                format!("{}:{segment}", plugin.name),
+                discovery::describe(&contents),
+                parsed.argument_hint,
+                origin.clone(),
+            ));
+        }
+    }
+
+    // A plugin with a root SKILL.md, no skills directory and no skills
+    // manifest key is a single-skill plugin.
+    let root_skill = plugin.install_path.join("SKILL.md");
+    if !found_any_skill && manifest.skills.is_empty() && root_skill.is_file() {
+        let contents = read(&root_skill);
+        let parsed = discovery::frontmatter(&contents);
+        let segment = parsed.name.clone().unwrap_or_else(|| plugin.name.clone());
+        commands.push(command(
+            format!("{}:{segment}", plugin.name),
+            discovery::describe(&contents),
+            parsed.argument_hint,
+            origin,
+        ));
+    }
+
+    commands
+}
+
+/// A personal or project entry. At these levels the frontmatter `name` is a
+/// display label only — the command comes from the directory or file name.
+fn local(file: DiscoveredFile, origin: CommandOrigin) -> AgentCommand {
+    let contents = read(&file.path);
+    command(
+        file.name,
+        discovery::describe(&contents),
+        discovery::frontmatter(&contents).argument_hint,
+        origin,
+    )
+}
+
+fn command(
+    name: String,
+    description: String,
+    argument_hint: Option<String>,
+    origin: CommandOrigin,
+) -> AgentCommand {
+    AgentCommand {
+        invocation: format!("/{name} "),
+        name,
+        description,
+        argument_hint,
+        origin,
+    }
+}
+
+/// Replaces any entry already holding this name, so the caller's push order is
+/// the precedence order.
+fn push(commands: &mut Vec<AgentCommand>, command: AgentCommand) {
+    commands.retain(|existing| existing.name != command.name);
+    commands.push(command);
+}
+
+fn read(path: &Path) -> String {
+    fs::read_to_string(path).unwrap_or_default()
 }
 
 #[cfg(test)]
@@ -297,5 +485,262 @@ mod tests {
         let mut enabled = HashMap::new();
         enabled.insert("a@m".to_owned(), false);
         assert!(!is_enabled(&plugin("a"), &enabled, &Manifest::default()));
+    }
+
+    fn skill(root: PathBuf, name: &str, description: &str) {
+        write(
+            root.join(name).join("SKILL.md"),
+            &format!("---\nname: {name}\ndescription: {description}\n---\nBody\n"),
+        );
+    }
+
+    fn named(commands: &[AgentCommand], name: &str) -> Option<AgentCommand> {
+        commands.iter().find(|command| command.name == name).cloned()
+    }
+
+    #[test]
+    fn personal_and_project_entries_are_indexed_without_a_namespace() {
+        let home = scratch("levels-home");
+        let workspace = scratch("levels-workspace");
+        skill(home.join(".claude/skills"), "deploy", "Ship it");
+        write(
+            workspace.join(".claude/commands/audit.md"),
+            "---\ndescription: Audit the repo\nargument-hint: [path]\n---\n",
+        );
+
+        let commands = catalog(&home, &workspace);
+
+        let deploy = named(&commands, "deploy").unwrap();
+        assert_eq!(deploy.description, "Ship it");
+        assert_eq!(deploy.invocation, "/deploy ");
+        assert_eq!(deploy.origin, CommandOrigin::Personal);
+
+        let audit = named(&commands, "audit").unwrap();
+        assert_eq!(audit.origin, CommandOrigin::Project);
+        assert_eq!(audit.argument_hint.as_deref(), Some("[path]"));
+
+        fs::remove_dir_all(home).unwrap();
+        fs::remove_dir_all(workspace).unwrap();
+    }
+
+    /// Claude Code resolves a name clash in favour of the personal skill, which
+    /// is the opposite of the usual project-wins intuition.
+    #[test]
+    fn a_personal_entry_shadows_a_project_entry_of_the_same_name() {
+        let home = scratch("shadow-home");
+        let workspace = scratch("shadow-workspace");
+        skill(home.join(".claude/skills"), "deploy", "Personal");
+        skill(workspace.join(".claude/skills"), "deploy", "Project");
+
+        let commands = catalog(&home, &workspace);
+
+        let deploy = commands
+            .iter()
+            .filter(|command| command.name == "deploy")
+            .collect::<Vec<_>>();
+        assert_eq!(deploy.len(), 1);
+        assert_eq!(deploy[0].description, "Personal");
+        fs::remove_dir_all(home).unwrap();
+        fs::remove_dir_all(workspace).unwrap();
+    }
+
+    #[test]
+    fn a_skill_beats_a_command_of_the_same_name() {
+        let home = scratch("skill-beats-home");
+        let workspace = scratch("skill-beats-workspace");
+        skill(home.join(".claude/skills"), "deploy", "From the skill");
+        write(
+            home.join(".claude/commands/deploy.md"),
+            "---\ndescription: From the command\n---\n",
+        );
+
+        let commands = catalog(&home, &workspace);
+
+        assert_eq!(named(&commands, "deploy").unwrap().description, "From the skill");
+        fs::remove_dir_all(home).unwrap();
+        fs::remove_dir_all(workspace).unwrap();
+    }
+
+    /// Sets up a plugin in the cache and registers it in
+    /// `installed_plugins.json` under `<name>@marketplace`.
+    fn install(home: &Path, name: &str, manifest_json: Option<&str>) -> PathBuf {
+        let install_path = home.join("cache").join(name);
+        fs::create_dir_all(&install_path).unwrap();
+        if let Some(manifest_json) = manifest_json {
+            write(install_path.join(".claude-plugin/plugin.json"), manifest_json);
+        }
+        write(
+            home.join(".claude/plugins/installed_plugins.json"),
+            &format!(
+                r#"{{"version":2,"plugins":{{"{name}@marketplace":[{{"scope":"user","installPath":"{}"}}]}}}}"#,
+                install_path.display()
+            ),
+        );
+        install_path
+    }
+
+    #[test]
+    fn plugin_entries_are_namespaced_and_carry_their_origin() {
+        let home = scratch("plugin-home");
+        let workspace = scratch("plugin-workspace");
+        let install = install(&home, "superpowers", None);
+        skill(install.join("skills"), "brainstorming", "Turn ideas into designs");
+        write(
+            install.join("commands/status.md"),
+            "---\ndescription: Show status\n---\n",
+        );
+
+        let commands = catalog(&home, &workspace);
+
+        let brainstorming = named(&commands, "superpowers:brainstorming").unwrap();
+        assert_eq!(brainstorming.invocation, "/superpowers:brainstorming ");
+        assert_eq!(
+            brainstorming.origin,
+            CommandOrigin::Plugin {
+                plugin: "superpowers".to_owned(),
+                marketplace: "marketplace".to_owned(),
+            }
+        );
+        assert!(named(&commands, "superpowers:status").is_some());
+        fs::remove_dir_all(home).unwrap();
+        fs::remove_dir_all(workspace).unwrap();
+    }
+
+    /// In a plugin skill the frontmatter name replaces only the last segment.
+    #[test]
+    fn a_plugin_skill_frontmatter_name_replaces_the_last_segment_only() {
+        let home = scratch("rename-home");
+        let workspace = scratch("rename-workspace");
+        let install = install(&home, "demo", None);
+        write(
+            install.join("skills/review/SKILL.md"),
+            "---\nname: fancy\ndescription: Review\n---\n",
+        );
+
+        let commands = catalog(&home, &workspace);
+
+        assert!(named(&commands, "demo:fancy").is_some());
+        assert!(named(&commands, "demo:review").is_none());
+        fs::remove_dir_all(home).unwrap();
+        fs::remove_dir_all(workspace).unwrap();
+    }
+
+    #[test]
+    fn a_plugin_root_skill_file_becomes_a_single_skill_plugin() {
+        let home = scratch("root-skill-home");
+        let workspace = scratch("root-skill-workspace");
+        let install = install(&home, "solo", None);
+        write(install.join("SKILL.md"), "---\ndescription: The only one\n---\n");
+
+        let commands = catalog(&home, &workspace);
+
+        assert_eq!(named(&commands, "solo:solo").unwrap().description, "The only one");
+        fs::remove_dir_all(home).unwrap();
+        fs::remove_dir_all(workspace).unwrap();
+    }
+
+    #[test]
+    fn a_disabled_plugin_contributes_nothing() {
+        let home = scratch("disabled-home");
+        let workspace = scratch("disabled-workspace");
+        let install = install(&home, "off", None);
+        skill(install.join("skills"), "hidden", "Should not appear");
+        write(
+            home.join(".claude/settings.json"),
+            r#"{"enabledPlugins":{"off@marketplace":false}}"#,
+        );
+
+        let commands = catalog(&home, &workspace);
+
+        assert!(named(&commands, "off:hidden").is_none());
+        fs::remove_dir_all(home).unwrap();
+        fs::remove_dir_all(workspace).unwrap();
+    }
+
+    #[test]
+    fn a_plugin_opted_out_by_default_is_restored_by_a_settings_entry() {
+        let home = scratch("opt-in-home");
+        let workspace = scratch("opt-in-workspace");
+        let install = install(&home, "optional", Some(r#"{"name":"optional","defaultEnabled":false}"#));
+        skill(install.join("skills"), "extra", "Opt in");
+
+        assert!(named(&catalog(&home, &workspace), "optional:extra").is_none());
+
+        write(
+            home.join(".claude/settings.json"),
+            r#"{"enabledPlugins":{"optional@marketplace":true}}"#,
+        );
+        assert!(named(&catalog(&home, &workspace), "optional:extra").is_some());
+
+        fs::remove_dir_all(home).unwrap();
+        fs::remove_dir_all(workspace).unwrap();
+    }
+
+    #[test]
+    fn manifest_command_paths_replace_the_default_directory() {
+        let home = scratch("replace-home");
+        let workspace = scratch("replace-workspace");
+        let install = install(&home, "custom", Some(r#"{"name":"custom","commands":["./cmd/"]}"#));
+        write(install.join("commands/ignored.md"), "---\ndescription: No\n---\n");
+        write(install.join("cmd/used.md"), "---\ndescription: Yes\n---\n");
+
+        let commands = catalog(&home, &workspace);
+
+        assert!(named(&commands, "custom:used").is_some());
+        assert!(named(&commands, "custom:ignored").is_none());
+        fs::remove_dir_all(home).unwrap();
+        fs::remove_dir_all(workspace).unwrap();
+    }
+
+    #[test]
+    fn manifest_skill_paths_add_to_the_default_directory() {
+        let home = scratch("extend-home");
+        let workspace = scratch("extend-workspace");
+        let install = install(&home, "both", Some(r#"{"name":"both","skills":["./extra/"]}"#));
+        skill(install.join("skills"), "standard", "Default root");
+        skill(install.join("extra"), "additional", "Extra root");
+
+        let commands = catalog(&home, &workspace);
+
+        assert!(named(&commands, "both:standard").is_some());
+        assert!(named(&commands, "both:additional").is_some());
+        fs::remove_dir_all(home).unwrap();
+        fs::remove_dir_all(workspace).unwrap();
+    }
+
+    #[test]
+    fn built_ins_are_present_and_a_personal_entry_shadows_one() {
+        let home = scratch("builtin-home");
+        let workspace = scratch("builtin-workspace");
+        let commands = catalog(&home, &workspace);
+        assert!(named(&commands, "code-review").unwrap().origin.is_built_in());
+
+        skill(home.join(".claude/skills"), "code-review", "Mine");
+        let commands = catalog(&home, &workspace);
+        let review = named(&commands, "code-review").unwrap();
+        assert_eq!(review.origin, CommandOrigin::Personal);
+        assert_eq!(
+            commands.iter().filter(|c| c.name == "code-review").count(),
+            1
+        );
+
+        fs::remove_dir_all(home).unwrap();
+        fs::remove_dir_all(workspace).unwrap();
+    }
+
+    #[test]
+    fn a_broken_plugin_does_not_empty_the_catalog() {
+        let home = scratch("broken-home");
+        let workspace = scratch("broken-workspace");
+        let install = install(&home, "broken", Some("{not json"));
+        skill(install.join("skills"), "still-here", "Survives");
+        skill(home.join(".claude/skills"), "personal", "Survives too");
+
+        let commands = catalog(&home, &workspace);
+
+        assert!(named(&commands, "personal").is_some());
+        assert!(named(&commands, "broken:still-here").is_some());
+        fs::remove_dir_all(home).unwrap();
+        fs::remove_dir_all(workspace).unwrap();
     }
 }
