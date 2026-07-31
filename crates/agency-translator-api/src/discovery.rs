@@ -91,6 +91,79 @@ fn unquote(value: &str) -> &str {
     value
 }
 
+use std::fs;
+use std::path::{Path, PathBuf};
+
+/// One markdown file that defines a command, and the name it is defined under
+/// before any provider-specific namespacing is applied.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiscoveredFile {
+    pub name: String,
+    pub path: PathBuf,
+}
+
+/// How deep `command_files` will recurse. A symlink loop inside a plugin must
+/// not be able to hang the indexer.
+const MAX_DEPTH: usize = 8;
+
+/// Skills laid out as `<root>/<name>/SKILL.md`. A directory without a
+/// `SKILL.md` is supporting material, not a skill.
+pub fn skill_directories(root: &Path) -> Vec<DiscoveredFile> {
+    let Ok(entries) = fs::read_dir(root) else {
+        return Vec::new();
+    };
+    let mut found = entries
+        .flatten()
+        .filter_map(|entry| {
+            let path = entry.path().join("SKILL.md");
+            path.is_file().then(|| DiscoveredFile {
+                name: entry.file_name().to_string_lossy().into_owned(),
+                path,
+            })
+        })
+        .collect::<Vec<_>>();
+    sort(&mut found);
+    found
+}
+
+/// Commands laid out as markdown files under `root`. Claude Code names a
+/// command after its file stem however deeply it is nested, so the walk
+/// recurses without building a path-based name.
+pub fn command_files(root: &Path) -> Vec<DiscoveredFile> {
+    let mut found = Vec::new();
+    collect_command_files(root, 0, &mut found);
+    sort(&mut found);
+    found
+}
+
+fn collect_command_files(root: &Path, depth: usize, found: &mut Vec<DiscoveredFile>) {
+    if depth > MAX_DEPTH {
+        return;
+    }
+    let Ok(entries) = fs::read_dir(root) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_command_files(&path, depth + 1, found);
+        } else if path.extension().is_some_and(|extension| extension == "md")
+            && let Some(stem) = path.file_stem()
+        {
+            found.push(DiscoveredFile {
+                name: stem.to_string_lossy().into_owned(),
+                path,
+            });
+        }
+    }
+}
+
+/// Directory order is not stable across filesystems, and an unstable catalog
+/// would reorder the completion list between runs.
+fn sort(found: &mut [DiscoveredFile]) {
+    found.sort_by(|left, right| left.name.cmp(&right.name).then(left.path.cmp(&right.path)));
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -147,5 +220,67 @@ mod tests {
         let parsed = frontmatter("---\ndescription:\nmodel: opus\n---\nBody\n");
         assert_eq!(parsed.description, None);
         assert_eq!(describe("---\ndescription:\nmodel: opus\n---\nBody\n"), "Body");
+    }
+
+    use std::fs;
+    use std::path::PathBuf;
+
+    /// A throwaway directory named for the test that asked for it. The api
+    /// crate has no dev-dependency on a tempdir crate and does not need one.
+    fn scratch(label: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "agency-discovery-{}-{label}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    #[test]
+    fn skills_are_directories_holding_a_skill_file() {
+        let root = scratch("skills");
+        fs::create_dir_all(root.join("deploy")).unwrap();
+        fs::write(root.join("deploy/SKILL.md"), "---\ndescription: Ship\n---\n").unwrap();
+        fs::create_dir_all(root.join("audit")).unwrap();
+        fs::write(root.join("audit/SKILL.md"), "body").unwrap();
+        // A directory with no SKILL.md is not a skill.
+        fs::create_dir_all(root.join("assets")).unwrap();
+
+        let found = skill_directories(&root);
+
+        assert_eq!(
+            found.iter().map(|file| file.name.as_str()).collect::<Vec<_>>(),
+            ["audit", "deploy"]
+        );
+        assert_eq!(found[1].path, root.join("deploy/SKILL.md"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn commands_are_markdown_files_named_by_stem_at_any_depth() {
+        let root = scratch("commands");
+        fs::write(root.join("deploy.md"), "body").unwrap();
+        fs::create_dir_all(root.join("git")).unwrap();
+        fs::write(root.join("git/commit.md"), "body").unwrap();
+        // Non-markdown files are not commands.
+        fs::write(root.join("README.txt"), "body").unwrap();
+
+        let found = command_files(&root);
+
+        assert_eq!(
+            found.iter().map(|file| file.name.as_str()).collect::<Vec<_>>(),
+            ["commit", "deploy"]
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_missing_root_yields_nothing_rather_than_failing() {
+        assert!(skill_directories(Path::new("/does/not/exist")).is_empty());
+        assert!(command_files(Path::new("/does/not/exist")).is_empty());
     }
 }

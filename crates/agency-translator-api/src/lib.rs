@@ -1,3 +1,4 @@
+pub mod commands;
 pub mod discovery;
 
 use serde::{Deserialize, Serialize};
