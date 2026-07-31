@@ -1,5 +1,5 @@
 [package]
-name = "agency-agents"
+name = "agency-rpc"
 version = "0.1.0"
 edition.workspace = true
 license.workspace = true
@@ -7,8 +7,5 @@ rust-version.workspace = true
 publish = false
 
 [dependencies]
-base64 = "0.22"
-agency-translator-api = { path = "../agency-translator-api" }
-agency-translators = { path = "../agency-translators" }
 serde.workspace = true
 serde_json.workspace = true

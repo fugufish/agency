@@ -1,0 +1,111 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+    tags:
+      - "v[0-9]*"
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_TOOLCHAIN: "1.95"
+  ZIG_VERSION: "0.15.2"
+
+jobs:
+  build-and-test:
+    name: Build and test (${{ matrix.name }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux
+            os: ubuntu-latest
+          - name: macOS
+            os: macos-latest
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v6
+
+      - name: Install Rust
+        run: rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal
+
+      - name: Install Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+
+      - name: Build workspace
+        run: cargo +"$RUST_TOOLCHAIN" build --workspace --locked
+
+      - name: Test workspace
+        run: cargo +"$RUST_TOOLCHAIN" test --workspace --all-targets --locked
+
+  final-build:
+    name: Final build (${{ matrix.name }})
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build-and-test
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux
+            os: ubuntu-latest
+            artifact: agency-linux
+          - name: macOS
+            os: macos-latest
+            artifact: agency-macos
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v6
+
+      - name: Install Rust
+        run: rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal
+
+      - name: Install Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+
+      - name: Build release binary
+        run: cargo +"$RUST_TOOLCHAIN" build --package agency-desktop --bin agency --release --locked
+
+      - name: Package release binary
+        run: tar -C target/release -czf "${{ matrix.artifact }}.tar.gz" agency
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.artifact }}
+          path: ${{ matrix.artifact }}.tar.gz
+          if-no-files-found: error
+
+  publish-release:
+    name: Publish GitHub release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: final-build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download final builds
+        uses: actions/download-artifact@v8
+        with:
+          pattern: agency-*
+          merge-multiple: true
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "${{ github.ref_name }}" >/dev/null 2>&1; then
+            gh release upload "${{ github.ref_name }}" agency-*.tar.gz --clobber
+          else
+            gh release create "${{ github.ref_name }}" agency-*.tar.gz --verify-tag --generate-notes
+          fi

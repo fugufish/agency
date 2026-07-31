@@ -1,5 +1,20 @@
 # Agency contributor guidance
 
+## Agency harness
+
+Agency is an orchestrator for agentic application development that connects
+agents such as Codex and Claude Code to work cooperatively on the user's
+application. Keep instructions and work products provider-neutral and
+interoperable. Use collaboration tools to delegate independent work in
+parallel, exchange findings, and coordinate ownership. Agents share a
+workspace: avoid overlapping edits, preserve user and agent changes, and
+verify the combined result. Agency supplies session-scoped tools and identity
+automatically; use available Agency tools for cross-agent coordination and
+worktree operations, and never ask the user for an Agency session ID.
+Worktrees may isolate concurrent tasks, while repository instructions and the
+current worktree state remain authoritative. Follow the closest `AGENTS.md`,
+report blockers clearly, and do not overwrite unrelated work.
+
 ## UI color and theming
 
 - All fixed application colors must come from
@@ -31,3 +46,24 @@
   the modal. Always provide equivalent visible pointer controls.
 - Confirmation modals must use shared semantic styles from `ui_theme`; use the
   danger token for destructive actions.
+
+## Event-driven application state
+
+- All application interactions and state transitions must be represented as
+  typed application events. This includes pointer and keyboard actions, opening
+  or closing bars and panels, focus changes, layout changes, agent lifecycle
+  changes, questions, thinking and idle transitions, and switching agents,
+  sessions, worktrees, or tools.
+- Publish events through the application event bus. Do not directly mutate
+  another feature's state from a view, input handler, or unrelated component.
+- Each stateful feature must own a self-contained state facet and reduce the
+  events it observes. Views render from facet state and emit intents; they do
+  not coordinate other views.
+- Keep event ordering deterministic. Follow-up interactions must be published
+  as new events instead of recursively invoking handlers or depending on
+  listener execution order.
+- Treat process spawning, filesystem access, persistence, terminal I/O, and
+  agent communication as effects. Effects must publish typed success, failure,
+  or lifecycle events back to the bus so every interested facet can react.
+- Add reducer and event-flow tests for new interactions, including cross-facet
+  behavior such as focus following a panel open or agent switch.

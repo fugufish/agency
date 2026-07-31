@@ -2,7 +2,7 @@ use agency_translator_api::{
     ClientId, ContentBlock, Conversation, ConversationEvent, ConversationUpdate, EventPayload,
     ExportResult, ImportResult, LiveEventTranslator, MessageRole, NativeArtifact, NativeEnvelope,
     SessionTranslator, TRANSLATOR_PROTOCOL_VERSION, TranslationError, TranslationReport,
-    TranslatorDescriptor,
+    TranslatorDescriptor, tools,
 };
 use serde_json::{Value, json};
 
@@ -39,13 +39,17 @@ impl LiveEventTranslator for CodexTranslator {
                     .get("type")
                     .and_then(Value::as_str)
                     .unwrap_or("activity");
-                if matches!(kind, "agentMessage" | "userMessage") {
-                    return Ok(Vec::new());
-                }
-                if kind == "fileChange" && method == "item/started" {
-                    return Ok(Vec::new());
-                }
-                if kind != "fileChange" && method == "item/completed" {
+                // Long-running work is reported twice. A file change only
+                // carries the patch it applied once it has finished, and a
+                // command carries its output and exit code the same way, so
+                // its completed report replaces the one that started it.
+                let report = match (kind, method) {
+                    ("agentMessage" | "userMessage", _) => false,
+                    ("fileChange", method) => method == "item/completed",
+                    (tools::COMMAND_EXECUTION, _) => true,
+                    (_, method) => method == "item/started",
+                };
+                if !report {
                     return Ok(Vec::new());
                 }
                 let name = item
@@ -321,6 +325,49 @@ fn export_content(block: &ContentBlock, assistant: bool) -> Value {
 mod file_change_tests {
     use super::*;
     use serde_json::json;
+
+    fn command_item(status: &str, output: Option<&str>, exit_code: Option<i64>) -> Value {
+        json!({
+            "method": if status == "inProgress" { "item/started" } else { "item/completed" },
+            "params": {
+                "turnId": "turn-1",
+                "item": {
+                    "id": "exec-1",
+                    "type": "commandExecution",
+                    "command": "/usr/bin/zsh -lc 'cargo test'",
+                    "status": status,
+                    "aggregatedOutput": output,
+                    "exitCode": exit_code
+                }
+            }
+        })
+    }
+
+    #[test]
+    fn commands_are_reported_when_they_start_and_again_with_their_output() {
+        let started = CodexTranslator
+            .translate_live(&command_item("inProgress", None, None))
+            .unwrap();
+        let ConversationUpdate::Append { event } = &started[0] else {
+            panic!("a starting command should be reported");
+        };
+        assert_eq!(event.id, "exec-1");
+
+        let completed = CodexTranslator
+            .translate_live(&command_item("completed", Some("3 passed\n"), Some(0)))
+            .unwrap();
+        let ConversationUpdate::Append { event } = &completed[0] else {
+            panic!("a finished command should replace the one that started");
+        };
+        assert_eq!(event.id, "exec-1");
+        let EventPayload::ToolCall { input, .. } = &event.payload else {
+            panic!("commands stay normalized tool calls");
+        };
+        assert_eq!(tools::kind(input), Some(tools::COMMAND_EXECUTION));
+        assert_eq!(input["aggregatedOutput"], "3 passed\n");
+        assert_eq!(input["exitCode"], 0);
+        assert!(tools::is_finished(input));
+    }
 
     #[test]
     fn waits_for_completed_file_changes() {

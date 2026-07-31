@@ -13,6 +13,25 @@ pub const SUCCESS: Color = color!(0x9ece6a);
 pub const WARNING: Color = color!(0xe0af68);
 pub const DANGER: Color = color!(0xf7768e);
 
+/// Maps syntax tokens onto the application palette so highlighted code stays
+/// inside Agency's Tokyo Night theme instead of importing a foreign palette.
+pub fn syntax_color(source: Option<Color>) -> Color {
+    let Some(source) = source else {
+        return TEXT;
+    };
+    if source.r > source.g * 1.18 {
+        DANGER
+    } else if source.g > source.r * 1.12 && source.g > source.b {
+        SUCCESS
+    } else if source.r > source.b && source.g > source.b {
+        WARNING
+    } else if source.b > source.r || source.b > source.g {
+        PRIMARY
+    } else {
+        TEXT
+    }
+}
+
 pub fn theme() -> Theme {
     Theme::custom(
         "Agency",
@@ -111,17 +130,6 @@ pub fn agent_badge() -> container::Style {
         })
 }
 
-pub fn thinking_badge() -> container::Style {
-    container::Style::default()
-        .color(DARK_TEXT)
-        .background(WARNING)
-        .border(Border {
-            color: WARNING,
-            width: 1.0,
-            radius: 4.0.into(),
-        })
-}
-
 pub fn user_message() -> container::Style {
     container::Style::default()
         .color(TEXT)
@@ -161,6 +169,57 @@ pub fn modal() -> container::Style {
         })
 }
 
+/// Pointer-operable twin of [`agent_badge`] for the status bar's agent chip.
+pub fn agent_chip(open: bool, status: button::Status) -> button::Style {
+    let background = if open || matches!(status, button::Status::Hovered | button::Status::Pressed)
+    {
+        SURFACE_RAISED
+    } else {
+        SURFACE_SELECTED
+    };
+    let mut style = button::Style::default().with_background(background);
+    style.text_color = PRIMARY;
+    style.border = Border {
+        color: PRIMARY,
+        width: 1.0,
+        radius: 4.0.into(),
+    };
+    style
+}
+
+/// Panel for a menu that floats above another surface rather than covering the
+/// application the way [`modal`] does.
+pub fn floating_menu() -> container::Style {
+    container::Style::default()
+        .color(TEXT)
+        .background(SURFACE)
+        .border(Border {
+            color: PRIMARY,
+            width: 1.0,
+            radius: 8.0.into(),
+        })
+}
+
+pub fn menu_entry(selected: bool, status: button::Status) -> button::Style {
+    let highlighted =
+        selected || matches!(status, button::Status::Hovered | button::Status::Pressed);
+    let background = if selected {
+        SURFACE_SELECTED
+    } else if highlighted {
+        SURFACE_RAISED
+    } else {
+        SURFACE
+    };
+    let mut style = button::Style::default().with_background(background);
+    style.text_color = TEXT;
+    style.border = Border {
+        color: if highlighted { PRIMARY } else { BORDER },
+        width: 1.0,
+        radius: 5.0.into(),
+    };
+    style
+}
+
 pub fn dialog_button(danger: bool, status: button::Status) -> button::Style {
     let accent = if danger { DANGER } else { PRIMARY };
     let background = if matches!(status, button::Status::Hovered | button::Status::Pressed) {
@@ -191,6 +250,32 @@ pub fn icon_button(status: button::Status) -> button::Style {
         radius: 5.0.into(),
     };
     style
+}
+
+pub fn slash_command_button(selected_by_keyboard: bool, status: button::Status) -> button::Style {
+    let selected =
+        selected_by_keyboard || matches!(status, button::Status::Hovered | button::Status::Pressed);
+    let mut style =
+        button::Style::default().with_background(if selected { SURFACE_SELECTED } else { SURFACE });
+    style.text_color = TEXT;
+    style.border = Border {
+        color: if selected { PRIMARY } else { BORDER },
+        width: 1.0,
+        radius: 5.0.into(),
+    };
+    style
+}
+
+pub fn agent_type_badge(codex: bool) -> container::Style {
+    let color = if codex { PRIMARY } else { WARNING };
+    container::Style::default()
+        .color(color)
+        .background(Color { a: 0.14, ..color })
+        .border(Border {
+            color,
+            width: 1.0,
+            radius: 4.0.into(),
+        })
 }
 
 pub fn trash_button(status: button::Status) -> button::Style {
@@ -316,20 +401,58 @@ pub fn session_button(selected: bool, status: button::Status) -> button::Style {
     style
 }
 
-#[derive(Debug, Clone, Copy)]
-pub enum SessionStatus {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AgentStatus {
     Active,
-    Running,
+    Thinking,
     Waiting,
+    Idle,
     Resume,
 }
 
-pub fn session_status_badge(status: SessionStatus) -> container::Style {
+pub fn agent_status_badge(status: AgentStatus, pulse: f32) -> container::Style {
     let color = match status {
-        SessionStatus::Active => PRIMARY,
-        SessionStatus::Running => SUCCESS,
-        SessionStatus::Waiting => WARNING,
-        SessionStatus::Resume => TEXT,
+        AgentStatus::Active => SUCCESS,
+        AgentStatus::Thinking => WARNING,
+        AgentStatus::Waiting => DANGER,
+        AgentStatus::Idle => TEXT,
+        AgentStatus::Resume => PRIMARY,
+    };
+    let animated = status == AgentStatus::Active;
+    let background_alpha = if animated {
+        0.12 + pulse.clamp(0.0, 1.0) * 0.18
+    } else {
+        0.08
+    };
+    let mut style = container::Style::default()
+        .color(color)
+        .background(Color {
+            a: background_alpha,
+            ..color
+        })
+        .border(Border {
+            color,
+            width: if animated { 1.5 } else { 1.0 },
+            radius: 4.0.into(),
+        });
+    if animated {
+        style.shadow = Shadow {
+            color: Color {
+                a: 0.12 + pulse.clamp(0.0, 1.0) * 0.2,
+                ..color
+            },
+            offset: Vector::default(),
+            blur_radius: 3.0 + pulse.clamp(0.0, 1.0) * 5.0,
+        };
+    }
+    style
+}
+
+pub fn mcp_server_state_badge(state: crate::McpServerState) -> container::Style {
+    let color = match state {
+        crate::McpServerState::Connected => SUCCESS,
+        crate::McpServerState::Error => DANGER,
+        crate::McpServerState::RequiresAuthentication => WARNING,
     };
     container::Style::default()
         .color(color)
@@ -341,7 +464,29 @@ pub fn session_status_badge(status: SessionStatus) -> container::Style {
         })
 }
 
-pub fn tool_button(selected: bool, status: button::Status) -> button::Style {
+pub fn mcp_access_badge() -> container::Style {
+    container::Style::default()
+        .color(TEXT)
+        .background(SURFACE_SELECTED)
+        .border(Border {
+            color: BORDER,
+            width: 1.0,
+            radius: 4.0.into(),
+        })
+}
+
+pub fn mcp_agent_card() -> container::Style {
+    container::Style::default()
+        .color(TEXT)
+        .background(SURFACE)
+        .border(Border {
+            color: BORDER,
+            width: 1.0,
+            radius: 6.0.into(),
+        })
+}
+
+pub fn tool_button(selected: bool, focused: bool, status: button::Status) -> button::Style {
     let background = if selected {
         SURFACE_SELECTED
     } else if matches!(status, button::Status::Hovered | button::Status::Pressed) {
@@ -352,11 +497,23 @@ pub fn tool_button(selected: bool, status: button::Status) -> button::Style {
     let mut style = button::Style::default().with_background(background);
     style.text_color = TEXT;
     style.border = Border {
-        color: Color::TRANSPARENT,
-        width: 1.0,
+        color: if selected || focused {
+            PRIMARY
+        } else {
+            Color::TRANSPARENT
+        },
+        width: if focused { 2.0 } else { 1.0 },
         radius: 7.0.into(),
     };
     style
+}
+
+pub fn focus_surface(focused: bool) -> container::Style {
+    container::Style::default().border(Border {
+        color: if focused { PRIMARY } else { Color::TRANSPARENT },
+        width: 1.0,
+        radius: 2.0.into(),
+    })
 }
 
 pub fn file_entry(selected: bool, status: button::Status) -> button::Style {
@@ -386,4 +543,124 @@ pub fn tree_root() -> container::Style {
             width: 1.0,
             radius: 5.0.into(),
         })
+}
+
+/// The card every reported activity uses — file changes, commands, reads, and
+/// plugin installs — accented by how that activity ended.
+pub fn status_card(status: &str) -> container::Style {
+    container::Style::default()
+        .color(TEXT)
+        .background(SURFACE)
+        .border(Border {
+            color: status_accent(status),
+            width: 1.0,
+            radius: 7.0.into(),
+        })
+}
+
+pub fn status_badge(status: &str) -> container::Style {
+    let accent = status_accent(status);
+    container::Style::default()
+        .color(accent)
+        .background(SURFACE_RAISED)
+        .border(Border {
+            color: accent,
+            width: 1.0,
+            radius: 4.0.into(),
+        })
+}
+
+fn status_accent(status: &str) -> Color {
+    const FINISHED: [&str; 3] = ["completed", "installed", "read"];
+    const FAILED: [&str; 4] = ["failed", "error", "declined", "denied"];
+
+    if FINISHED
+        .iter()
+        .any(|finished| status.eq_ignore_ascii_case(finished))
+    {
+        SUCCESS
+    } else if FAILED
+        .iter()
+        .any(|failed| status.eq_ignore_ascii_case(failed))
+    {
+        DANGER
+    } else {
+        WARNING
+    }
+}
+
+/// Terminal output, shown the way a terminal shows it.
+pub fn terminal_output() -> container::Style {
+    container::Style::default()
+        .color(TEXT)
+        .background(BACKGROUND)
+        .border(Border {
+            color: BORDER,
+            width: 1.0,
+            radius: 5.0.into(),
+        })
+}
+
+pub fn file_change_row() -> container::Style {
+    container::Style::default()
+        .color(TEXT)
+        .background(BACKGROUND)
+        .border(Border {
+            color: BORDER,
+            width: 1.0,
+            radius: 5.0.into(),
+        })
+}
+
+pub fn file_change_count() -> container::Style {
+    container::Style::default()
+        .color(PRIMARY)
+        .background(SURFACE_RAISED)
+        .border(Border {
+            color: PRIMARY,
+            width: 1.0,
+            radius: 8.0.into(),
+        })
+}
+
+pub fn file_change_badge(action: &str) -> container::Style {
+    let color = if action.eq_ignore_ascii_case("created") {
+        SUCCESS
+    } else if action.eq_ignore_ascii_case("deleted") {
+        DANGER
+    } else if action.eq_ignore_ascii_case("moved") {
+        WARNING
+    } else {
+        PRIMARY
+    };
+    container::Style::default()
+        .color(color)
+        .background(SURFACE_RAISED)
+        .border(Border {
+            color,
+            width: 1.0,
+            radius: 4.0.into(),
+        })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn selected_tool_button_has_persistent_primary_highlight() {
+        let style = tool_button(true, false, button::Status::Active);
+
+        assert_eq!(style.background, Some(SURFACE_SELECTED.into()));
+        assert_eq!(style.border.color, PRIMARY);
+        assert_eq!(style.border.width, 1.0);
+    }
+
+    #[test]
+    fn inactive_tool_button_has_no_highlight() {
+        let style = tool_button(false, false, button::Status::Active);
+
+        assert_eq!(style.background, Some(BACKGROUND.into()));
+        assert_eq!(style.border.color, Color::TRANSPARENT);
+    }
 }

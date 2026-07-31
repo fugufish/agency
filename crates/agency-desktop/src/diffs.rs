@@ -1,6 +1,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use agency_translator_api::tools;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -56,11 +57,9 @@ impl DiffSessionState {
     }
 
     pub fn capture(&mut self, event_id: &str, input: &Value, transcript_index: usize) -> bool {
-        if input.get("type").and_then(Value::as_str) == Some("fileChange")
-            && input
-                .get("status")
-                .and_then(Value::as_str)
-                .is_some_and(|status| status != "completed")
+        // A change is only worth keeping once it has actually been applied.
+        if tools::kind(input) == Some(tools::FILE_CHANGE)
+            && tools::status(input) != tools::COMPLETED
         {
             return false;
         }
@@ -217,10 +216,7 @@ pub fn file_changes(value: &Value) -> Vec<FileChange> {
         .flatten()
         .filter_map(|change| {
             let path = change.get("path")?.as_str()?.to_owned();
-            let kind = change
-                .get("kind")
-                .and_then(Value::as_str)
-                .unwrap_or("update");
+            let kind = tools::change_kind(change);
             let hunk = change.get("diff")?.as_str()?;
             let old = if kind.eq_ignore_ascii_case("add") {
                 "/dev/null".to_owned()

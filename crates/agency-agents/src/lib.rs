@@ -15,7 +15,10 @@ use agency_translator_api::{
 };
 use agency_translators::{claude::ClaudeTranslator, codex::CodexTranslator};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
+use serde::Deserialize;
 use serde_json::{Value, json};
+
+const ENV_CONVERSATION_ID: &str = "AGENCY_CONVERSATION_ID";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Provider {
@@ -23,11 +26,63 @@ pub enum Provider {
     Claude,
 }
 
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct McpServer {
+    pub name: String,
+    #[serde(default = "enabled_by_default")]
+    pub enabled: bool,
+    pub transport: McpTransport,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum McpTransport {
+    Stdio {
+        command: String,
+        #[serde(default)]
+        args: Vec<String>,
+        env: Option<HashMap<String, String>>,
+        cwd: Option<PathBuf>,
+    },
+    StreamableHttp {
+        url: String,
+        bearer_token_env_var: Option<String>,
+        http_headers: Option<HashMap<String, String>>,
+        env_http_headers: Option<HashMap<String, String>>,
+    },
+}
+
+const fn enabled_by_default() -> bool {
+    true
+}
+
 impl Provider {
     pub fn label(self) -> &'static str {
         match self {
             Self::Codex => "Codex",
             Self::Claude => "Claude Code",
+        }
+    }
+
+    /// The executable Agency starts for this provider.
+    pub fn command(self) -> &'static str {
+        match self {
+            Self::Codex => "codex",
+            Self::Claude => "claude",
+        }
+    }
+
+    /// Resolves the name a user types for a provider, such as in `--agent`.
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name
+            .trim()
+            .to_ascii_lowercase()
+            .replace([' ', '_'], "-")
+            .as_str()
+        {
+            "codex" => Some(Self::Codex),
+            "claude" | "claude-code" => Some(Self::Claude),
+            _ => None,
         }
     }
 }
@@ -98,9 +153,26 @@ pub struct Session {
 
 impl Session {
     pub fn spawn(provider: Provider, cwd: &Path) -> Result<Self, String> {
+        Self::spawn_with_env(provider, cwd, &[])
+    }
+
+    pub fn spawn_with_env(
+        provider: Provider,
+        cwd: &Path,
+        environment: &[(String, String)],
+    ) -> Result<Self, String> {
+        Self::spawn_with_env_and_mcps(provider, cwd, environment, &[])
+    }
+
+    pub fn spawn_with_env_and_mcps(
+        provider: Provider,
+        cwd: &Path,
+        environment: &[(String, String)],
+        mcp_servers: &[McpServer],
+    ) -> Result<Self, String> {
         match provider {
-            Provider::Codex => Self::spawn_codex(cwd, None, None),
-            Provider::Claude => Self::spawn_claude(cwd, None),
+            Provider::Codex => Self::spawn_codex(cwd, None, None, environment),
+            Provider::Claude => Self::spawn_claude(cwd, None, environment, mcp_servers),
         }
     }
 
@@ -110,7 +182,7 @@ impl Session {
         conversation: &Conversation,
     ) -> Result<Self, String> {
         match provider {
-            Provider::Codex => Self::spawn_codex(cwd, None, Some(conversation)),
+            Provider::Codex => Self::spawn_codex(cwd, None, Some(conversation), &[]),
             Provider::Claude => Err(
                 "Claude history must be installed into its native store before resuming".to_owned(),
             ),
@@ -118,12 +190,31 @@ impl Session {
     }
 
     pub fn resume(provider: Provider, session_id: &str, cwd: &Path) -> Result<Self, String> {
+        Self::resume_with_env(provider, session_id, cwd, &[])
+    }
+
+    pub fn resume_with_env(
+        provider: Provider,
+        session_id: &str,
+        cwd: &Path,
+        environment: &[(String, String)],
+    ) -> Result<Self, String> {
+        Self::resume_with_env_and_mcps(provider, session_id, cwd, environment, &[])
+    }
+
+    pub fn resume_with_env_and_mcps(
+        provider: Provider,
+        session_id: &str,
+        cwd: &Path,
+        environment: &[(String, String)],
+        mcp_servers: &[McpServer],
+    ) -> Result<Self, String> {
         if session_id.trim().is_empty() {
             return Err("Cannot resume an agent session without an ID".to_owned());
         }
         match provider {
-            Provider::Codex => Self::spawn_codex(cwd, Some(session_id), None),
-            Provider::Claude => Self::spawn_claude(cwd, Some(session_id)),
+            Provider::Codex => Self::spawn_codex(cwd, Some(session_id), None, environment),
+            Provider::Claude => Self::spawn_claude(cwd, Some(session_id), environment, mcp_servers),
         }
     }
 
@@ -280,10 +371,30 @@ impl Session {
         cwd: &Path,
         resume_id: Option<&str>,
         imported_history: Option<&Conversation>,
+        environment: &[(String, String)],
     ) -> Result<Self, String> {
-        let mut child = Command::new("codex")
+        let mut command = Command::new("codex");
+        let harness_context = agency_harness_context(environment);
+        if !environment.is_empty() {
+            let mcp_command = environment
+                .iter()
+                .find(|(key, _)| key == "AGENCY_MCP_COMMAND")
+                .map(|(_, value)| value.as_str())
+                .unwrap_or("agency");
+            command.args([
+                "-c",
+                &format!(
+                    "mcp_servers.agency.command={}",
+                    serde_json::to_string(mcp_command).unwrap_or_else(|_| "\"agency\"".to_owned())
+                ),
+                "-c",
+                "mcp_servers.agency.args=[\"--mcp\"]",
+            ]);
+        }
+        let mut child = command
             .args(["app-server", "--stdio"])
             .current_dir(cwd)
+            .envs(environment.iter().map(|(key, value)| (key, value)))
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -336,12 +447,19 @@ impl Session {
             Some(thread_id) => json!({
                 "method": "thread/resume",
                 "id": 1,
-                "params": { "threadId": thread_id, "cwd": cwd }
+                "params": {
+                    "threadId": thread_id,
+                    "cwd": cwd,
+                    "developerInstructions": harness_context
+                }
             }),
             None => json!({
                 "method": "thread/start",
                 "id": 1,
-                "params": { "cwd": cwd }
+                "params": {
+                    "cwd": cwd,
+                    "developerInstructions": harness_context
+                }
             }),
         };
         write_json(&writer, &thread_request)?;
@@ -460,7 +578,12 @@ impl Session {
         })
     }
 
-    fn spawn_claude(cwd: &Path, resume_id: Option<&str>) -> Result<Self, String> {
+    fn spawn_claude(
+        cwd: &Path,
+        resume_id: Option<&str>,
+        environment: &[(String, String)],
+        mcp_servers: &[McpServer],
+    ) -> Result<Self, String> {
         let mut command = Command::new("claude");
         command.args([
             "-p",
@@ -472,11 +595,31 @@ impl Session {
             "--include-partial-messages",
             "--replay-user-messages",
         ]);
+        if let Some(context) = agency_harness_context(environment) {
+            command.args(["--append-system-prompt", &context]);
+        }
+        if !environment.is_empty() {
+            let mcp_command = environment
+                .iter()
+                .find(|(key, _)| key == "AGENCY_MCP_COMMAND")
+                .map(|(_, value)| value.as_str())
+                .unwrap_or("agency");
+            let mut servers = serde_json::Map::from_iter([(
+                "agency".to_owned(),
+                json!({ "command": mcp_command, "args": ["--mcp"] }),
+            )]);
+            for server in mcp_servers.iter().filter(|server| server.enabled) {
+                servers.insert(server.name.clone(), claude_mcp_config(server)?);
+            }
+            let mcp_config = json!({ "mcpServers": servers }).to_string();
+            command.args(["--mcp-config", &mcp_config]);
+        }
         if let Some(session_id) = resume_id {
             command.args(["--resume", session_id]);
         }
         let mut child = command
             .current_dir(cwd)
+            .envs(environment.iter().map(|(key, value)| (key, value)))
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -513,6 +656,9 @@ impl Session {
         let reader_events = events_tx.clone();
         let reader_thread_id = Arc::clone(&thread_id);
         thread::spawn(move || {
+            // One translator per session: it carries the state of the turn in
+            // flight so tool calls can be completed by their later results.
+            let translator = ClaudeTranslator::default();
             for line in BufReader::new(stdout).lines() {
                 match line {
                     Ok(line) => match serde_json::from_str::<Value>(&line) {
@@ -537,6 +683,7 @@ impl Session {
                                 });
                             }
                             normalize_claude(
+                                &translator,
                                 &value,
                                 &reader_events,
                                 &reader_pending,
@@ -571,6 +718,49 @@ impl Session {
             pending_codex_turns: Arc::new(Mutex::new(Vec::new())),
             pending_responses,
         })
+    }
+}
+
+fn claude_mcp_config(server: &McpServer) -> Result<Value, String> {
+    match &server.transport {
+        McpTransport::Stdio {
+            command,
+            args,
+            env,
+            cwd,
+        } => {
+            let mut config = json!({
+                "command": command,
+                "args": args,
+                "env": env.clone().unwrap_or_default(),
+            });
+            if let Some(cwd) = cwd {
+                config["cwd"] = json!(cwd);
+            }
+            Ok(config)
+        }
+        McpTransport::StreamableHttp {
+            url,
+            bearer_token_env_var,
+            http_headers,
+            env_http_headers,
+        } => {
+            if bearer_token_env_var.is_some()
+                || env_http_headers
+                    .as_ref()
+                    .is_some_and(|headers| !headers.is_empty())
+            {
+                return Err(format!(
+                    "MCP server {:?} uses environment-backed HTTP authentication that Agency cannot safely pass to Claude Code yet",
+                    server.name
+                ));
+            }
+            Ok(json!({
+                "type": "http",
+                "url": url,
+                "headers": http_headers.clone().unwrap_or_default(),
+            }))
+        }
     }
 }
 
@@ -609,7 +799,7 @@ fn claude_history(cwd: &Path, session_id: &str) -> Result<Conversation, String> 
     let source = fs::read_to_string(&path)
         .map_err(|error| format!("Could not read Claude session history: {error}"))?;
 
-    ClaudeTranslator
+    ClaudeTranslator::default()
         .import(&NativeArtifact::JsonLines(source))
         .map(|result| result.conversation)
         .map_err(|error| format!("Could not translate Claude history: {error}"))
@@ -617,7 +807,7 @@ fn claude_history(cwd: &Path, session_id: &str) -> Result<Conversation, String> 
 
 #[cfg(test)]
 fn parse_claude_history(source: &str) -> Conversation {
-    ClaudeTranslator
+    ClaudeTranslator::default()
         .import(&NativeArtifact::JsonLines(source.to_owned()))
         .map(|result| result.conversation)
         .unwrap_or_default()
@@ -646,6 +836,20 @@ fn codex_turn_message(thread_id: &str, input: Vec<Value>, request_id: u64) -> Va
             "input": input
         }
     })
+}
+
+fn agency_harness_context(environment: &[(String, String)]) -> Option<String> {
+    let conversation_id = environment
+        .iter()
+        .find(|(key, _)| key == ENV_CONVERSATION_ID)
+        .map(|(_, value)| value.trim())
+        .filter(|value| !value.is_empty())?;
+    Some(format!(
+        "You are running inside the Agency agentic coding harness. \
+Your Agency session ID is `{conversation_id}`. Agency's MCP tools are \
+session-scoped and automatically act on this session and its workspace; \
+do not ask the user for a session ID when calling them."
+    ))
 }
 
 fn write_json(writer: &Mutex<ChildStdin>, value: &Value) -> Result<(), String> {
@@ -796,12 +1000,13 @@ fn normalize_codex(
 }
 
 fn normalize_claude(
+    translator: &ClaudeTranslator,
     value: &Value,
     events: &mpsc::Sender<Event>,
     pending: &Mutex<HashMap<u64, PendingResponse>>,
     next_question_id: &AtomicU64,
 ) {
-    match ClaudeTranslator.translate_live(value) {
+    match translator.translate_live(value) {
         Ok(updates) => {
             for update in updates {
                 let _ = events.send(Event::Conversation(Box::new(update)));
@@ -904,6 +1109,61 @@ fn pipe_stderr(
 mod tests {
     use super::*;
 
+    #[test]
+    fn harness_context_identifies_the_agency_session() {
+        let environment = vec![(
+            ENV_CONVERSATION_ID.to_owned(),
+            "conversation-123".to_owned(),
+        )];
+
+        let context = agency_harness_context(&environment).unwrap();
+
+        assert!(context.contains("Agency agentic coding harness"));
+        assert!(context.contains("`conversation-123`"));
+        assert!(context.contains("do not ask the user for a session ID"));
+    }
+
+    #[test]
+    fn codex_mcp_json_accepts_null_optional_maps() {
+        let stdio: McpServer = serde_json::from_value(json!({
+            "name": "docs",
+            "enabled": true,
+            "transport": {
+                "type": "stdio",
+                "command": "docs-mcp",
+                "args": [],
+                "env": null,
+                "cwd": null
+            }
+        }))
+        .unwrap();
+        assert_eq!(
+            claude_mcp_config(&stdio).unwrap(),
+            json!({ "command": "docs-mcp", "args": [], "env": {} })
+        );
+
+        let remote: McpServer = serde_json::from_value(json!({
+            "name": "remote",
+            "enabled": true,
+            "transport": {
+                "type": "streamable_http",
+                "url": "https://example.com/mcp",
+                "bearer_token_env_var": null,
+                "http_headers": null,
+                "env_http_headers": null
+            }
+        }))
+        .unwrap();
+        assert_eq!(
+            claude_mcp_config(&remote).unwrap(),
+            json!({
+                "type": "http",
+                "url": "https://example.com/mcp",
+                "headers": {}
+            })
+        );
+    }
+
     fn normalization_state() -> (Mutex<HashMap<u64, PendingResponse>>, AtomicU64) {
         (Mutex::new(HashMap::new()), AtomicU64::new(1))
     }
@@ -958,6 +1218,7 @@ mod tests {
         let (sender, receiver) = mpsc::channel();
         let (pending, next_id) = normalization_state();
         normalize_claude(
+            &ClaudeTranslator::default(),
             &json!({
                 "type": "stream_event",
                 "event": {
@@ -1044,6 +1305,7 @@ mod tests {
         let (sender, receiver) = mpsc::channel();
         let (pending, next_id) = normalization_state();
         normalize_claude(
+            &ClaudeTranslator::default(),
             &json!({
                 "type": "control_request",
                 "request_id": "permission-1",
@@ -1111,11 +1373,15 @@ mod tests {
     fn claude_native_jsonl_becomes_main_conversation_history() {
         let history = parse_claude_history(
             r#"{"type":"user","isSidechain":false,"message":{"role":"user","content":"Hello"}}
-{"type":"assistant","isSidechain":false,"message":{"role":"assistant","content":[{"type":"text","text":"Hi there"},{"type":"tool_use","name":"Bash"}]}}
+{"type":"assistant","isSidechain":false,"message":{"role":"assistant","content":[{"type":"text","text":"Hi there"},{"type":"tool_use","id":"tool-1","name":"Bash","input":{"command":"cargo test"}}]}}
 {"type":"assistant","isSidechain":true,"message":{"role":"assistant","content":[{"type":"text","text":"hidden subagent"}]}}"#,
         );
 
         assert_eq!(history.events.len(), 3);
+        assert!(matches!(
+            &history.events[2].payload,
+            agency_translator_api::EventPayload::ToolCall { name, .. } if name == "cargo test"
+        ));
         assert!(matches!(
             &history.events[0].payload,
             agency_translator_api::EventPayload::Message {

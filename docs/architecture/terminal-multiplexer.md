@@ -12,6 +12,10 @@
 
 The desktop client attaches to a session, feeds its raw output into `libghostty-vt`, and renders the resulting screen. The multiplexer has no dependency on Iced or Ghostty.
 
+## Headless commands
+
+Agency also runs explicit commands that have no terminal pane, such as the plugin installs behind `/plugin install`. A headless command uses the same PTY, reader, control, and exit plumbing as an attachable session, but it is owned by its caller instead of the multiplexer, so it never appears among the attachable sessions. Its output is rendered through `libghostty-vt` like any other terminal and streamed to the surface that requested the command, and its exit status is reported so the caller can tell success from failure.
+
 ## Current boundary
 
 The initial multiplexer is a headless Rust library hosted inside the Agency process. Sessions remain alive while Agency is running and can have multiple attachments, but they do not yet survive a Agency process restart.

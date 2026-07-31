@@ -120,14 +120,14 @@ impl ClaudeNativeStore {
         let _lock = DirectoryLock::acquire(&directory)?;
         let session_id = native_uuid();
         let path = directory.join(format!("{session_id}.jsonl"));
-        let artifact = ClaudeTranslator.export(conversation)?;
+        let artifact = ClaudeTranslator::default().export(conversation)?;
         let source = decorate_claude_jsonl(
             artifact.artifact,
             &session_id,
             cwd,
             compatibility.version.as_deref(),
         )?;
-        ClaudeTranslator.validate(&NativeArtifact::JsonLines(source.clone()))?;
+        ClaudeTranslator::default().validate(&NativeArtifact::JsonLines(source.clone()))?;
         let backup = atomic_write(&path, source.as_bytes())?;
         update_session_index(&directory, cwd, &session_id, &path, &source)?;
         Ok(InstalledSession {
@@ -502,7 +502,10 @@ mod tests {
                 native: None,
             },
         ]);
-        let artifact = ClaudeTranslator.export(&conversation).unwrap().artifact;
+        let artifact = ClaudeTranslator::default()
+            .export(&conversation)
+            .unwrap()
+            .artifact;
         let source = decorate_claude_jsonl(
             artifact,
             "session-id",

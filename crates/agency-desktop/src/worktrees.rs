@@ -29,6 +29,82 @@ pub fn discover(workspace: &Path) -> Result<Vec<Worktree>, String> {
     }
 }
 
+pub fn create(
+    workspace: &Path,
+    branch: &str,
+    base: Option<&str>,
+    path_hint: Option<&str>,
+) -> Result<Worktree, String> {
+    let branch = branch.trim();
+    if branch.is_empty() {
+        return Err("Branch name cannot be empty".to_owned());
+    }
+    let validation = Command::new("git")
+        .args(["check-ref-format", "--branch", branch])
+        .current_dir(workspace)
+        .output()
+        .map_err(|error| format!("Could not validate branch name: {error}"))?;
+    if !validation.status.success() {
+        return Err(format!("Invalid branch name: {branch}"));
+    }
+
+    let existing = discover(workspace)?;
+    let primary = existing
+        .first()
+        .ok_or_else(|| "Git did not report a primary worktree".to_owned())?;
+    let repository_name = primary
+        .path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("workspace");
+    let hint = path_hint
+        .map(str::trim)
+        .filter(|hint| !hint.is_empty())
+        .unwrap_or_else(|| branch.rsplit('/').next().unwrap_or(branch));
+    if !hint
+        .chars()
+        .all(|character| character.is_ascii_alphanumeric() || "-_.".contains(character))
+        || hint == "."
+        || hint == ".."
+    {
+        return Err(
+            "Worktree path hint may contain only letters, numbers, '-', '_', and '.'".to_owned(),
+        );
+    }
+    let parent = primary
+        .path
+        .parent()
+        .ok_or_else(|| "Primary worktree has no parent directory".to_owned())?;
+    let path = parent.join(format!("{repository_name}-{hint}"));
+    if path.exists() {
+        return Err(format!("Worktree path already exists: {}", path.display()));
+    }
+
+    let base = base
+        .map(str::trim)
+        .filter(|base| !base.is_empty())
+        .unwrap_or("HEAD");
+    let output = Command::new("git")
+        .args(["worktree", "add", "-b", branch])
+        .arg("--")
+        .arg(&path)
+        .arg(base)
+        .current_dir(workspace)
+        .output()
+        .map_err(|error| format!("Could not create Git worktree: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "Could not create Git worktree: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    Ok(Worktree {
+        path,
+        label: branch.to_owned(),
+        branch: Some(branch.to_owned()),
+    })
+}
+
 fn parse_porcelain(output: &str) -> Vec<Worktree> {
     output
         .split("\n\n")
