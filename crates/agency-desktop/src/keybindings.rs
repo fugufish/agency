@@ -3,28 +3,305 @@ use iced::keyboard::{
     Key, Modifiers,
     key::{Code, Named, Physical},
 };
+use std::collections::BTreeMap;
+#[cfg(test)]
+use std::collections::HashMap;
+use std::hash::Hash;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Mode {
     Normal,
+    Insert,
+    Visual,
     Terminal,
-    Composer,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ComposerMotion {
+    Left,
+    Right,
+    Up,
+    Down,
+    WordForward,
+    WordBackward,
+    WordEnd,
+    LineStart,
+    LineEnd,
+    DocumentStart,
+    DocumentEnd,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ComposerOperator {
+    Delete,
+    Change,
+    Yank,
+}
+
+/// The semantic keybinding context owned by the currently focused UI element.
+///
+/// Add a variant when introducing a surface with local keybindings, attach it
+/// to that surface's [`FocusId`], and dispatch using [`FocusTracker::context`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct KeybindingContext(pub &'static str);
+
+#[allow(non_upper_case_globals)]
+impl KeybindingContext {
+    pub const Workspace: Self = Self("workspace");
+    pub const Toolbar: Self = Self("toolbar");
+    pub const Explorer: Self = Self("explorer");
+    pub const DiffActivity: Self = Self("diff-activity");
+    pub const DiffViewer: Self = Self("diff-viewer");
+    pub const Composer: Self = Self("composer");
+    pub const Terminal: Self = Self("terminal");
+    pub const Confirmation: Self = Self("confirmation");
+    pub const AgentMenu: Self = Self("agent-menu");
+
+    #[cfg(test)]
+    pub const fn new(id: &'static str) -> Self {
+        Self(id)
+    }
+}
+
+impl Default for KeybindingContext {
+    fn default() -> Self {
+        Self::Workspace
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct DispatchContext {
+    pub focused: KeybindingContext,
+    pub terminal_available: bool,
+    pub composer_available: bool,
+}
+
+impl DispatchContext {
+    pub fn focused(focused: KeybindingContext) -> Self {
+        Self {
+            focused,
+            terminal_available: false,
+            composer_available: false,
+        }
+    }
+}
+
+/// Numeric window identity. Its value is the window's left-to-right position.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct FocusId(pub usize);
+
+#[derive(Debug, Clone, Copy)]
+struct FocusEntry<C> {
+    context: C,
+    visible: bool,
+}
+
+/// Reusable focus harness associating arbitrary UI elements with contexts.
+#[derive(Debug, Clone)]
+pub struct FocusTracker<C> {
+    windows: BTreeMap<FocusId, FocusEntry<C>>,
+    focused: FocusId,
+}
+
+#[derive(Debug, Clone)]
+struct ElementModes<M> {
+    allowed: Vec<M>,
+}
+
+/// Registry of the global modes in which each focusable tool can bind keys.
+/// It deliberately stores no active mode: mode is application-global.
+#[derive(Debug, Clone)]
+pub struct ElementModeRegistry<M> {
+    elements: BTreeMap<FocusId, ElementModes<M>>,
+}
+
+impl<M> Default for ElementModeRegistry<M> {
+    fn default() -> Self {
+        Self {
+            elements: BTreeMap::new(),
+        }
+    }
+}
+
+/// Declarative, provider-neutral keymap keyed by app mode, element context,
+/// tool-supported mode, and normalized key sequence. Both IDs and actions are
+/// caller-defined, so adding a feature never requires changing this harness.
+#[cfg(test)]
+#[derive(Debug, Clone)]
+pub struct ContextKeymap<AppMode, Context, ElementMode, Command> {
+    bindings: HashMap<(AppMode, Context, Option<ElementMode>, String), Command>,
+}
+
+#[cfg(test)]
+impl<AppMode, Context, ElementMode, Command> Default
+    for ContextKeymap<AppMode, Context, ElementMode, Command>
+{
+    fn default() -> Self {
+        Self {
+            bindings: HashMap::new(),
+        }
+    }
+}
+
+#[cfg(test)]
+impl<AppMode, Context, ElementMode, Command> ContextKeymap<AppMode, Context, ElementMode, Command>
+where
+    AppMode: Copy + Eq + Hash,
+    Context: Copy + Eq + Hash,
+    ElementMode: Copy + Eq + Hash,
+{
+    pub fn bind(
+        &mut self,
+        app_mode: AppMode,
+        context: Context,
+        element_mode: Option<ElementMode>,
+        sequence: impl Into<String>,
+        command: Command,
+    ) {
+        self.bindings
+            .insert((app_mode, context, element_mode, sequence.into()), command);
+    }
+
+    pub fn resolve(
+        &self,
+        app_mode: AppMode,
+        context: Context,
+        element_mode: Option<ElementMode>,
+        sequence: &str,
+    ) -> Option<&Command> {
+        self.bindings
+            .get(&(app_mode, context, element_mode, sequence.to_owned()))
+    }
+}
+
+impl<M: Copy + PartialEq> ElementModeRegistry<M> {
+    pub fn attach(&mut self, element: FocusId, allowed: impl IntoIterator<Item = M>) {
+        let allowed = allowed.into_iter().collect::<Vec<_>>();
+        assert!(
+            !allowed.is_empty(),
+            "an element must support at least one mode"
+        );
+        self.elements.insert(element, ElementModes { allowed });
+    }
+
+    pub fn supports(&self, element: FocusId, mode: M) -> bool {
+        self.elements
+            .get(&element)
+            .is_some_and(|element| element.allowed.contains(&mode))
+    }
+
+    #[cfg(test)]
+    pub fn allows_modes(&self, element: FocusId) -> bool {
+        self.elements
+            .get(&element)
+            .is_some_and(|element| element.allowed.len() > 1)
+    }
+}
+
+impl<C: Copy> FocusTracker<C> {
+    pub fn new(initial: FocusId, context: C) -> Self {
+        Self {
+            windows: BTreeMap::from([(
+                initial,
+                FocusEntry {
+                    context,
+                    visible: true,
+                },
+            )]),
+            focused: initial,
+        }
+    }
+
+    pub fn attach(&mut self, element: FocusId, context: C) {
+        self.windows.insert(
+            element,
+            FocusEntry {
+                context,
+                visible: false,
+            },
+        );
+    }
+
+    pub fn set_visible(&mut self, element: FocusId, visible: bool) -> bool {
+        let Some(entry) = self.windows.get_mut(&element) else {
+            return false;
+        };
+        entry.visible = visible;
+        true
+    }
+
+    pub fn focus(&mut self, element: FocusId) -> bool {
+        if self
+            .windows
+            .get(&element)
+            .is_some_and(|entry| entry.visible)
+        {
+            self.focused = element;
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn focused(&self) -> FocusId {
+        self.focused
+    }
+
+    pub fn is_visible(&self, element: FocusId) -> bool {
+        self.windows
+            .get(&element)
+            .is_some_and(|entry| entry.visible)
+    }
+
+    pub fn context(&self) -> C {
+        self.windows[&self.focused].context
+    }
+
+    pub fn focus_right(&mut self) -> FocusId {
+        self.cycle(true)
+    }
+
+    pub fn focus_left(&mut self) -> FocusId {
+        self.cycle(false)
+    }
+
+    fn cycle(&mut self, right: bool) -> FocusId {
+        let visible = self
+            .windows
+            .iter()
+            .filter_map(|(id, entry)| entry.visible.then_some(*id))
+            .collect::<Vec<_>>();
+        if let Some(position) = visible.iter().position(|id| *id == self.focused) {
+            let next = if right {
+                (position + 1) % visible.len()
+            } else {
+                position.checked_sub(1).unwrap_or(visible.len() - 1)
+            };
+            self.focused = visible[next];
+        } else if let Some(first) = visible.first() {
+            self.focused = *first;
+        }
+        self.focused
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ModeIndicator {
     Normal,
+    Insert,
+    Visual,
     Terminal,
-    Composer,
     Leader,
 }
 
 impl ModeIndicator {
+    #[cfg(test)]
     pub fn label(self) -> &'static str {
         match self {
             Self::Normal => "NORMAL",
+            Self::Insert => "INSERT",
+            Self::Visual => "VISUAL",
             Self::Terminal => "TERMINAL",
-            Self::Composer => "COMPOSER",
             Self::Leader => "LEADER",
         }
     }
@@ -34,16 +311,21 @@ impl ModeIndicator {
 pub enum Activity {
     Sessions,
     Explorer,
+    Mcp,
     Diffs,
+    FileViewer,
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Action {
     None,
+    FocusRight,
+    FocusLeft,
     WorktreePrevious,
     WorktreeNext,
     WorktreeSelect(usize),
     ToggleActivity(Activity),
+    ToggleSettings,
     NewSession,
     ToolbarPrevious,
     ToolbarNext,
@@ -66,10 +348,26 @@ pub enum Action {
     DiffJumpToTool,
     DiffClose,
     ToggleTerminal,
+    ToggleAgentMenu,
+    AgentMenuPrevious,
+    AgentMenuNext,
+    AgentMenuFirst,
+    AgentMenuLast,
+    AgentMenuConfirm,
+    AgentMenuClose,
+    EnterComposer,
+    EnterTerminal,
     AgentAppend(String),
     AgentBackspace,
     AgentPaste,
     AgentSelectAll,
+    AgentMove(ComposerMotion),
+    AgentOperate(ComposerOperator, Option<ComposerMotion>),
+    AgentOperateSelection(ComposerOperator),
+    AgentDeleteChar,
+    AgentInsertAtLineStart,
+    AgentAppendAtCursor,
+    AgentAppendAtLineEnd,
     AgentSubmit,
     TerminalInput(Vec<u8>),
 }
@@ -79,6 +377,9 @@ pub struct Keybindings {
     mode: Mode,
     leader_pending: bool,
     leader_separator_pending: bool,
+    focus_chord_pending: Option<bool>,
+    composer_operator_pending: Option<ComposerOperator>,
+    composer_g_pending: bool,
 }
 
 impl Default for Keybindings {
@@ -94,27 +395,74 @@ impl Keybindings {
             mode: Mode::Normal,
             leader_pending: false,
             leader_separator_pending: false,
+            focus_chord_pending: None,
+            composer_operator_pending: None,
+            composer_g_pending: false,
         }
     }
 
     pub fn is_composer_active(&self) -> bool {
-        self.mode == Mode::Composer
+        matches!(self.mode, Mode::Insert | Mode::Visual)
+    }
+
+    pub fn is_normal(&self) -> bool {
+        self.mode == Mode::Normal
+    }
+
+    pub fn mode(&self) -> Mode {
+        self.mode
+    }
+
+    pub fn set_mode(&mut self, mode: Mode) {
+        self.mode = mode;
+        self.composer_operator_pending = None;
+        self.composer_g_pending = false;
+    }
+
+    pub fn display_label(&self) -> &'static str {
+        if self.leader_pending {
+            return "LEADER";
+        }
+        match self.mode {
+            Mode::Normal => "NORMAL",
+            Mode::Insert => "INSERT",
+            Mode::Visual => "VISUAL",
+            Mode::Terminal => "TERMINAL",
+        }
+    }
+
+    pub fn activate_context(&mut self, context: KeybindingContext) {
+        self.leader_pending = false;
+        self.leader_separator_pending = false;
+        if context == KeybindingContext::Terminal {
+            self.mode = Mode::Terminal;
+        } else if self.mode == Mode::Terminal {
+            self.mode = Mode::Normal;
+        }
     }
 
     pub fn is_leader_pending(&self) -> bool {
         self.leader_pending
     }
 
-    pub fn show_sessions_hint(&self) -> &str {
-        &self.config.show_sessions
+    pub fn toggle_sessions_hint(&self) -> &str {
+        &self.config.toggle_sessions
     }
 
-    pub fn show_explorer_hint(&self) -> &str {
-        &self.config.show_explorer
+    pub fn toggle_explorer_hint(&self) -> &str {
+        &self.config.toggle_explorer
     }
 
-    pub fn show_diffs_hint(&self) -> &str {
-        &self.config.show_diffs
+    pub fn toggle_mcp_hint(&self) -> &str {
+        &self.config.toggle_mcp
+    }
+
+    pub fn toggle_diffs_hint(&self) -> &str {
+        &self.config.toggle_diffs
+    }
+
+    pub fn toggle_settings_hint(&self) -> &str {
+        &self.config.toggle_settings
     }
 
     pub fn toggle_terminal_hint(&self) -> &str {
@@ -123,6 +471,10 @@ impl Keybindings {
 
     pub fn enter_active_view_hint(&self) -> &str {
         &self.config.enter_active_view
+    }
+
+    pub fn toggle_agent_menu_hint(&self) -> &str {
+        &self.config.toggle_agent_menu
     }
 
     pub fn toggle_terminal_mode(&mut self, terminal_visible: bool) {
@@ -144,12 +496,15 @@ impl Keybindings {
         } else {
             match self.mode {
                 Mode::Normal => ModeIndicator::Normal,
+                Mode::Insert => ModeIndicator::Insert,
+                Mode::Visual => ModeIndicator::Visual,
                 Mode::Terminal => ModeIndicator::Terminal,
-                Mode::Composer => ModeIndicator::Composer,
             }
         }
     }
 
+    #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
     pub fn handle(
         &mut self,
         key: &Key,
@@ -175,6 +530,8 @@ impl Keybindings {
         )
     }
 
+    #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
     pub fn handle_with_diff(
         &mut self,
         key: &Key,
@@ -188,30 +545,95 @@ impl Keybindings {
         diff_activity_visible: bool,
         diff_viewer_visible: bool,
     ) -> Action {
+        let context = if diff_viewer_visible {
+            KeybindingContext::DiffViewer
+        } else if diff_activity_visible {
+            KeybindingContext::DiffActivity
+        } else if toolbar_visible && explorer_active {
+            KeybindingContext::Explorer
+        } else if toolbar_visible {
+            KeybindingContext::Toolbar
+        } else if agent_visible {
+            KeybindingContext::Composer
+        } else {
+            KeybindingContext::Workspace
+        };
+        self.handle_in_context(
+            key,
+            physical_key,
+            modifiers,
+            text,
+            DispatchContext {
+                focused: context,
+                terminal_available: terminal_visible,
+                composer_available: agent_visible,
+            },
+        )
+    }
+
+    pub fn handle_in_context(
+        &mut self,
+        key: &Key,
+        physical_key: Physical,
+        modifiers: Modifiers,
+        text: Option<&str>,
+        context: DispatchContext,
+    ) -> Action {
+        if let Some(right) = self.focus_chord_pending.take()
+            && (modifiers.is_empty() || modifiers == Modifiers::CTRL)
+            && is_character(key, physical_key, "w", Code::KeyW)
+        {
+            return if right {
+                Action::FocusRight
+            } else {
+                Action::FocusLeft
+            };
+        }
+        if modifiers.control()
+            && is_character(key, physical_key, "w", Code::KeyW)
+            && modifiers != Modifiers::CTRL
+            && modifiers != (Modifiers::CTRL | Modifiers::SHIFT)
+        {
+            return Action::None;
+        }
+        if modifiers.control() && is_character(key, physical_key, "w", Code::KeyW) {
+            self.focus_chord_pending = Some(!modifiers.shift());
+            return Action::None;
+        }
+
         if self.leader_pending {
             return self.handle_leader_suffix(
                 key,
                 physical_key,
                 modifiers,
-                terminal_visible,
-                agent_visible,
+                context.terminal_available,
+                context.composer_available,
             );
         }
 
+        // NORMAL mode commands remain global even while the composer owns
+        // focus. The composer has its own NORMAL-mode motions, but the leader
+        // must be recognized before dispatching into that local keymap.
+        if self.mode == Mode::Normal
+            && modifiers.is_empty()
+            && configured_character(key, physical_key, &self.config.leader, " ", Code::Space)
+        {
+            self.leader_pending = true;
+            return Action::None;
+        }
+
         match self.mode {
-            Mode::Normal => self.handle_normal(
-                key,
-                physical_key,
-                modifiers,
-                terminal_visible,
-                agent_visible,
-                toolbar_visible,
-                explorer_active,
-                diff_activity_visible,
-                diff_viewer_visible,
-            ),
+            Mode::Normal | Mode::Visual if context.focused == KeybindingContext::Composer => {
+                self.handle_agent(key, physical_key, modifiers, text)
+            }
+            Mode::Normal | Mode::Visual => {
+                self.handle_normal(key, physical_key, modifiers, context)
+            }
+            Mode::Insert if context.focused == KeybindingContext::Composer => {
+                self.handle_agent(key, physical_key, modifiers, text)
+            }
+            Mode::Insert => Action::None,
             Mode::Terminal => self.handle_terminal(key, physical_key, modifiers, text),
-            Mode::Composer => self.handle_agent(key, physical_key, modifiers, text),
         }
     }
 
@@ -220,28 +642,63 @@ impl Keybindings {
         key: &Key,
         physical_key: Physical,
         modifiers: Modifiers,
-        terminal_visible: bool,
-        agent_visible: bool,
-        toolbar_visible: bool,
-        explorer_active: bool,
-        diff_activity_visible: bool,
-        diff_viewer_visible: bool,
+        context: DispatchContext,
     ) -> Action {
-        if modifiers.is_empty()
-            && configured_character(key, physical_key, &self.config.leader, " ", Code::Space)
-        {
-            self.leader_pending = true;
+        let focused = context.focused;
+        // The agent menu is a floating popover that owns input while it is
+        // open: unhandled keys resolve to nothing rather than falling through
+        // to the surface it floats above.
+        if focused == KeybindingContext::AgentMenu {
+            if modifiers == Modifiers::SHIFT && is_character(key, physical_key, "g", Code::KeyG) {
+                return Action::AgentMenuLast;
+            }
+            if modifiers.is_empty() {
+                if matches!(key.as_ref(), Key::Named(Named::ArrowUp))
+                    || is_character(key, physical_key, "k", Code::KeyK)
+                {
+                    return Action::AgentMenuPrevious;
+                }
+                if matches!(key.as_ref(), Key::Named(Named::ArrowDown))
+                    || is_character(key, physical_key, "j", Code::KeyJ)
+                {
+                    return Action::AgentMenuNext;
+                }
+                if is_character(key, physical_key, "g", Code::KeyG) {
+                    return Action::AgentMenuFirst;
+                }
+                if matches!(key.as_ref(), Key::Named(Named::Enter)) {
+                    return Action::AgentMenuConfirm;
+                }
+                if matches!(key.as_ref(), Key::Named(Named::Escape)) {
+                    return Action::AgentMenuClose;
+                }
+            }
             return Action::None;
         }
 
-        if diff_viewer_visible
+        if focused == KeybindingContext::DiffViewer
             && modifiers == Modifiers::CTRL
             && is_character(key, physical_key, "c", Code::KeyC)
         {
             return Action::DiffClose;
         }
 
-        if diff_viewer_visible && modifiers.is_empty() {
+        if focused == KeybindingContext::DiffViewer && modifiers.is_empty() {
+            if matches!(key.as_ref(), Key::Named(Named::Escape)) {
+                self.mode = Mode::Normal;
+                return Action::None;
+            }
+            if is_character(key, physical_key, "v", Code::KeyV) {
+                self.mode = if self.mode == Mode::Visual {
+                    Mode::Normal
+                } else {
+                    Mode::Visual
+                };
+                return Action::None;
+            }
+            if is_character(key, physical_key, "i", Code::KeyI) {
+                return Action::None;
+            }
             if matches!(key.as_ref(), Key::Named(Named::ArrowUp))
                 || is_character(key, physical_key, "k", Code::KeyK)
             {
@@ -257,7 +714,7 @@ impl Keybindings {
             }
         }
 
-        if diff_activity_visible {
+        if focused == KeybindingContext::DiffActivity {
             if modifiers == Modifiers::SHIFT && is_character(key, physical_key, "g", Code::KeyG) {
                 return Action::DiffLast;
             }
@@ -281,15 +738,14 @@ impl Keybindings {
             }
         }
 
-        if toolbar_visible
-            && !explorer_active
+        if focused == KeybindingContext::Toolbar
             && modifiers == Modifiers::SHIFT
             && is_character(key, physical_key, "g", Code::KeyG)
         {
             return Action::ToolbarLast;
         }
 
-        if toolbar_visible && explorer_active && modifiers.is_empty() {
+        if focused == KeybindingContext::Explorer && modifiers.is_empty() {
             if matches!(key.as_ref(), Key::Named(Named::ArrowUp))
                 || is_character(key, physical_key, "k", Code::KeyK)
             {
@@ -315,7 +771,7 @@ impl Keybindings {
             }
         }
 
-        if toolbar_visible && !explorer_active && modifiers.is_empty() {
+        if focused == KeybindingContext::Toolbar && modifiers.is_empty() {
             if is_character(key, physical_key, "k", Code::KeyK) {
                 return Action::ToolbarPrevious;
             }
@@ -334,16 +790,23 @@ impl Keybindings {
         }
 
         if modifiers.is_empty() {
-            if !explorer_active && is_character(key, physical_key, "h", Code::KeyH) {
+            if focused != KeybindingContext::Explorer
+                && is_character(key, physical_key, "h", Code::KeyH)
+            {
                 return Action::WorktreePrevious;
             }
-            if !explorer_active && is_character(key, physical_key, "l", Code::KeyL) {
+            if focused != KeybindingContext::Explorer
+                && is_character(key, physical_key, "l", Code::KeyL)
+            {
                 return Action::WorktreeNext;
             }
         }
 
+        // Entering an insert-like mode is an action, never a bare mode
+        // mutation: the mode is only meaningful once the owning element also
+        // holds focus, so the application moves focus and sets the mode
+        // together.
         if modifiers.is_empty()
-            && terminal_visible
             && configured_character(
                 key,
                 physical_key,
@@ -352,19 +815,12 @@ impl Keybindings {
                 Code::KeyI,
             )
         {
-            self.mode = Mode::Terminal;
-        }
-        if modifiers.is_empty()
-            && agent_visible
-            && configured_character(
-                key,
-                physical_key,
-                &self.config.enter_active_view,
-                "i",
-                Code::KeyI,
-            )
-        {
-            self.mode = Mode::Composer;
+            if context.composer_available {
+                return Action::EnterComposer;
+            }
+            if context.terminal_available {
+                return Action::EnterTerminal;
+            }
         }
 
         Action::None
@@ -400,7 +856,7 @@ impl Keybindings {
         if configured_character(
             key,
             physical_key,
-            &self.config.show_explorer,
+            &self.config.toggle_explorer,
             "e",
             Code::KeyE,
         ) {
@@ -410,20 +866,60 @@ impl Keybindings {
         if configured_character(
             key,
             physical_key,
-            &self.config.show_sessions,
+            &self.config.toggle_sessions,
             "s",
             Code::KeyS,
         ) {
             self.mode = Mode::Normal;
             return Action::ToggleActivity(Activity::Sessions);
         }
-        if configured_character(key, physical_key, &self.config.show_diffs, "d", Code::KeyD) {
+        if configured_character(key, physical_key, &self.config.toggle_mcp, "m", Code::KeyM) {
+            self.mode = Mode::Normal;
+            return Action::ToggleActivity(Activity::Mcp);
+        }
+        if configured_character(
+            key,
+            physical_key,
+            &self.config.toggle_file_viewer,
+            "d",
+            Code::KeyD,
+        ) {
+            self.mode = Mode::Normal;
+            return Action::ToggleActivity(Activity::FileViewer);
+        }
+        if configured_character(
+            key,
+            physical_key,
+            &self.config.toggle_diffs,
+            "f",
+            Code::KeyF,
+        ) {
             self.mode = Mode::Normal;
             return Action::ToggleActivity(Activity::Diffs);
         }
+        if configured_character(
+            key,
+            physical_key,
+            &self.config.toggle_settings,
+            ",",
+            Code::Comma,
+        ) {
+            self.mode = Mode::Normal;
+            return Action::ToggleSettings;
+        }
         if configured_character(key, physical_key, &self.config.new_session, "n", Code::KeyN) {
-            self.mode = Mode::Composer;
+            self.mode = Mode::Normal;
             return Action::NewSession;
+        }
+        if configured_character(
+            key,
+            physical_key,
+            &self.config.toggle_agent_menu,
+            "a",
+            Code::KeyA,
+        ) {
+            self.mode = Mode::Normal;
+            return Action::ToggleAgentMenu;
         }
         if agent_visible
             && configured_character(
@@ -434,8 +930,7 @@ impl Keybindings {
                 Code::KeyI,
             )
         {
-            self.mode = Mode::Composer;
-            return Action::None;
+            return Action::EnterComposer;
         }
         if configured_character(
             key,
@@ -483,24 +978,201 @@ impl Keybindings {
             return Action::AgentSelectAll;
         }
 
-        match key.as_ref() {
-            Key::Named(Named::Escape) => {
-                self.mode = Mode::Normal;
+        match self.mode {
+            Mode::Insert => match key.as_ref() {
+                Key::Named(Named::Escape) => {
+                    self.mode = Mode::Normal;
+                    Action::None
+                }
+                Key::Named(Named::Enter) if !modifiers.shift() => Action::AgentSubmit,
+                Key::Named(Named::Backspace) => Action::AgentBackspace,
+                _ if !modifiers.control()
+                    && !modifiers.logo()
+                    && (text.is_some()
+                        || physical_key == Physical::Code(Code::Space)
+                        || matches!(key, Key::Character(_))) =>
+                {
+                    Action::AgentAppend(printable_text(key, physical_key, text))
+                }
+                _ => Action::None,
+            },
+            Mode::Normal | Mode::Visual => {
+                if matches!(key.as_ref(), Key::Named(Named::Escape)) {
+                    self.composer_operator_pending = None;
+                    self.composer_g_pending = false;
+                    self.mode = Mode::Normal;
+                    return Action::None;
+                }
+                let shifted = modifiers.shift();
+                if modifiers.is_empty() && is_character(key, physical_key, "v", Code::KeyV) {
+                    self.mode = if self.mode == Mode::Visual {
+                        Mode::Normal
+                    } else {
+                        Mode::Visual
+                    };
+                    self.composer_operator_pending = None;
+                    self.composer_g_pending = false;
+                    return Action::None;
+                }
+
+                if self.mode == Mode::Normal {
+                    if modifiers.is_empty() && is_character(key, physical_key, "i", Code::KeyI) {
+                        self.mode = Mode::Insert;
+                        return Action::None;
+                    }
+                    if modifiers.is_empty() && is_character(key, physical_key, "a", Code::KeyA) {
+                        self.mode = Mode::Insert;
+                        return Action::AgentAppendAtCursor;
+                    }
+                    if shifted && is_character(key, physical_key, "a", Code::KeyA) {
+                        self.mode = Mode::Insert;
+                        return Action::AgentAppendAtLineEnd;
+                    }
+                    if shifted && is_character(key, physical_key, "i", Code::KeyI) {
+                        self.mode = Mode::Insert;
+                        return Action::AgentInsertAtLineStart;
+                    }
+                }
+
+                let plain_g =
+                    modifiers.is_empty() && is_character(key, physical_key, "g", Code::KeyG);
+                if plain_g {
+                    if !self.composer_g_pending {
+                        self.composer_g_pending = true;
+                        return Action::None;
+                    }
+                    self.composer_g_pending = false;
+                    let motion = ComposerMotion::DocumentStart;
+                    if let Some(operator) = self.composer_operator_pending.take() {
+                        if operator == ComposerOperator::Change {
+                            self.mode = Mode::Insert;
+                        }
+                        return Action::AgentOperate(operator, Some(motion));
+                    }
+                    return Action::AgentMove(motion);
+                }
+                self.composer_g_pending = false;
+
+                if self.mode == Mode::Normal {
+                    let operator = if is_character(key, physical_key, "d", Code::KeyD) {
+                        Some(ComposerOperator::Delete)
+                    } else if is_character(key, physical_key, "c", Code::KeyC) {
+                        Some(ComposerOperator::Change)
+                    } else if is_character(key, physical_key, "y", Code::KeyY) {
+                        Some(ComposerOperator::Yank)
+                    } else {
+                        None
+                    };
+                    if let Some(operator) = operator {
+                        if shifted && operator != ComposerOperator::Yank {
+                            self.mode = if operator == ComposerOperator::Change {
+                                Mode::Insert
+                            } else {
+                                Mode::Normal
+                            };
+                            self.composer_operator_pending = None;
+                            return Action::AgentOperate(operator, Some(ComposerMotion::LineEnd));
+                        }
+                        if self.composer_operator_pending == Some(operator) {
+                            self.composer_operator_pending = None;
+                            if operator == ComposerOperator::Change {
+                                self.mode = Mode::Insert;
+                            }
+                            return Action::AgentOperate(operator, None);
+                        }
+                        self.composer_operator_pending = Some(operator);
+                        return Action::None;
+                    }
+
+                    let motion = composer_motion(key, physical_key, modifiers);
+                    if let Some(motion) = motion {
+                        if let Some(operator) = self.composer_operator_pending.take() {
+                            if operator == ComposerOperator::Change {
+                                self.mode = Mode::Insert;
+                            }
+                            return Action::AgentOperate(operator, Some(motion));
+                        }
+                        return Action::AgentMove(motion);
+                    }
+                    self.composer_operator_pending = None;
+                    if modifiers.is_empty() && is_character(key, physical_key, "x", Code::KeyX) {
+                        return Action::AgentDeleteChar;
+                    }
+                } else {
+                    let operator = if modifiers.is_empty()
+                        && is_character(key, physical_key, "d", Code::KeyD)
+                        || modifiers.is_empty() && is_character(key, physical_key, "x", Code::KeyX)
+                    {
+                        Some(ComposerOperator::Delete)
+                    } else if modifiers.is_empty()
+                        && is_character(key, physical_key, "c", Code::KeyC)
+                    {
+                        Some(ComposerOperator::Change)
+                    } else if modifiers.is_empty()
+                        && is_character(key, physical_key, "y", Code::KeyY)
+                    {
+                        Some(ComposerOperator::Yank)
+                    } else {
+                        None
+                    };
+                    if let Some(operator) = operator {
+                        self.mode = if operator == ComposerOperator::Change {
+                            Mode::Insert
+                        } else {
+                            Mode::Normal
+                        };
+                        return Action::AgentOperateSelection(operator);
+                    }
+
+                    if let Some(motion) = composer_motion(key, physical_key, modifiers) {
+                        return Action::AgentMove(motion);
+                    }
+                }
+
+                if modifiers.is_empty() && is_character(key, physical_key, "p", Code::KeyP) {
+                    if self.mode == Mode::Visual {
+                        self.mode = Mode::Normal;
+                    }
+                    return Action::AgentPaste;
+                }
                 Action::None
             }
-            Key::Named(Named::Enter) if !modifiers.shift() => Action::AgentSubmit,
-            Key::Named(Named::Backspace) => Action::AgentBackspace,
-            _ if !modifiers.control()
-                && !modifiers.logo()
-                && (text.is_some()
-                    || physical_key == Physical::Code(Code::Space)
-                    || matches!(key, Key::Character(_))) =>
-            {
-                Action::AgentAppend(printable_text(key, physical_key, text))
-            }
-            _ => Action::None,
+            Mode::Terminal => Action::None,
         }
     }
+}
+
+fn composer_motion(
+    key: &Key,
+    physical_key: Physical,
+    modifiers: Modifiers,
+) -> Option<ComposerMotion> {
+    let plain = !modifiers.control() && !modifiers.logo() && !modifiers.alt();
+    plain.then(|| {
+        if is_character(key, physical_key, "h", Code::KeyH) {
+            Some(ComposerMotion::Left)
+        } else if is_character(key, physical_key, "l", Code::KeyL) {
+            Some(ComposerMotion::Right)
+        } else if is_character(key, physical_key, "k", Code::KeyK) {
+            Some(ComposerMotion::Up)
+        } else if is_character(key, physical_key, "j", Code::KeyJ) {
+            Some(ComposerMotion::Down)
+        } else if is_character(key, physical_key, "w", Code::KeyW) {
+            Some(ComposerMotion::WordForward)
+        } else if is_character(key, physical_key, "b", Code::KeyB) {
+            Some(ComposerMotion::WordBackward)
+        } else if is_character(key, physical_key, "e", Code::KeyE) {
+            Some(ComposerMotion::WordEnd)
+        } else if matches!(key.as_ref(), Key::Character(value) if value == "0") {
+            Some(ComposerMotion::LineStart)
+        } else if matches!(key.as_ref(), Key::Character(value) if value == "$") {
+            Some(ComposerMotion::LineEnd)
+        } else if modifiers.shift() && is_character(key, physical_key, "g", Code::KeyG) {
+            Some(ComposerMotion::DocumentEnd)
+        } else {
+            None
+        }
+    })?
 }
 
 fn printable_text(key: &Key, physical_key: Physical, text: Option<&str>) -> String {
@@ -604,6 +1276,148 @@ fn control_byte(character: char) -> Option<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn focus_tracker_attaches_contexts_and_rejects_unknown_focus() {
+        let workspace = FocusId(1);
+        let explorer = FocusId(0);
+        let unknown = FocusId(99);
+        let mut focus = FocusTracker::new(workspace, KeybindingContext::Workspace);
+        focus.attach(explorer, KeybindingContext::Explorer);
+        focus.set_visible(explorer, true);
+
+        assert!(focus.focus(explorer));
+        assert_eq!(focus.focused(), explorer);
+        assert_eq!(focus.context(), KeybindingContext::Explorer);
+        assert!(!focus.focus(unknown));
+        assert_eq!(focus.focused(), explorer);
+    }
+
+    #[test]
+    fn focus_tracker_cycles_visible_windows_in_numeric_order() {
+        let mut focus = FocusTracker::new(FocusId(1), KeybindingContext::Workspace);
+        focus.attach(FocusId(0), KeybindingContext::Explorer);
+        focus.attach(FocusId(2), KeybindingContext::DiffViewer);
+        focus.attach(FocusId(3), KeybindingContext::DiffActivity);
+        focus.set_visible(FocusId(0), true);
+        focus.set_visible(FocusId(2), true);
+
+        assert_eq!(focus.focus_right(), FocusId(2));
+        assert_eq!(focus.focus_right(), FocusId(0));
+        assert_eq!(focus.focus_left(), FocusId(2));
+    }
+
+    #[test]
+    fn arbitrary_features_can_register_contexts_modes_and_commands() {
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+        enum CanvasMode {
+            Pan,
+            Draw,
+        }
+        #[derive(Debug, PartialEq, Eq)]
+        enum CanvasCommand {
+            Stroke,
+        }
+
+        let canvas = FocusId(42);
+        let context = KeybindingContext::new("plugin.canvas");
+        let focus = FocusTracker::new(canvas, context);
+        let mut modes = ElementModeRegistry::default();
+        modes.attach(canvas, [CanvasMode::Pan, CanvasMode::Draw]);
+        let mut keymap = ContextKeymap::default();
+        keymap.bind(
+            Mode::Normal,
+            context,
+            Some(CanvasMode::Draw),
+            "mouse1",
+            CanvasCommand::Stroke,
+        );
+
+        assert_eq!(focus.context(), context);
+        assert!(modes.allows_modes(canvas));
+        assert!(modes.supports(canvas, CanvasMode::Draw));
+        assert_eq!(
+            keymap.resolve(Mode::Normal, context, Some(CanvasMode::Draw), "mouse1"),
+            Some(&CanvasCommand::Stroke)
+        );
+    }
+
+    #[test]
+    fn focus_chords_are_global_and_directional() {
+        let context = DispatchContext::focused(KeybindingContext::Composer);
+        let mut bindings = Keybindings::default();
+        let ctrl_w = parse_vscode_key("ctrl+w");
+        let ctrl_shift_w = parse_vscode_key("ctrl+shift+w");
+        let w = parse_vscode_key("w");
+
+        assert_eq!(
+            bindings.handle_in_context(
+                &ctrl_w.key,
+                ctrl_w.physical,
+                ctrl_w.modifiers,
+                ctrl_w.text.as_deref(),
+                context,
+            ),
+            Action::None
+        );
+        assert_eq!(
+            bindings
+                .handle_in_context(&w.key, w.physical, w.modifiers, w.text.as_deref(), context,),
+            Action::FocusRight
+        );
+        assert_eq!(
+            bindings.handle_in_context(
+                &ctrl_shift_w.key,
+                ctrl_shift_w.physical,
+                ctrl_shift_w.modifiers,
+                ctrl_shift_w.text.as_deref(),
+                context,
+            ),
+            Action::None
+        );
+        assert_eq!(
+            bindings
+                .handle_in_context(&w.key, w.physical, w.modifiers, w.text.as_deref(), context,),
+            Action::FocusLeft
+        );
+        assert_eq!(
+            bindings.handle_in_context(
+                &ctrl_w.key,
+                ctrl_w.physical,
+                ctrl_w.modifiers,
+                ctrl_w.text.as_deref(),
+                context,
+            ),
+            Action::None
+        );
+        assert_eq!(
+            bindings.handle_in_context(
+                &ctrl_w.key,
+                ctrl_w.physical,
+                ctrl_w.modifiers,
+                ctrl_w.text.as_deref(),
+                context,
+            ),
+            Action::FocusRight
+        );
+    }
+
+    #[test]
+    fn focused_tool_selects_bindings_within_the_global_mode() {
+        let mut bindings = Keybindings {
+            mode: Mode::Insert,
+            ..Keybindings::default()
+        };
+        let action = bindings.handle_in_context(
+            &Key::Character("j".into()),
+            Physical::Code(Code::KeyJ),
+            Modifiers::empty(),
+            Some("j"),
+            DispatchContext::focused(KeybindingContext::Explorer),
+        );
+
+        assert_eq!(action, Action::None);
+    }
 
     #[derive(Clone, Copy, Default)]
     struct Context {
@@ -731,6 +1545,11 @@ mod tests {
                 Code::Equal,
                 Some("=".to_owned()),
             ),
+            "$" => (
+                Key::Character("$".into()),
+                Code::Digit4,
+                Some("$".to_owned()),
+            ),
             digit if digit.len() == 1 && digit.as_bytes()[0].is_ascii_digit() => {
                 let code = match digit {
                     "0" => Code::Digit0,
@@ -799,6 +1618,7 @@ mod tests {
             'x' => Code::KeyX,
             'y' => Code::KeyY,
             'z' => Code::KeyZ,
+            ',' => Code::Comma,
             _ => return None,
         })
     }
@@ -806,7 +1626,7 @@ mod tests {
     #[test]
     fn normal_mode_vscode_keybindings_map_to_actions() {
         let normal = ModeIndicator::Normal;
-        let composer = ModeIndicator::Composer;
+        let composer = ModeIndicator::Insert;
         let terminal = ModeIndicator::Terminal;
 
         assert_mode_bindings(
@@ -829,8 +1649,15 @@ mod tests {
                     Action::ToggleActivity(Activity::Sessions),
                     normal,
                 ),
-                ("space d", Action::ToggleActivity(Activity::Diffs), normal),
-                ("space n", Action::NewSession, composer),
+                ("space m", Action::ToggleActivity(Activity::Mcp), normal),
+                (
+                    "space d",
+                    Action::ToggleActivity(Activity::FileViewer),
+                    normal,
+                ),
+                ("space f", Action::ToggleActivity(Activity::Diffs), normal),
+                ("space ,", Action::ToggleSettings, normal),
+                ("space n", Action::NewSession, normal),
                 ("space t", Action::ToggleTerminal, terminal),
             ],
         );
@@ -915,16 +1742,24 @@ mod tests {
             terminal_visible: true,
             ..Context::default()
         };
+        // TERMINAL is entered by the application once the terminal window has
+        // focus, so the binding itself stays in NORMAL and only names the
+        // action.
         assert_mode_bindings(
             Mode::Normal,
             terminal_context,
-            [("i", Action::None, terminal)],
+            [("i", Action::EnterTerminal, normal)],
+        );
+        assert_mode_bindings(
+            Mode::Terminal,
+            terminal_context,
+            [("i", Action::TerminalInput(b"i".to_vec()), terminal)],
         );
     }
 
     #[test]
     fn composer_mode_vscode_keybindings_map_to_actions() {
-        let composer = ModeIndicator::Composer;
+        let composer = ModeIndicator::Insert;
         let normal = ModeIndicator::Normal;
         let context = Context {
             agent_visible: true,
@@ -932,7 +1767,7 @@ mod tests {
         };
 
         assert_mode_bindings(
-            Mode::Composer,
+            Mode::Insert,
             context,
             [
                 ("x", Action::AgentAppend("x".to_owned()), composer),
@@ -946,6 +1781,108 @@ mod tests {
                 ("escape", Action::None, normal),
             ],
         );
+
+        KeybindingHarness::for_mode(Mode::Insert, context).assert(
+            "escape escape",
+            Action::None,
+            normal,
+        );
+    }
+
+    #[test]
+    fn diff_viewer_supports_normal_and_visual_modes_without_insert() {
+        let context = Context {
+            agent_visible: true,
+            diff_activity_visible: true,
+            diff_viewer_visible: true,
+            ..Context::default()
+        };
+        let mut harness = KeybindingHarness::for_mode(Mode::Normal, context);
+
+        assert_eq!(harness.bindings.mode(), Mode::Normal);
+        assert_eq!(harness.dispatch("v"), Action::None);
+        assert_eq!(harness.bindings.mode(), Mode::Visual);
+        assert_eq!(harness.dispatch("j"), Action::DiffScrollDown);
+        assert_eq!(harness.dispatch("i"), Action::None);
+        assert!(!harness.bindings.is_normal());
+        assert_eq!(harness.bindings.mode(), Mode::Visual);
+        assert_eq!(harness.dispatch("escape"), Action::None);
+        assert_eq!(harness.bindings.mode(), Mode::Normal);
+    }
+
+    #[test]
+    fn composer_normal_mode_supports_vim_motions_and_operators() {
+        let context = Context {
+            agent_visible: true,
+            ..Context::default()
+        };
+        let cases = [
+            ("h", Action::AgentMove(ComposerMotion::Left)),
+            ("j", Action::AgentMove(ComposerMotion::Down)),
+            ("k", Action::AgentMove(ComposerMotion::Up)),
+            ("l", Action::AgentMove(ComposerMotion::Right)),
+            ("w", Action::AgentMove(ComposerMotion::WordForward)),
+            ("b", Action::AgentMove(ComposerMotion::WordBackward)),
+            ("e", Action::AgentMove(ComposerMotion::WordEnd)),
+            ("0", Action::AgentMove(ComposerMotion::LineStart)),
+            ("shift+$", Action::AgentMove(ComposerMotion::LineEnd)),
+            ("g g", Action::AgentMove(ComposerMotion::DocumentStart)),
+            ("shift+g", Action::AgentMove(ComposerMotion::DocumentEnd)),
+            ("d d", Action::AgentOperate(ComposerOperator::Delete, None)),
+            (
+                "d w",
+                Action::AgentOperate(ComposerOperator::Delete, Some(ComposerMotion::WordForward)),
+            ),
+            ("c c", Action::AgentOperate(ComposerOperator::Change, None)),
+            ("y y", Action::AgentOperate(ComposerOperator::Yank, None)),
+            ("x", Action::AgentDeleteChar),
+            ("p", Action::AgentPaste),
+        ];
+
+        for (binding, expected) in cases {
+            let mut harness = KeybindingHarness::for_mode(Mode::Normal, context);
+            assert_eq!(harness.dispatch(binding), expected, "binding `{binding}`");
+        }
+    }
+
+    #[test]
+    fn composer_visual_mode_supports_vim_motions_and_selection_operators() {
+        let context = Context {
+            agent_visible: true,
+            ..Context::default()
+        };
+        let cases = [
+            ("v h", Action::AgentMove(ComposerMotion::Left)),
+            ("v j", Action::AgentMove(ComposerMotion::Down)),
+            ("v k", Action::AgentMove(ComposerMotion::Up)),
+            ("v l", Action::AgentMove(ComposerMotion::Right)),
+            ("v w", Action::AgentMove(ComposerMotion::WordForward)),
+            ("v b", Action::AgentMove(ComposerMotion::WordBackward)),
+            ("v e", Action::AgentMove(ComposerMotion::WordEnd)),
+            ("v 0", Action::AgentMove(ComposerMotion::LineStart)),
+            ("v shift+$", Action::AgentMove(ComposerMotion::LineEnd)),
+            ("v g g", Action::AgentMove(ComposerMotion::DocumentStart)),
+            ("v shift+g", Action::AgentMove(ComposerMotion::DocumentEnd)),
+            (
+                "v d",
+                Action::AgentOperateSelection(ComposerOperator::Delete),
+            ),
+            (
+                "v x",
+                Action::AgentOperateSelection(ComposerOperator::Delete),
+            ),
+            (
+                "v c",
+                Action::AgentOperateSelection(ComposerOperator::Change),
+            ),
+            ("v y", Action::AgentOperateSelection(ComposerOperator::Yank)),
+            ("v p", Action::AgentPaste),
+        ];
+
+        for (binding, expected) in cases {
+            let mut harness = KeybindingHarness::for_mode(Mode::Normal, context);
+            assert_eq!(harness.dispatch(binding), expected, "binding `{binding}`");
+        }
     }
 
     #[test]
@@ -984,15 +1921,21 @@ mod tests {
         modifiers: Modifiers,
         terminal_open: bool,
     ) -> Action {
-        bindings.handle(
+        let focused = if matches!(bindings.mode(), Mode::Insert | Mode::Visual) {
+            KeybindingContext::Composer
+        } else {
+            KeybindingContext::Workspace
+        };
+        bindings.handle_in_context(
             &Key::Character(character.into()),
             Physical::Code(code),
             modifiers,
             Some(character),
-            terminal_open,
-            false,
-            false,
-            false,
+            DispatchContext {
+                focused,
+                terminal_available: terminal_open,
+                composer_available: false,
+            },
         )
     }
 
@@ -1065,7 +2008,10 @@ mod tests {
             press(&mut bindings, "n", Code::KeyN, Modifiers::empty(), false),
             Action::NewSession
         ));
-        assert_eq!(bindings.mode_label(), "COMPOSER");
+        // The new session's composer is not focused yet, so the mode may not
+        // run ahead of focus: INSERT without the composer focused would swallow
+        // every subsequent key.
+        assert_eq!(bindings.mode_label(), "NORMAL");
     }
 
     #[test]
@@ -1084,42 +2030,64 @@ mod tests {
             false,
         );
 
-        assert!(matches!(action, Action::None));
-        assert_eq!(bindings.mode_label(), "COMPOSER");
+        assert!(matches!(action, Action::EnterComposer));
+        assert_eq!(bindings.mode_label(), "NORMAL");
+    }
+
+    #[test]
+    fn entering_an_insert_like_mode_is_always_an_action() {
+        // Every key that would put Agency into an insert-like mode must ask the
+        // application to focus the owning surface instead of mutating the mode
+        // behind focus's back.
+        for (composer_available, terminal_available, expected) in [
+            (true, false, Action::EnterComposer),
+            (false, true, Action::EnterTerminal),
+            (true, true, Action::EnterComposer),
+            (false, false, Action::None),
+        ] {
+            let mut bindings = Keybindings::default();
+            let action = bindings.handle_in_context(
+                &Key::Character("i".into()),
+                Physical::Code(Code::KeyI),
+                Modifiers::empty(),
+                Some("i"),
+                DispatchContext {
+                    focused: KeybindingContext::Toolbar,
+                    terminal_available,
+                    composer_available,
+                },
+            );
+
+            assert_eq!(action, expected);
+            assert_eq!(
+                bindings.mode_label(),
+                "NORMAL",
+                "mode changed before focus moved"
+            );
+        }
     }
 
     #[test]
     fn agent_composer_accepts_input_while_explorer_is_open() {
-        let mut bindings = Keybindings::default();
-        press(&mut bindings, " ", Code::Space, Modifiers::empty(), false);
-        bindings.handle(
-            &Key::Character("i".into()),
-            Physical::Code(Code::KeyI),
-            Modifiers::empty(),
-            Some("i"),
-            false,
-            true,
-            true,
-            true,
-        );
+        let mut bindings = Keybindings {
+            mode: Mode::Insert,
+            ..Keybindings::default()
+        };
 
-        let action = bindings.handle(
+        let action = bindings.handle_in_context(
             &Key::Character("h".into()),
             Physical::Code(Code::KeyH),
             Modifiers::empty(),
             Some("h"),
-            false,
-            true,
-            true,
-            true,
+            DispatchContext::focused(KeybindingContext::Composer),
         );
 
         assert!(matches!(action, Action::AgentAppend(text) if text == "h"));
-        assert_eq!(bindings.mode_label(), "COMPOSER");
+        assert_eq!(bindings.mode_label(), "INSERT");
     }
 
     #[test]
-    fn leader_e_opens_explorer_and_leader_s_opens_sessions() {
+    fn leader_shortcuts_open_explorer_sessions_and_mcp() {
         let mut bindings = Keybindings::default();
         press(&mut bindings, " ", Code::Space, Modifiers::empty(), false);
         assert!(matches!(
@@ -1132,7 +2100,118 @@ mod tests {
             press(&mut bindings, "s", Code::KeyS, Modifiers::empty(), false),
             Action::ToggleActivity(Activity::Sessions)
         ));
+
+        press(&mut bindings, " ", Code::Space, Modifiers::empty(), false);
+        assert!(matches!(
+            press(&mut bindings, "m", Code::KeyM, Modifiers::empty(), false),
+            Action::ToggleActivity(Activity::Mcp)
+        ));
+    }
+
+    #[test]
+    fn leader_a_toggles_the_agent_menu() {
+        let mut bindings = Keybindings::default();
+        press(&mut bindings, " ", Code::Space, Modifiers::empty(), false);
+
+        assert!(matches!(
+            press(&mut bindings, "a", Code::KeyA, Modifiers::empty(), false),
+            Action::ToggleAgentMenu
+        ));
         assert_eq!(bindings.mode_label(), "NORMAL");
+    }
+
+    #[test]
+    fn global_config_can_remap_the_agent_menu() {
+        let config = KeybindingConfig {
+            toggle_agent_menu: "p".to_owned(),
+            ..KeybindingConfig::default()
+        };
+        let mut bindings = Keybindings::from_config(config);
+        press(&mut bindings, " ", Code::Space, Modifiers::empty(), false);
+
+        assert!(matches!(
+            press(&mut bindings, "p", Code::KeyP, Modifiers::empty(), false),
+            Action::ToggleAgentMenu
+        ));
+    }
+
+    #[test]
+    fn the_agent_menu_navigates_with_vim_keys() {
+        let context = DispatchContext::focused(KeybindingContext::AgentMenu);
+        let mut bindings = Keybindings::default();
+        let cases = [
+            ("k", Action::AgentMenuPrevious),
+            ("j", Action::AgentMenuNext),
+            ("g", Action::AgentMenuFirst),
+            ("enter", Action::AgentMenuConfirm),
+            ("escape", Action::AgentMenuClose),
+            ("shift+g", Action::AgentMenuLast),
+            ("up", Action::AgentMenuPrevious),
+            ("down", Action::AgentMenuNext),
+        ];
+
+        for (binding, expected) in cases {
+            let stroke = parse_vscode_key(binding);
+            assert_eq!(
+                bindings.handle_in_context(
+                    &stroke.key,
+                    stroke.physical,
+                    stroke.modifiers,
+                    stroke.text.as_deref(),
+                    context,
+                ),
+                expected,
+                "`{binding}` should resolve in the agent menu"
+            );
+        }
+    }
+
+    /// The menu floats above another surface, so keys it does not bind must not
+    /// leak into the surface behind it.
+    #[test]
+    fn the_agent_menu_owns_input_while_it_is_open() {
+        let context = DispatchContext::focused(KeybindingContext::AgentMenu);
+        let mut bindings = Keybindings::default();
+
+        for binding in ["h", "l", "i", "d"] {
+            let stroke = parse_vscode_key(binding);
+            assert_eq!(
+                bindings.handle_in_context(
+                    &stroke.key,
+                    stroke.physical,
+                    stroke.modifiers,
+                    stroke.text.as_deref(),
+                    context,
+                ),
+                Action::None,
+                "`{binding}` should not reach the surface behind the agent menu"
+            );
+        }
+    }
+
+    /// The leader is resolved before the focused surface, so an open menu can
+    /// always be dismissed with the same sequence that opened it.
+    #[test]
+    fn the_leader_still_reaches_an_open_agent_menu() {
+        let context = DispatchContext::focused(KeybindingContext::AgentMenu);
+        let mut bindings = Keybindings::default();
+        let space = parse_vscode_key("space");
+        let a = parse_vscode_key("a");
+
+        assert_eq!(
+            bindings.handle_in_context(
+                &space.key,
+                space.physical,
+                space.modifiers,
+                space.text.as_deref(),
+                context,
+            ),
+            Action::None
+        );
+        assert_eq!(
+            bindings.handle_in_context(&a.key, a.physical, a.modifiers, a.text.as_deref(), context),
+            Action::ToggleAgentMenu
+        );
     }
 
     #[test]
@@ -1243,71 +2322,49 @@ mod tests {
     }
 
     #[test]
-    fn explorer_respects_composer_mode_then_configured_leader_in_normal_mode() {
+    fn explorer_does_not_receive_composer_bindings() {
         let config = KeybindingConfig {
             leader: ",".to_owned(),
             ..KeybindingConfig::default()
         };
         let mut bindings = Keybindings {
-            mode: Mode::Composer,
+            mode: Mode::Insert,
             ..Keybindings::from_config(config)
         };
 
-        assert!(matches!(
-            bindings.handle(
+        let explorer = DispatchContext::focused(KeybindingContext::Explorer);
+        assert_eq!(
+            bindings.handle_in_context(
                 &Key::Character(",".into()),
                 Physical::Code(Code::Comma),
                 Modifiers::empty(),
                 Some(","),
-                false,
-                true,
-                true,
-                true,
-            ),
-            Action::AgentAppend(text) if text == ","
-        ));
-        assert_eq!(bindings.mode_label(), "COMPOSER");
-
-        assert!(matches!(
-            bindings.handle(
-                &Key::Named(Named::Escape),
-                Physical::Code(Code::Escape),
-                Modifiers::empty(),
-                None,
-                false,
-                true,
-                true,
-                true,
+                explorer,
             ),
             Action::None
-        ));
-        assert_eq!(bindings.mode_label(), "NORMAL");
+        );
+        assert_eq!(bindings.mode(), Mode::Insert);
+        bindings.set_mode(Mode::Normal);
 
         assert!(matches!(
-            bindings.handle(
+            bindings.handle_in_context(
                 &Key::Character(",".into()),
                 Physical::Code(Code::Comma),
                 Modifiers::empty(),
                 Some(","),
-                false,
-                true,
-                true,
-                true,
+                explorer,
             ),
             Action::None
         ));
         assert_eq!(bindings.mode_label(), "LEADER");
 
         assert!(matches!(
-            bindings.handle(
+            bindings.handle_in_context(
                 &Key::Character("s".into()),
                 Physical::Code(Code::KeyS),
                 Modifiers::empty(),
                 Some("s"),
-                false,
-                true,
-                true,
-                true,
+                explorer,
             ),
             Action::ToggleActivity(Activity::Sessions)
         ));
@@ -1315,7 +2372,7 @@ mod tests {
 
     #[test]
     fn pending_leader_suffix_is_global_across_modes() {
-        for receiving_mode in [Mode::Normal, Mode::Composer, Mode::Terminal] {
+        for receiving_mode in [Mode::Normal, Mode::Insert, Mode::Visual, Mode::Terminal] {
             let mut bindings = Keybindings::default();
             press(&mut bindings, " ", Code::Space, Modifiers::empty(), false);
             bindings.mode = receiving_mode;
@@ -1329,9 +2386,41 @@ mod tests {
     }
 
     #[test]
+    fn normal_mode_leader_starts_while_composer_has_focus() {
+        let mut bindings = Keybindings::default();
+        let composer = DispatchContext {
+            focused: KeybindingContext::Composer,
+            composer_available: true,
+            terminal_available: false,
+        };
+
+        assert_eq!(
+            bindings.handle_in_context(
+                &Key::Character(" ".into()),
+                Physical::Code(Code::Space),
+                Modifiers::empty(),
+                Some(" "),
+                composer,
+            ),
+            Action::None
+        );
+        assert!(bindings.is_leader_pending());
+        assert_eq!(
+            bindings.handle_in_context(
+                &Key::Character("s".into()),
+                Physical::Code(Code::KeyS),
+                Modifiers::empty(),
+                Some("s"),
+                composer,
+            ),
+            Action::ToggleActivity(Activity::Sessions)
+        );
+    }
+
+    #[test]
     fn agent_mode_never_interprets_space_as_leader() {
         let mut bindings = Keybindings {
-            mode: Mode::Composer,
+            mode: Mode::Insert,
             ..Keybindings::default()
         };
 
@@ -1339,19 +2428,19 @@ mod tests {
             press(&mut bindings, " ", Code::Space, Modifiers::empty(), false),
             Action::AgentAppend(text) if text == " "
         ));
-        assert_eq!(bindings.mode_label(), "COMPOSER");
+        assert_eq!(bindings.mode_label(), "INSERT");
 
         assert!(matches!(
             press(&mut bindings, "t", Code::KeyT, Modifiers::empty(), false),
             Action::AgentAppend(text) if text == "t"
         ));
-        assert_eq!(bindings.mode_label(), "COMPOSER");
+        assert_eq!(bindings.mode_label(), "INSERT");
     }
 
     #[test]
     fn agent_space_works_without_an_iced_text_payload() {
         let mut bindings = Keybindings {
-            mode: Mode::Composer,
+            mode: Mode::Insert,
             ..Keybindings::default()
         };
 
@@ -1373,7 +2462,7 @@ mod tests {
     #[test]
     fn agent_paste_uses_the_clipboard_action() {
         let mut bindings = Keybindings {
-            mode: Mode::Composer,
+            mode: Mode::Insert,
             ..Keybindings::default()
         };
 
@@ -1386,7 +2475,7 @@ mod tests {
     #[test]
     fn agent_control_a_selects_all() {
         let mut bindings = Keybindings {
-            mode: Mode::Composer,
+            mode: Mode::Insert,
             ..Keybindings::default()
         };
 

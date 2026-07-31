@@ -1,15 +1,24 @@
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
+use std::time::Duration;
 
 use agency_mux::{
-    Attachment, Controller, Event, Multiplexer, Program, Size as TerminalSize, Status,
+    Attachment, CommandSpec, Controller, Event, Exit, HeadlessSession, Multiplexer, Program,
+    Size as TerminalSize, Status,
 };
 use libghostty_vt::render::{CellIterator, RowIterator};
 use libghostty_vt::{RenderState, Terminal, TerminalOptions};
 
 const COLS: u16 = 100;
 const ROWS: u16 = 30;
+/// Headless commands have no visible surface, so they use a tall screen that
+/// keeps a whole command's output addressable instead of a viewport-sized one.
+const HEADLESS_COLS: u16 = 120;
+const HEADLESS_ROWS: u16 = 200;
+/// A process is reaped before its final bytes are guaranteed to have been
+/// broadcast, so the renderer drains briefly before reporting the exit.
+const TRAILING_OUTPUT: Duration = Duration::from_millis(100);
 
 pub struct TerminalSession {
     controller: Controller,
@@ -23,7 +32,101 @@ pub struct TerminalSession {
 enum TerminalUpdate {
     Screen(String),
     Failed(String),
-    Exited,
+    Exited(Exit),
+}
+
+/// A terminal that renders off screen. Its output is streamed to whichever
+/// surface asked for the command instead of to a terminal pane.
+pub struct HeadlessTerminal {
+    controller: Controller,
+    updates: Receiver<TerminalUpdate>,
+    screen: String,
+    outcome: Option<HeadlessOutcome>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HeadlessOutcome {
+    Exited(Exit),
+    Failed(String),
+}
+
+impl HeadlessTerminal {
+    pub fn spawn(command: CommandSpec, cwd: &Path) -> Result<Self, String> {
+        let size = TerminalSize {
+            cols: HEADLESS_COLS,
+            rows: HEADLESS_ROWS,
+            ..TerminalSize::default()
+        };
+        let session = HeadlessSession::spawn(command, cwd, size)?;
+        let controller = session.controller();
+        let (update_tx, update_rx) = mpsc::channel();
+
+        thread::spawn(move || run_renderer(session, update_tx, size));
+
+        Ok(Self {
+            controller,
+            updates: update_rx,
+            screen: String::new(),
+            outcome: None,
+        })
+    }
+
+    /// Drains pending renderer updates into the rendered screen and outcome.
+    pub fn poll(&mut self) {
+        for update in self.updates.try_iter() {
+            match update {
+                TerminalUpdate::Screen(screen) => self.screen = screen.trim_end().to_owned(),
+                TerminalUpdate::Failed(error) => {
+                    self.outcome.get_or_insert(HeadlessOutcome::Failed(error));
+                }
+                TerminalUpdate::Exited(exit) => {
+                    self.outcome.get_or_insert(HeadlessOutcome::Exited(exit));
+                }
+            }
+        }
+    }
+
+    pub fn output(&self) -> &str {
+        &self.screen
+    }
+
+    pub fn outcome(&self) -> Option<&HeadlessOutcome> {
+        self.outcome.as_ref()
+    }
+}
+
+impl Drop for HeadlessTerminal {
+    fn drop(&mut self) {
+        if self.outcome.is_none() {
+            self.controller.terminate();
+        }
+    }
+}
+
+/// Lets the renderer read from an attached session or a headless command.
+trait EventSource {
+    fn recv(&self) -> Result<Event, mpsc::RecvError>;
+    fn recv_timeout(&self, timeout: Duration) -> Result<Event, mpsc::RecvTimeoutError>;
+}
+
+impl EventSource for Attachment {
+    fn recv(&self) -> Result<Event, mpsc::RecvError> {
+        Attachment::recv(self)
+    }
+
+    fn recv_timeout(&self, timeout: Duration) -> Result<Event, mpsc::RecvTimeoutError> {
+        Attachment::recv_timeout(self, timeout)
+    }
+}
+
+impl EventSource for HeadlessSession {
+    fn recv(&self) -> Result<Event, mpsc::RecvError> {
+        HeadlessSession::recv(self)
+    }
+
+    fn recv_timeout(&self, timeout: Duration) -> Result<Event, mpsc::RecvTimeoutError> {
+        HeadlessSession::recv_timeout(self, timeout)
+    }
 }
 
 impl TerminalSession {
@@ -32,19 +135,16 @@ impl TerminalSession {
         program: Program,
         cwd: &Path,
     ) -> Result<Self, String> {
-        let attachment = multiplexer.spawn(
-            program,
-            cwd,
-            TerminalSize {
-                cols: COLS,
-                rows: ROWS,
-                ..TerminalSize::default()
-            },
-        )?;
+        let size = TerminalSize {
+            cols: COLS,
+            rows: ROWS,
+            ..TerminalSize::default()
+        };
+        let attachment = multiplexer.spawn(program, cwd, size)?;
         let controller = attachment.controller();
         let (update_tx, update_rx) = mpsc::channel();
 
-        thread::spawn(move || run_renderer(attachment, update_tx));
+        thread::spawn(move || run_renderer(attachment, update_tx, size));
 
         Ok(Self {
             controller,
@@ -69,7 +169,7 @@ impl TerminalSession {
                     self.screen.push_str(&error);
                     self.status = Status::Failed;
                 }
-                TerminalUpdate::Exited => self.status = Status::Exited,
+                TerminalUpdate::Exited(_) => self.status = Status::Exited,
             }
         }
     }
@@ -95,11 +195,11 @@ impl TerminalSession {
     }
 }
 
-fn run_renderer(attachment: Attachment, updates: Sender<TerminalUpdate>) {
+fn run_renderer(source: impl EventSource, updates: Sender<TerminalUpdate>, size: TerminalSize) {
     let result = (|| -> Result<(), String> {
         let mut terminal = Terminal::new(TerminalOptions {
-            cols: COLS,
-            rows: ROWS,
+            cols: size.cols,
+            rows: size.rows,
             max_scrollback: 10_000,
         })
         .map_err(|error| format!("Could not initialize Ghostty: {error}"))?;
@@ -110,7 +210,7 @@ fn run_renderer(attachment: Attachment, updates: Sender<TerminalUpdate>) {
         let mut cells =
             CellIterator::new().map_err(|error| format!("Could not initialize cells: {error}"))?;
 
-        while let Ok(event) = attachment.recv() {
+        while let Ok(event) = source.recv() {
             match event {
                 Event::Output(bytes) => {
                     terminal.vt_write(&bytes);
@@ -118,8 +218,14 @@ fn run_renderer(attachment: Attachment, updates: Sender<TerminalUpdate>) {
                         render_screen(&terminal, &mut render_state, &mut rows, &mut cells)?;
                     let _ = updates.send(TerminalUpdate::Screen(screen));
                 }
-                Event::Exited => {
-                    let _ = updates.send(TerminalUpdate::Exited);
+                Event::Exited(exit) => {
+                    while let Ok(Event::Output(bytes)) = source.recv_timeout(TRAILING_OUTPUT) {
+                        terminal.vt_write(&bytes);
+                    }
+                    let screen =
+                        render_screen(&terminal, &mut render_state, &mut rows, &mut cells)?;
+                    let _ = updates.send(TerminalUpdate::Screen(screen));
+                    let _ = updates.send(TerminalUpdate::Exited(exit));
                     break;
                 }
                 Event::Failed(error) => {

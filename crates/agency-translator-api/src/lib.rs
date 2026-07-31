@@ -22,9 +22,11 @@ pub struct Conversation {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "camelCase")]
 pub enum ConversationUpdate {
-    Append {
-        event: ConversationEvent,
-    },
+    /// Adds an event, or replaces the event that already carries the same id.
+    /// Providers report long-running work twice — once when it starts and once
+    /// when it finishes — and the finished report replaces the started one in
+    /// place instead of repeating it.
+    Append { event: ConversationEvent },
     AppendText {
         event_id: String,
         source: ClientId,
@@ -56,6 +58,9 @@ pub enum EventPayload {
         role: MessageRole,
         content: Vec<ContentBlock>,
     },
+    /// A tool invocation. `input` uses the canonical [`tools`] vocabulary when
+    /// the call is one every provider performs, so transcripts render the same
+    /// work identically no matter which agent did it.
     ToolCall {
         id: Option<String>,
         name: String,
@@ -194,6 +199,122 @@ impl fmt::Display for TranslationError {
 
 impl std::error::Error for TranslationError {}
 
+/// The canonical, provider-neutral vocabulary for tool calls.
+///
+/// Agents describe the same work in different ways: Codex reports app-server
+/// items, Claude Code reports `tool_use` blocks completed by `tool_result`
+/// payloads. Each translator normalizes the work every agent does — running a
+/// command, changing a file, reading a file — into these shapes, so a single
+/// set of transcript handlers renders both agents identically. Provider
+/// specific tool calls keep their own input and render generically.
+pub mod tools {
+    use serde_json::{Value, json};
+
+    /// A command run in the workspace shell.
+    /// `{"type":"commandExecution","command":..,"status":..,"aggregatedOutput":..,"exitCode":..}`
+    pub const COMMAND_EXECUTION: &str = "commandExecution";
+    /// One or more files written, created, or deleted.
+    /// `{"type":"fileChange","status":..,"changes":[{"path":..,"kind":..,"diff":..}]}`
+    pub const FILE_CHANGE: &str = "fileChange";
+    /// A file read into the agent's context.
+    /// `{"type":"fileRead","status":..,"path":..,"lines":..}`
+    pub const FILE_READ: &str = "fileRead";
+
+    pub const IN_PROGRESS: &str = "inProgress";
+    pub const COMPLETED: &str = "completed";
+    pub const FAILED: &str = "failed";
+
+    /// The canonical kind of a tool call input, if it has one.
+    pub fn kind(input: &Value) -> Option<&str> {
+        input.get("type").and_then(Value::as_str)
+    }
+
+    /// The reported status, defaulting to completed for inputs that omit it.
+    pub fn status(input: &Value) -> &str {
+        input
+            .get("status")
+            .and_then(Value::as_str)
+            .unwrap_or(COMPLETED)
+    }
+
+    pub fn is_finished(input: &Value) -> bool {
+        status(input) != IN_PROGRESS
+    }
+
+    pub fn command_execution(
+        command: &str,
+        status: &str,
+        output: Option<&str>,
+        exit_code: Option<i64>,
+    ) -> Value {
+        json!({
+            "type": COMMAND_EXECUTION,
+            "command": command,
+            "status": status,
+            "aggregatedOutput": output,
+            "exitCode": exit_code,
+        })
+    }
+
+    pub fn file_read(path: &str, status: &str, lines: Option<u64>) -> Value {
+        json!({
+            "type": FILE_READ,
+            "path": path,
+            "status": status,
+            "lines": lines,
+        })
+    }
+
+    pub fn file_change(status: &str, changes: Vec<Value>) -> Value {
+        json!({
+            "type": FILE_CHANGE,
+            "status": status,
+            "changes": changes,
+        })
+    }
+
+    /// One changed file. `diff` holds unified diff hunks without file headers,
+    /// which the transcript adds from `path` when it renders the change.
+    pub fn change(path: &str, kind: &str, diff: &str) -> Value {
+        json!({ "path": path, "kind": kind, "diff": diff })
+    }
+
+    /// The kind of a change. Codex reports `{"type":"update"}` while Claude
+    /// Code and imported history report a plain `"update"`.
+    pub fn change_kind(change: &Value) -> &str {
+        let kind = change.get("kind");
+        kind.and_then(Value::as_str)
+            .or_else(|| {
+                kind.and_then(|kind| kind.get("type"))
+                    .and_then(Value::as_str)
+            })
+            .unwrap_or("update")
+    }
+
+    /// A unified diff hunk built from prefixed lines (` `, `-`, `+`).
+    pub fn hunk(
+        old_start: u64,
+        old_lines: u64,
+        new_start: u64,
+        new_lines: u64,
+        body: &str,
+    ) -> String {
+        let body = body.strip_suffix('\n').unwrap_or(body);
+        format!("@@ -{old_start},{old_lines} +{new_start},{new_lines} @@\n{body}\n")
+    }
+
+    /// The hunk for a file that is created whole.
+    pub fn added_file_hunk(content: &str) -> String {
+        let lines = content.strip_suffix('\n').unwrap_or(content);
+        let body = lines
+            .split('\n')
+            .map(|line| format!("+{line}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        hunk(0, 0, 1, lines.split('\n').count() as u64, &body)
+    }
+}
+
 pub trait SessionTranslator: Send + Sync {
     fn descriptor(&self) -> TranslatorDescriptor;
     fn import(&self, artifact: &NativeArtifact) -> Result<ImportResult, TranslationError>;
@@ -203,4 +324,37 @@ pub trait SessionTranslator: Send + Sync {
 
 pub trait LiveEventTranslator: Send + Sync {
     fn translate_live(&self, event: &Value) -> Result<Vec<ConversationUpdate>, TranslationError>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::tools;
+    use serde_json::json;
+
+    #[test]
+    fn change_kinds_read_both_provider_spellings() {
+        assert_eq!(tools::change_kind(&json!({"kind": "add"})), "add");
+        assert_eq!(
+            tools::change_kind(&json!({"kind": {"type": "delete", "move_path": null}})),
+            "delete"
+        );
+        assert_eq!(tools::change_kind(&json!({})), "update");
+    }
+
+    #[test]
+    fn hunks_are_rendered_the_way_both_agents_report_them() {
+        assert_eq!(
+            tools::hunk(1, 3, 1, 3, " alpha\n-beta\n+BETA\n gamma"),
+            "@@ -1,3 +1,3 @@\n alpha\n-beta\n+BETA\n gamma\n"
+        );
+        assert_eq!(tools::added_file_hunk("done\n"), "@@ -0,0 +1,1 @@\n+done\n");
+    }
+
+    #[test]
+    fn statuses_default_to_completed_but_report_progress() {
+        let running = tools::command_execution("cargo test", tools::IN_PROGRESS, None, None);
+        assert_eq!(tools::kind(&running), Some(tools::COMMAND_EXECUTION));
+        assert!(!tools::is_finished(&running));
+        assert!(tools::is_finished(&json!({"type": "fileChange"})));
+    }
 }

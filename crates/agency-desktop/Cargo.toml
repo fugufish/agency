@@ -6,10 +6,16 @@ license.workspace = true
 rust-version.workspace = true
 publish = false
 
+[[bin]]
+name = "agency"
+path = "src/main.rs"
+
 [dependencies]
 arboard = { version = "3.6.1", features = ["image-data", "wayland-data-control"] }
 agency-agents = { path = "../agency-agents" }
+agency-mcp = { path = "../agency-mcp" }
 agency-mux = { path = "../agency-mux" }
+agency-rpc = { path = "../agency-rpc" }
 agency-translator-api = { path = "../agency-translator-api" }
 agency-translators = { path = "../agency-translators" }
 base64 = "0.22"

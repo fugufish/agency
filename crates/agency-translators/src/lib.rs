@@ -8,7 +8,7 @@ use agency_translator_api::{
 
 pub fn built_in(client: &ClientId) -> Option<Box<dyn SessionTranslator>> {
     match client.0.as_str() {
-        "claude-code" => Some(Box::new(claude::ClaudeTranslator)),
+        "claude-code" => Some(Box::new(claude::ClaudeTranslator::default())),
         "codex" => Some(Box::new(codex::CodexTranslator)),
         _ => None,
     }

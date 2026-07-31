@@ -5,6 +5,8 @@ use iced::Color;
 use serde::{Deserialize, Serialize};
 
 pub const WORKSPACE_CONFIG_DIRECTORY: &str = ".agency";
+pub const WORKSPACE_CONFIG_FILE: &str = "config.toml";
+pub const WORKSPACE_LOCAL_CONFIG_FILE: &str = "config.local.toml";
 
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -33,6 +35,36 @@ impl GlobalConfig {
             .map_err(|error| format!("Could not read {}: {error}", path.display()))?;
         toml::from_str(&source)
             .map_err(|error| format!("Could not parse {}: {error}", path.display()))
+    }
+
+    pub fn save_default_agent(default_agent: DefaultAgent) -> Result<(), String> {
+        let path = global_config_path()?;
+        let mut document = if path.exists() {
+            fs::read_to_string(&path)
+                .map_err(|error| format!("Could not read {}: {error}", path.display()))?
+                .parse::<toml::Table>()
+                .map_err(|error| format!("Could not parse {}: {error}", path.display()))?
+        } else {
+            toml::Table::new()
+        };
+        let value = match default_agent {
+            DefaultAgent::Codex => "codex",
+            DefaultAgent::Claude => "claude",
+        };
+        document.insert(
+            "default_agent".to_owned(),
+            toml::Value::String(value.to_owned()),
+        );
+        let directory = path
+            .parent()
+            .ok_or_else(|| format!("Invalid config path: {}", path.display()))?;
+        fs::create_dir_all(directory)
+            .map_err(|error| format!("Could not create {}: {error}", directory.display()))?;
+        fs::write(
+            &path,
+            toml::to_string_pretty(&document).map_err(|error| error.to_string())?,
+        )
+        .map_err(|error| format!("Could not write {}: {error}", path.display()))
     }
 }
 
@@ -106,11 +138,21 @@ impl WindowState {
 #[serde(default, deny_unknown_fields)]
 pub struct KeybindingConfig {
     pub leader: String,
-    pub show_explorer: String,
-    pub show_sessions: String,
-    pub show_diffs: String,
+    #[serde(alias = "show_explorer")]
+    pub toggle_explorer: String,
+    #[serde(alias = "show_sessions")]
+    pub toggle_sessions: String,
+    #[serde(alias = "show_mcp")]
+    pub toggle_mcp: String,
+    #[serde(alias = "show_diffs")]
+    pub toggle_diffs: String,
+    #[serde(alias = "toggle_markdown")]
+    pub toggle_file_viewer: String,
+    #[serde(alias = "show_settings")]
+    pub toggle_settings: String,
     pub new_session: String,
     pub toggle_terminal: String,
+    pub toggle_agent_menu: String,
     pub enter_active_view: String,
 }
 
@@ -118,11 +160,15 @@ impl Default for KeybindingConfig {
     fn default() -> Self {
         Self {
             leader: " ".to_owned(),
-            show_explorer: "e".to_owned(),
-            show_sessions: "s".to_owned(),
-            show_diffs: "d".to_owned(),
+            toggle_explorer: "e".to_owned(),
+            toggle_sessions: "s".to_owned(),
+            toggle_mcp: "m".to_owned(),
+            toggle_diffs: "f".to_owned(),
+            toggle_file_viewer: "d".to_owned(),
+            toggle_settings: ",".to_owned(),
             new_session: "n".to_owned(),
             toggle_terminal: "t".to_owned(),
+            toggle_agent_menu: "a".to_owned(),
             enter_active_view: "i".to_owned(),
         }
     }
@@ -135,7 +181,8 @@ pub struct ModeColorConfig {
     pub terminal: String,
     pub agent: String,
     pub leader: String,
-    pub escape: String,
+    #[serde(alias = "escape")]
+    pub visual: String,
 }
 
 impl Default for ModeColorConfig {
@@ -145,7 +192,7 @@ impl Default for ModeColorConfig {
             terminal: "#9ece6a".to_owned(),
             agent: "#7dcfff".to_owned(),
             leader: "#e0af68".to_owned(),
-            escape: "#f7768e".to_owned(),
+            visual: "#f7768e".to_owned(),
         }
     }
 }
@@ -155,6 +202,7 @@ pub struct ModeColors {
     pub terminal: Color,
     pub agent: Color,
     pub leader: Color,
+    pub visual: Color,
 }
 
 impl ModeColors {
@@ -162,23 +210,40 @@ impl ModeColors {
         let defaults = ModeColorConfig::default();
 
         Self {
-            normal: configured_color("AGENCY_MODE_COLOR_NORMAL", &config.normal, &defaults.normal),
+            normal: configured_color(
+                &["AGENCY_MODE_COLOR_NORMAL"],
+                &config.normal,
+                &defaults.normal,
+            ),
             terminal: configured_color(
-                "AGENCY_MODE_COLOR_TERMINAL",
+                &["AGENCY_MODE_COLOR_TERMINAL"],
                 &config.terminal,
                 &defaults.terminal,
             ),
-            agent: configured_color("AGENCY_MODE_COLOR_AGENT", &config.agent, &defaults.agent),
-            leader: configured_color("AGENCY_MODE_COLOR_LEADER", &config.leader, &defaults.leader),
+            agent: configured_color(&["AGENCY_MODE_COLOR_AGENT"], &config.agent, &defaults.agent),
+            leader: configured_color(
+                &["AGENCY_MODE_COLOR_LEADER"],
+                &config.leader,
+                &defaults.leader,
+            ),
+            visual: configured_color(
+                &["AGENCY_MODE_COLOR_VISUAL", "AGENCY_MODE_COLOR_ESCAPE"],
+                &config.visual,
+                &defaults.visual,
+            ),
         }
     }
 }
 
-fn configured_color(environment: &str, configured: &str, fallback: &str) -> Color {
-    std::env::var(environment)
-        .ok()
-        .as_deref()
-        .and_then(parse_hex_color)
+fn configured_color(environments: &[&str], configured: &str, fallback: &str) -> Color {
+    environments
+        .iter()
+        .find_map(|environment| {
+            std::env::var(environment)
+                .ok()
+                .as_deref()
+                .and_then(parse_hex_color)
+        })
         .or_else(|| parse_hex_color(configured))
         .or_else(|| parse_hex_color(fallback))
         .expect("built-in mode colors must be valid")
@@ -242,9 +307,44 @@ mod tests {
         .unwrap();
 
         assert_eq!(config.default_agent, DefaultAgent::Claude);
-        assert_eq!(config.keybindings.show_explorer, "e");
+        assert_eq!(config.keybindings.toggle_explorer, "e");
         assert_eq!(config.keybindings.toggle_terminal, "t");
+        assert_eq!(config.keybindings.toggle_file_viewer, "d");
         assert_eq!(config.mode_colors.agent, "#ffffff");
+    }
+
+    #[test]
+    fn accepts_legacy_escape_mode_color() {
+        let config: GlobalConfig = toml::from_str(
+            r##"
+                [mode_colors]
+                escape = "#123456"
+            "##,
+        )
+        .unwrap();
+
+        assert_eq!(config.mode_colors.visual, "#123456");
+    }
+
+    #[test]
+    fn accepts_legacy_show_activity_keybindings() {
+        let config: GlobalConfig = toml::from_str(
+            r#"
+                [keybindings]
+                show_explorer = "x"
+                show_sessions = "y"
+                show_mcp = "z"
+                show_diffs = "f"
+                show_settings = "."
+            "#,
+        )
+        .unwrap();
+
+        assert_eq!(config.keybindings.toggle_explorer, "x");
+        assert_eq!(config.keybindings.toggle_sessions, "y");
+        assert_eq!(config.keybindings.toggle_mcp, "z");
+        assert_eq!(config.keybindings.toggle_diffs, "f");
+        assert_eq!(config.keybindings.toggle_settings, ".");
     }
 
     #[test]
