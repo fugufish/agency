@@ -1236,6 +1236,10 @@ impl Agency {
                     .filter(|agent| agent.path.is_some())
                     .map(|agent| agent.provider)
                     .collect();
+                // A newly detected agent has its own slash commands, and a
+                // newly missing one should drop its rows; either way the
+                // catalog built from the old agent list is stale.
+                self.emit(AppEvent::SlashCatalogRequested);
             }
             AppEvent::SetDefaultAgent(provider) => {
                 let configured = match provider {
@@ -7288,5 +7292,38 @@ mod tests {
                 .iter()
                 .any(|event| matches!(event, AppEvent::SlashCatalogRequested))
         );
+    }
+
+    #[test]
+    fn refreshing_agents_requests_a_reload() {
+        // A user who installs an agent after Agency starts and hits refresh
+        // gets an updated agent list; without this trigger the slash catalog
+        // would stay Agency-only until a worktree switch or restart.
+        let mut agency = Agency::for_testing();
+
+        let _ = agency.reduce_event(AppEvent::RefreshAgents);
+
+        assert!(
+            agency
+                .drain_events()
+                .iter()
+                .any(|event| matches!(event, AppEvent::SlashCatalogRequested))
+        );
+    }
+
+    /// `SlashCatalogRequested`'s handler must actually return the
+    /// `Task::perform(...)` that runs discovery, not `Task::none()` — a
+    /// deleted `return` would leave every other test in this file green.
+    /// `Task` does not expose its inner state for a direct equality check,
+    /// but `units()` distinguishes "does nothing" (`Task::none()`, 0 units)
+    /// from a real unit of work, which is exactly the distinction that
+    /// matters here.
+    #[test]
+    fn slash_catalog_requested_returns_a_real_task_rather_than_none() {
+        let mut agency = Agency::for_testing();
+
+        let task = agency.reduce_event(AppEvent::SlashCatalogRequested);
+
+        assert!(task.units() > 0);
     }
 }

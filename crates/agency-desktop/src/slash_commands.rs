@@ -658,6 +658,57 @@ mod tests {
         assert!(discover_agent_commands(&[], Path::new("/a/workspace")).is_empty());
     }
 
+    /// Pins `client_id`'s strings against the registry `command_catalog`
+    /// actually resolves, rather than against a literal in this test:
+    /// a typo in either `client_id` or the registry's match arms fails this,
+    /// where a test that duplicated the literal string would not.
+    #[test]
+    fn client_id_resolves_to_a_registered_command_catalog_for_every_provider() {
+        assert!(agency_translators::command_catalog(&client_id(Provider::Claude)).is_some());
+        assert!(agency_translators::command_catalog(&client_id(Provider::Codex)).is_some());
+    }
+
+    /// Exercises the real seam `SlashCatalogRequested` drives: `client_id`
+    /// into `agency_translators::command_catalog` into the translator's own
+    /// `commands()`. A project-level skill is used as the probe because it
+    /// does not depend on the developer's `$HOME` for its own existence.
+    ///
+    /// This is not fully hermetic: `ClaudeTranslator::commands` also reads
+    /// the real `$HOME` env var for personal- and plugin-level entries, so
+    /// the full result can vary by machine. The probe command's name is
+    /// deliberately distinctive to make a collision with something already
+    /// on the developer's real `$HOME` vanishingly unlikely, and the
+    /// assertion below only relies on the project-level entry being present,
+    /// not on the catalog's exact contents.
+    #[test]
+    fn discover_agent_commands_indexes_a_project_level_skill_for_a_real_provider() {
+        let workspace = std::env::temp_dir().join(format!(
+            "agency-discover-agent-commands-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let skill_directory = workspace
+            .join(".claude/skills")
+            .join("agency-desktop-discovery-probe-skill");
+        fs::create_dir_all(&skill_directory).unwrap();
+        fs::write(
+            skill_directory.join("SKILL.md"),
+            "---\ndescription: Discovery probe\n---\n",
+        )
+        .unwrap();
+
+        let found = discover_agent_commands(&[Provider::Claude], &workspace);
+
+        assert!(found.iter().any(|(provider, command)| {
+            *provider == Provider::Claude && command.name == "agency-desktop-discovery-probe-skill"
+        }));
+
+        fs::remove_dir_all(&workspace).unwrap();
+    }
+
     #[test]
     fn unknown_commands_are_rejected_locally() {
         assert_eq!(
