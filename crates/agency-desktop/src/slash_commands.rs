@@ -128,6 +128,82 @@ pub fn slash_command_completions<'a>(
         .filter(move |completion| input.starts_with('/') && completion.command.starts_with(input))
 }
 
+/// What the composer looks like to the completion list. The overlay borrows
+/// focus from the composer, so "focused" stays true while the list itself is
+/// the focused element.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ComposerState {
+    /// The composer keymap owns the keyboard.
+    pub focused: bool,
+    /// The composer is in a mode that types into the prompt.
+    pub accepting_text: bool,
+}
+
+/// Self-contained state for the inline slash command list. It reduces the
+/// composer's prompt into a visibility and a highlighted row, so no view or key
+/// handler has to keep the two in step by hand.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SlashCompletionState {
+    open: bool,
+    selected: usize,
+}
+
+impl SlashCompletionState {
+    pub fn is_open(self) -> bool {
+        self.open
+    }
+
+    pub fn selected(self) -> usize {
+        self.selected
+    }
+
+    /// Closes the list without forgetting anything else. Typing reopens it,
+    /// because the next prompt change refreshes from scratch.
+    pub fn close(&mut self) {
+        self.open = false;
+        self.selected = 0;
+    }
+
+    /// Re-derives visibility from the prompt as it stands *now*. Every caller
+    /// has to run this after the prompt has already been mutated, otherwise the
+    /// list describes the previous keystroke.
+    pub fn refresh(
+        &mut self,
+        catalog: &[SlashCommandCompletion],
+        prompt: &str,
+        composer: ComposerState,
+    ) {
+        let matches = slash_command_completions(catalog, prompt).count();
+        if matches == 0 || !composer.focused {
+            self.close();
+            return;
+        }
+        // Typing opens the list; NORMAL mode keeps an already-open list around
+        // so `j`/`k` can walk it without INSERT.
+        if composer.accepting_text {
+            self.open = true;
+        }
+        self.selected = self.selected.min(matches - 1);
+    }
+
+    pub fn select_previous(&mut self, matches: usize) {
+        if matches > 0 {
+            self.selected = self.selected.checked_sub(1).unwrap_or(matches - 1);
+        }
+    }
+
+    pub fn select_next(&mut self, matches: usize) {
+        if matches > 0 {
+            self.selected = (self.selected + 1) % matches;
+        }
+    }
+}
+
+/// How many catalog entries `prompt` currently matches.
+pub fn completion_count(catalog: &[SlashCommandCompletion], prompt: &str) -> usize {
+    slash_command_completions(catalog, prompt).count()
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TabCompletion {
     /// Fill the shared prefix and leave the list open on the narrowed matches.
@@ -700,6 +776,120 @@ mod tests {
         assert_eq!(completions[0].insertion, "/review ");
         assert_eq!(completions[1].provider, Some(Provider::Codex));
         assert_eq!(completions[1].insertion, "$review ");
+    }
+
+    const TYPING: ComposerState = ComposerState {
+        focused: true,
+        accepting_text: true,
+    };
+    const NORMAL: ComposerState = ComposerState {
+        focused: true,
+        accepting_text: false,
+    };
+
+    /// Regression: the list used to be refreshed from the prompt as it stood
+    /// *before* the keystroke was applied, so the leading `/` never opened it
+    /// and every later row described the previous character.
+    #[test]
+    fn the_leading_slash_opens_the_list() {
+        let catalog = vec![completion("/init"), completion("/mcp add")];
+        let mut state = SlashCompletionState::default();
+
+        state.refresh(&catalog, "/", TYPING);
+
+        assert!(state.is_open());
+        assert_eq!(state.selected(), 0);
+    }
+
+    #[test]
+    fn a_prompt_without_matches_closes_the_list() {
+        let catalog = vec![completion("/init")];
+        let mut state = SlashCompletionState::default();
+
+        state.refresh(&catalog, "/i", TYPING);
+        assert!(state.is_open());
+
+        state.refresh(&catalog, "/ix", TYPING);
+        assert!(!state.is_open());
+
+        state.refresh(&catalog, "", TYPING);
+        assert!(!state.is_open());
+    }
+
+    #[test]
+    fn narrowing_the_matches_pulls_the_selection_back_into_range() {
+        let catalog = vec![completion("/init"), completion("/insights")];
+        let mut state = SlashCompletionState::default();
+        state.refresh(&catalog, "/in", TYPING);
+        state.select_next(2);
+        assert_eq!(state.selected(), 1);
+
+        state.refresh(&catalog, "/init", TYPING);
+
+        assert!(state.is_open());
+        assert_eq!(state.selected(), 0);
+    }
+
+    /// The list binds `j`/`k` in NORMAL, so leaving INSERT must not close it.
+    /// It still must not *open* without the composer typing into the prompt.
+    #[test]
+    fn normal_mode_keeps_an_open_list_but_does_not_open_a_closed_one() {
+        let catalog = vec![completion("/init")];
+        let mut state = SlashCompletionState::default();
+
+        state.refresh(&catalog, "/i", NORMAL);
+        assert!(!state.is_open());
+
+        state.refresh(&catalog, "/i", TYPING);
+        state.refresh(&catalog, "/i", NORMAL);
+        assert!(state.is_open());
+    }
+
+    /// Focus moving off the composer takes the composer's overlay with it.
+    #[test]
+    fn losing_composer_focus_closes_the_list() {
+        let catalog = vec![completion("/init")];
+        let mut state = SlashCompletionState::default();
+        state.refresh(&catalog, "/i", TYPING);
+
+        state.refresh(
+            &catalog,
+            "/i",
+            ComposerState {
+                focused: false,
+                accepting_text: true,
+            },
+        );
+
+        assert!(!state.is_open());
+    }
+
+    #[test]
+    fn selection_wraps_in_both_directions_and_ignores_an_empty_list() {
+        let mut state = SlashCompletionState::default();
+
+        state.select_previous(3);
+        assert_eq!(state.selected(), 2);
+        state.select_next(3);
+        assert_eq!(state.selected(), 0);
+        state.select_previous(0);
+        assert_eq!(state.selected(), 0);
+        state.select_next(0);
+        assert_eq!(state.selected(), 0);
+    }
+
+    /// Accepting a completion closes the list even though the accepted prompt
+    /// still matches its own catalog entry, so the next Enter submits.
+    #[test]
+    fn closing_survives_a_prompt_that_still_matches() {
+        let catalog = vec![completion("/init")];
+        let mut state = SlashCompletionState::default();
+        state.refresh(&catalog, "/i", TYPING);
+
+        state.close();
+
+        assert!(!state.is_open());
+        assert_eq!(completion_count(&catalog, "/init"), 1);
     }
 
     #[test]
