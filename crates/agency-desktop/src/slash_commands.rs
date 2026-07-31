@@ -3,6 +3,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use agency_agents::{McpServer, Provider};
+use agency_translator_api::ClientId;
+use agency_translator_api::commands::AgentCommand;
 
 use crate::config::{
     WORKSPACE_CONFIG_FILE, WORKSPACE_LOCAL_CONFIG_FILE, workspace_config_directory,
@@ -33,11 +35,6 @@ pub struct SlashCommandCompletion {
     pub built_in: bool,
 }
 
-const CLAUDE_BUILT_INS: [(&str, &str); 2] = [
-    ("insights", "Generate a usage insights report"),
-    ("deep-research", "Run an in-depth research workflow"),
-];
-
 pub const INIT_AGENT_PROMPT: &str = r#"/init
 
 Initialize this repository for agents running inside the Agency harness. Create or update AGENTS.md, preserving and respecting every existing instruction. Add or merge a concise, provider-neutral "Agency harness" preamble that tells all agents:
@@ -51,8 +48,11 @@ Initialize this repository for agents running inside the Agency harness. Create 
 
 Keep the preamble compact to minimize recurring context cost. Do not duplicate an existing Agency section. Leave CLAUDE.md as the symlink to AGENTS.md created by Agency."#;
 
-pub fn slash_command_catalog(cwd: &Path) -> Vec<SlashCommandCompletion> {
-    let mut completions = vec![
+/// Agency's own commands, which the harness handles itself rather than passing
+/// to an agent. These are always available, including before the first
+/// translator catalog has loaded.
+pub fn agency_commands() -> Vec<SlashCommandCompletion> {
+    vec![
         SlashCommandCompletion {
             command: "/init".to_owned(),
             description: "Initialize Agency files in this workspace".to_owned(),
@@ -69,53 +69,61 @@ pub fn slash_command_catalog(cwd: &Path) -> Vec<SlashCommandCompletion> {
         },
         SlashCommandCompletion {
             command: "/plugin install".to_owned(),
-            description:
-                "Install a plugin, or add a marketplace source, for every configured agent"
-                    .to_owned(),
+            description: "Install a plugin, or add a marketplace source, for every configured agent"
+                .to_owned(),
             insertion: "/plugin install ".to_owned(),
             provider: None,
             built_in: false,
         },
-    ];
-    completions.extend(CLAUDE_BUILT_INS.into_iter().map(|(name, description)| {
-        SlashCommandCompletion {
-            command: format!("/{name}"),
-            description: description.to_owned(),
-            insertion: format!("/{name} "),
-            provider: Some(Provider::Claude),
-            built_in: true,
-        }
-    }));
+    ]
+}
 
-    let home = std::env::var_os("HOME").map(PathBuf::from);
-    for root in [
-        home.as_ref().map(|home| home.join(".codex/skills")),
-        Some(cwd.join(".codex/skills")),
-    ]
-    .into_iter()
-    .flatten()
-    {
-        discover_skills(&root, Provider::Codex, &mut completions);
+/// Asks each configured agent's translator what it can run here. This walks the
+/// filesystem, so it belongs behind an effect rather than on the UI thread.
+pub fn discover_agent_commands(
+    providers: &[Provider],
+    workspace: &Path,
+) -> Vec<(Provider, AgentCommand)> {
+    providers
+        .iter()
+        .filter_map(|provider| {
+            let catalog = agency_translators::command_catalog(&client_id(*provider))?;
+            Some(
+                catalog
+                    .commands(workspace)
+                    .into_iter()
+                    .map(move |command| (*provider, command)),
+            )
+        })
+        .flatten()
+        .collect()
+}
+
+/// Agency's commands followed by every agent's. Two agents offering the same
+/// name stay as two rows, because their insertions differ and collapsing them
+/// would send the wrong text to one of them. Shadowing *within* one agent was
+/// already resolved by that agent's translator.
+pub fn merge_catalog(agent: Vec<(Provider, AgentCommand)>) -> Vec<SlashCommandCompletion> {
+    let mut catalog = agency_commands();
+    catalog.extend(
+        agent
+            .into_iter()
+            .map(|(provider, command)| SlashCommandCompletion {
+                command: format!("/{}", command.name),
+                description: command.description,
+                insertion: command.invocation,
+                provider: Some(provider),
+                built_in: command.origin.is_built_in(),
+            }),
+    );
+    catalog
+}
+
+fn client_id(provider: Provider) -> ClientId {
+    match provider {
+        Provider::Codex => ClientId::new("codex"),
+        Provider::Claude => ClientId::new("claude-code"),
     }
-    for root in [
-        home.as_ref().map(|home| home.join(".claude/skills")),
-        Some(cwd.join(".claude/skills")),
-    ]
-    .into_iter()
-    .flatten()
-    {
-        discover_skills(&root, Provider::Claude, &mut completions);
-    }
-    for root in [
-        home.as_ref().map(|home| home.join(".claude/commands")),
-        Some(cwd.join(".claude/commands")),
-    ]
-    .into_iter()
-    .flatten()
-    {
-        discover_claude_commands(&root, &mut completions);
-    }
-    completions
 }
 
 pub fn slash_command_completions<'a>(
@@ -273,71 +281,6 @@ pub fn shared_completion_prefix(catalog: &[SlashCommandCompletion], input: &str)
     (prefix.len() > input.len()).then_some(prefix)
 }
 
-fn discover_skills(root: &Path, provider: Provider, completions: &mut Vec<SlashCommandCompletion>) {
-    let Ok(entries) = fs::read_dir(root) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path().join("SKILL.md");
-        if !path.is_file() {
-            continue;
-        }
-        let name = entry.file_name().to_string_lossy().into_owned();
-        push_agent_completion(completions, provider, name, &path);
-    }
-}
-
-fn discover_claude_commands(root: &Path, completions: &mut Vec<SlashCommandCompletion>) {
-    let Ok(entries) = fs::read_dir(root) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.extension().is_some_and(|extension| extension == "md")
-            && let Some(name) = path.file_stem()
-        {
-            push_agent_completion(
-                completions,
-                Provider::Claude,
-                name.to_string_lossy().into_owned(),
-                &path,
-            );
-        }
-    }
-}
-
-fn push_agent_completion(
-    completions: &mut Vec<SlashCommandCompletion>,
-    provider: Provider,
-    name: String,
-    source: &Path,
-) {
-    let description = fs::read_to_string(source)
-        .ok()
-        .and_then(|contents| {
-            contents
-                .lines()
-                .map(|line| line.trim().trim_start_matches('#').trim())
-                .find(|line| !line.is_empty() && *line != "---")
-                .map(str::to_owned)
-        })
-        .unwrap_or_else(|| "Agent skill or command".to_owned());
-    let command = format!("/{name}");
-    completions.retain(|completion| {
-        completion.provider != Some(provider) || completion.command != command
-    });
-    completions.push(SlashCommandCompletion {
-        command,
-        description,
-        insertion: match provider {
-            Provider::Codex => format!("${name} "),
-            Provider::Claude => format!("/{name} "),
-        },
-        provider: Some(provider),
-        built_in: false,
-    });
-}
-
 pub fn parse_slash_command(input: &str) -> Result<Option<SlashCommand>, String> {
     let input = input.trim();
     if !input.starts_with('/') {
@@ -484,6 +427,7 @@ pub fn load_codex_mcp(name: &str) -> Result<McpServer, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use agency_translator_api::commands::CommandOrigin;
 
     #[test]
     fn regular_prompts_are_not_commands() {
@@ -625,9 +569,19 @@ mod tests {
         );
     }
 
+    fn agent_command(name: &str, invocation: &str, origin: CommandOrigin) -> AgentCommand {
+        AgentCommand {
+            name: name.to_owned(),
+            description: "Does a thing".to_owned(),
+            invocation: invocation.to_owned(),
+            argument_hint: None,
+            origin,
+        }
+    }
+
     #[test]
-    fn plugin_install_is_offered_as_an_agency_command() {
-        let catalog = slash_command_catalog(Path::new("/a/workspace/that/does/not/exist"));
+    fn agency_commands_are_always_offered() {
+        let catalog = merge_catalog(Vec::new());
         let plugin = catalog
             .iter()
             .find(|completion| completion.command == "/plugin install")
@@ -636,6 +590,72 @@ mod tests {
         assert_eq!(plugin.insertion, "/plugin install ");
         assert_eq!(plugin.provider, None);
         assert!(!plugin.built_in);
+        assert!(catalog.iter().any(|completion| completion.command == "/init"));
+        assert!(catalog.iter().any(|completion| completion.command == "/mcp add"));
+    }
+
+    #[test]
+    fn a_translator_command_keeps_its_invocation_and_origin() {
+        let catalog = merge_catalog(vec![
+            (
+                Provider::Claude,
+                agent_command(
+                    "superpowers:brainstorming",
+                    "/superpowers:brainstorming ",
+                    CommandOrigin::Plugin {
+                        plugin: "superpowers".to_owned(),
+                        marketplace: "superpowers-marketplace".to_owned(),
+                    },
+                ),
+            ),
+            (
+                Provider::Claude,
+                agent_command("code-review", "/code-review ", CommandOrigin::BuiltIn),
+            ),
+        ]);
+
+        let brainstorming = catalog
+            .iter()
+            .find(|completion| completion.command == "/superpowers:brainstorming")
+            .unwrap();
+        assert_eq!(brainstorming.insertion, "/superpowers:brainstorming ");
+        assert_eq!(brainstorming.provider, Some(Provider::Claude));
+        assert!(!brainstorming.built_in);
+
+        let review = catalog
+            .iter()
+            .find(|completion| completion.command == "/code-review")
+            .unwrap();
+        assert!(review.built_in);
+    }
+
+    /// Two agents offering the same name stay as two rows: the insertions
+    /// differ, so collapsing them would send the wrong text to one of them.
+    #[test]
+    fn duplicate_names_are_kept_between_agents() {
+        let catalog = merge_catalog(vec![
+            (
+                Provider::Codex,
+                agent_command("review", "$review ", CommandOrigin::Personal),
+            ),
+            (
+                Provider::Claude,
+                agent_command("review", "/review ", CommandOrigin::Personal),
+            ),
+        ]);
+
+        let review = catalog
+            .iter()
+            .filter(|completion| completion.command == "/review")
+            .collect::<Vec<_>>();
+        assert_eq!(review.len(), 2);
+        assert_eq!(review[0].insertion, "$review ");
+        assert_eq!(review[1].insertion, "/review ");
+    }
+
+    #[test]
+    fn discovery_of_a_workspace_with_no_agents_yields_nothing() {
+        assert!(discover_agent_commands(&[], Path::new("/a/workspace")).is_empty());
     }
 
     #[test]
@@ -750,13 +770,13 @@ mod tests {
 
     #[test]
     fn tab_accepts_the_insertion_rather_than_the_displayed_command() {
-        let mut catalog = Vec::new();
-        push_agent_completion(
-            &mut catalog,
-            Provider::Codex,
-            "review".to_owned(),
-            Path::new("/a/source/that/does/not/exist"),
-        );
+        let catalog = vec![SlashCommandCompletion {
+            command: "/review".to_owned(),
+            description: String::new(),
+            insertion: "$review ".to_owned(),
+            provider: Some(Provider::Codex),
+            built_in: false,
+        }];
 
         let Some(TabCompletion::Accept(accepted)) = tab_completion(&catalog, "/review", 0) else {
             panic!("a fully typed command should be accepted");
@@ -770,36 +790,6 @@ mod tests {
         let catalog = vec![completion("/init"), completion("/mcp add")];
 
         assert_eq!(tab_completion(&catalog, "/init", 7), None);
-    }
-
-    #[test]
-    fn duplicate_names_are_kept_between_agents_and_replaced_within_one_agent() {
-        let mut completions = Vec::new();
-        let missing = Path::new("/a/source/that/does/not/exist");
-        push_agent_completion(
-            &mut completions,
-            Provider::Codex,
-            "review".to_owned(),
-            missing,
-        );
-        push_agent_completion(
-            &mut completions,
-            Provider::Claude,
-            "review".to_owned(),
-            missing,
-        );
-        push_agent_completion(
-            &mut completions,
-            Provider::Codex,
-            "review".to_owned(),
-            missing,
-        );
-
-        assert_eq!(completions.len(), 2);
-        assert_eq!(completions[0].provider, Some(Provider::Claude));
-        assert_eq!(completions[0].insertion, "/review ");
-        assert_eq!(completions[1].provider, Some(Provider::Codex));
-        assert_eq!(completions[1].insertion, "$review ");
     }
 
     const TYPING: ComposerState = ComposerState {
@@ -914,44 +904,6 @@ mod tests {
 
         assert!(!state.is_open());
         assert_eq!(completion_count(&catalog, "/init"), 1);
-    }
-
-    #[test]
-    fn claude_built_ins_are_available_and_can_be_overridden() {
-        let mut completions = CLAUDE_BUILT_INS
-            .into_iter()
-            .map(|(name, description)| SlashCommandCompletion {
-                command: format!("/{name}"),
-                description: description.to_owned(),
-                insertion: format!("/{name} "),
-                provider: Some(Provider::Claude),
-                built_in: true,
-            })
-            .collect::<Vec<_>>();
-
-        assert!(completions.iter().any(|completion| {
-            completion.command == "/insights"
-                && completion.provider == Some(Provider::Claude)
-                && completion.built_in
-        }));
-        assert!(completions.iter().any(|completion| {
-            completion.command == "/deep-research"
-                && completion.provider == Some(Provider::Claude)
-                && completion.built_in
-        }));
-
-        push_agent_completion(
-            &mut completions,
-            Provider::Claude,
-            "insights".to_owned(),
-            Path::new("/a/source/that/does/not/exist"),
-        );
-        let insights = completions
-            .iter()
-            .filter(|completion| completion.command == "/insights")
-            .collect::<Vec<_>>();
-        assert_eq!(insights.len(), 1);
-        assert!(!insights[0].built_in);
     }
 
     #[test]

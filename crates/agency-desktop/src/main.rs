@@ -54,8 +54,8 @@ use plugins::{PluginInstallEntry, PluginInstallEvent, PluginInstalls, Transcript
 use sessions::{SessionRegistry, name_from_prompt, new_conversation_id};
 use slash_commands::{
     ComposerState, INIT_AGENT_PROMPT, SlashCommand, SlashCommandCompletion, SlashCompletionState,
-    TabCompletion, completion_count, initialize_workspace, load_codex_mcp, parse_slash_command,
-    slash_command_catalog, slash_command_completions, tab_completion,
+    TabCompletion, completion_count, discover_agent_commands, initialize_workspace, load_codex_mcp,
+    merge_catalog, parse_slash_command, slash_command_completions, tab_completion,
 };
 use terminal::TerminalSession;
 use worktrees::Worktree;
@@ -930,7 +930,8 @@ impl Default for Agency {
             Err(error) => (SessionRegistry::empty(&cwd), Some(error)),
         };
         let rpc_capabilities = SessionCapabilities::default();
-        let slash_command_catalog = slash_command_catalog(&cwd);
+        let slash_command_catalog =
+            merge_catalog(discover_agent_commands(&configured_agents, &cwd));
         let (rpc_server, rpc_notice) = match RpcServer::start(rpc_capabilities.clone()) {
             Ok(server) => (Some(server), None),
             Err(error) => (None, Some(error)),
@@ -2291,7 +2292,8 @@ impl Agency {
 
         self.active_worktree = index;
         self.cwd = cwd;
-        self.slash_command_catalog = slash_command_catalog(&self.cwd);
+        self.slash_command_catalog =
+            merge_catalog(discover_agent_commands(&self.configured_agents, &self.cwd));
         self.overlays.slash.close();
         self.sessions = sessions;
         for agent in &self.agents {
