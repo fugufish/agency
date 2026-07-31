@@ -406,6 +406,12 @@ mod tests {
         let home = scratch("empty-home");
         let workspace = scratch("empty-workspace");
         assert!(catalog(&home, &workspace).is_empty());
+
+        // Positive control: without this, the assertion above would also pass
+        // if `catalog` returned nothing unconditionally, empty home or not.
+        skill(home.join(".agents/skills"), "present", "Now something is here");
+        assert!(named(&catalog(&home, &workspace), "present").is_some());
+
         fs::remove_dir_all(home).unwrap();
         fs::remove_dir_all(workspace).unwrap();
     }

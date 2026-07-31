@@ -262,8 +262,15 @@ fn plugin_commands(plugin: &InstalledPlugin, manifest: &Manifest) -> Vec<AgentCo
         }
     }
 
+    // A manifest that redundantly names the default `skills/` directory (or
+    // repeats one of its own extra roots) would otherwise be scanned twice,
+    // double-listing every skill inside it.
     let mut skill_roots = vec![plugin.install_path.join("skills")];
-    skill_roots.extend(manifest.skills.iter().cloned());
+    for root in manifest.skills.iter().cloned() {
+        if !skill_roots.contains(&root) {
+            skill_roots.push(root);
+        }
+    }
     let mut found_any_skill = false;
     for root in skill_roots {
         for file in discovery::skill_directories(&root) {
@@ -272,7 +279,7 @@ fn plugin_commands(plugin: &InstalledPlugin, manifest: &Manifest) -> Vec<AgentCo
             let parsed = discovery::frontmatter(&contents);
             // In a plugin skill the frontmatter name replaces the last segment
             // and the plugin prefix stays in place.
-            let segment = parsed.name.clone().unwrap_or(file.name);
+            let segment = command_token(parsed.name.clone(), || file.name.clone());
             commands.push(command(
                 format!("{}:{segment}", plugin.name),
                 discovery::describe(&contents),
@@ -288,7 +295,7 @@ fn plugin_commands(plugin: &InstalledPlugin, manifest: &Manifest) -> Vec<AgentCo
     if !found_any_skill && manifest.skills.is_empty() && root_skill.is_file() {
         let contents = read(&root_skill);
         let parsed = discovery::frontmatter(&contents);
-        let segment = parsed.name.clone().unwrap_or_else(|| plugin.name.clone());
+        let segment = command_token(parsed.name.clone(), || plugin.name.clone());
         commands.push(command(
             format!("{}:{segment}", plugin.name),
             discovery::describe(&contents),
@@ -298,6 +305,24 @@ fn plugin_commands(plugin: &InstalledPlugin, manifest: &Manifest) -> Vec<AgentCo
     }
 
     commands
+}
+
+/// Claude Code's documented rule is that a plugin skill's frontmatter `name`
+/// replaces the last segment of its command (`skills/review/SKILL.md` with
+/// `name: fancy` becomes `/plugin:fancy`). That rule assumes the frontmatter
+/// name is itself shaped like a command. Real plugins also use `name` for a
+/// human-readable display label — Hookify's `writing-rules` skill sets
+/// `name: Writing Hookify Rules` — and honoring that literally would emit
+/// `/hookify:Writing Hookify Rules`, a command with a space in it that Claude
+/// Code cannot resolve and nobody could type. So the rename only applies when
+/// the frontmatter name could stand alone as a command segment; otherwise the
+/// directory (or plugin) name is what Claude Code actually invokes, and that
+/// is what gets indexed instead.
+fn command_token(name: Option<String>, fallback: impl FnOnce() -> String) -> String {
+    match name {
+        Some(name) if !name.is_empty() && !name.chars().any(char::is_whitespace) => name,
+        _ => fallback(),
+    }
 }
 
 /// A personal or project entry. At these levels the frontmatter `name` is a
@@ -625,6 +650,28 @@ mod tests {
         fs::remove_dir_all(workspace).unwrap();
     }
 
+    /// Regression for the real Hookify plugin: its `writing-rules` skill sets
+    /// `name: Writing Hookify Rules`, which is not a token Claude Code can
+    /// invoke. The indexer must fall back to the directory name rather than
+    /// emitting a command nobody can type.
+    #[test]
+    fn a_plugin_skill_frontmatter_name_with_whitespace_falls_back_to_the_directory_name() {
+        let home = scratch("rename-invalid-home");
+        let workspace = scratch("rename-invalid-workspace");
+        let install = install(&home, "hookify", None);
+        write(
+            install.join("skills/writing-rules/SKILL.md"),
+            "---\nname: Writing Hookify Rules\ndescription: Write hookify rules\n---\n",
+        );
+
+        let commands = catalog(&home, &workspace);
+
+        assert!(named(&commands, "hookify:writing-rules").is_some());
+        assert!(named(&commands, "hookify:Writing Hookify Rules").is_none());
+        fs::remove_dir_all(home).unwrap();
+        fs::remove_dir_all(workspace).unwrap();
+    }
+
     #[test]
     fn a_plugin_root_skill_file_becomes_a_single_skill_plugin() {
         let home = scratch("root-skill-home");
@@ -645,6 +692,9 @@ mod tests {
         let workspace = scratch("disabled-workspace");
         let install = install(&home, "off", None);
         skill(install.join("skills"), "hidden", "Should not appear");
+        // Positive control: without this, the assertion below would also pass
+        // if `catalog` returned nothing at all, regardless of `is_enabled`.
+        skill(home.join(".claude/skills"), "elsewhere", "Still works");
         write(
             home.join(".claude/settings.json"),
             r#"{"enabledPlugins":{"off@marketplace":false}}"#,
@@ -653,6 +703,7 @@ mod tests {
         let commands = catalog(&home, &workspace);
 
         assert!(named(&commands, "off:hidden").is_none());
+        assert!(named(&commands, "elsewhere").is_some());
         fs::remove_dir_all(home).unwrap();
         fs::remove_dir_all(workspace).unwrap();
     }
@@ -688,6 +739,26 @@ mod tests {
 
         assert!(named(&commands, "custom:used").is_some());
         assert!(named(&commands, "custom:ignored").is_none());
+        fs::remove_dir_all(home).unwrap();
+        fs::remove_dir_all(workspace).unwrap();
+    }
+
+    /// A manifest declaring `"skills":"./skills/"` names the same directory
+    /// `catalog` already scans by default. Without a dedup, every skill in
+    /// it would be indexed twice.
+    #[test]
+    fn a_manifest_that_redundantly_names_the_default_skills_directory_lists_once() {
+        let home = scratch("redundant-skills-home");
+        let workspace = scratch("redundant-skills-workspace");
+        let install = install(&home, "dup", Some(r#"{"name":"dup","skills":"./skills/"}"#));
+        skill(install.join("skills"), "once", "Should appear once");
+
+        let commands = catalog(&home, &workspace);
+
+        assert_eq!(
+            commands.iter().filter(|command| command.name == "dup:once").count(),
+            1
+        );
         fs::remove_dir_all(home).unwrap();
         fs::remove_dir_all(workspace).unwrap();
     }
