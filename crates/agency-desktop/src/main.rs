@@ -53,9 +53,9 @@ use keybindings::{
 use plugins::{PluginInstallEntry, PluginInstallEvent, PluginInstalls, TranscriptInstalls};
 use sessions::{SessionRegistry, name_from_prompt, new_conversation_id};
 use slash_commands::{
-    INIT_AGENT_PROMPT, SlashCommand, SlashCommandCompletion, TabCompletion, initialize_workspace,
-    load_codex_mcp, parse_slash_command, slash_command_catalog, slash_command_completions,
-    tab_completion,
+    ComposerState, INIT_AGENT_PROMPT, SlashCommand, SlashCommandCompletion, SlashCompletionState,
+    TabCompletion, completion_count, initialize_workspace, load_codex_mcp, parse_slash_command,
+    slash_command_catalog, slash_command_completions, tab_completion,
 };
 use terminal::TerminalSession;
 use worktrees::Worktree;
@@ -71,6 +71,10 @@ const FOCUS_DIFF_ACTIVITY: FocusId = FocusId(6);
 const FOCUS_SLASH_COMPLETION: FocusId = FocusId(7);
 const FOCUS_CONFIRMATION: FocusId = FocusId(8);
 const FOCUS_AGENT_MENU: FocusId = FocusId(9);
+/// Overlays that take focus from the surface they float over rather than owning
+/// a place in the focus cycle.
+const BORROWING_OVERLAYS: [FocusId; 3] =
+    [FOCUS_SLASH_COMPLETION, FOCUS_CONFIRMATION, FOCUS_AGENT_MENU];
 
 /// Height reserved for the status bar. The agent menu floats directly above it,
 /// so the two have to agree on where the bar starts.
@@ -98,6 +102,67 @@ fn ui_focus_tracker() -> FocusTracker<KeybindingContext> {
         focus.attach(element, context);
     }
     focus
+}
+
+/// Whether an action rewrites the composer's prompt text. The match is
+/// exhaustive on purpose: a new action has to declare itself rather than
+/// silently skipping the prompt-changed event the completion list reduces.
+fn edits_prompt(action: &Action) -> bool {
+    match action {
+        Action::AgentAppend(_)
+        | Action::AgentBackspace
+        | Action::AgentPaste
+        | Action::AgentDeleteChar
+        | Action::AgentOperate(..)
+        | Action::AgentOperateSelection(_)
+        | Action::AgentSubmit => true,
+        // Cursor, selection, and mode moves leave the text alone.
+        Action::AgentSelectAll
+        | Action::AgentMove(_)
+        | Action::AgentInsertAtLineStart
+        | Action::AgentAppendAtCursor
+        | Action::AgentAppendAtLineEnd
+        | Action::None
+        | Action::FocusRight
+        | Action::FocusLeft
+        | Action::WorktreePrevious
+        | Action::WorktreeNext
+        | Action::WorktreeSelect(_)
+        | Action::ToggleActivity(_)
+        | Action::ToggleSettings
+        | Action::NewSession
+        | Action::ToolbarPrevious
+        | Action::ToolbarNext
+        | Action::ToolbarFirst
+        | Action::ToolbarLast
+        | Action::ToolbarOpen
+        | Action::ToolbarTrash
+        | Action::ExplorerPrevious
+        | Action::ExplorerNext
+        | Action::ExplorerCollapse
+        | Action::ExplorerExpand
+        | Action::ExplorerOpen
+        | Action::DiffPrevious
+        | Action::DiffNext
+        | Action::DiffFirst
+        | Action::DiffLast
+        | Action::DiffOpen
+        | Action::DiffScrollUp
+        | Action::DiffScrollDown
+        | Action::DiffJumpToTool
+        | Action::DiffClose
+        | Action::ToggleTerminal
+        | Action::ToggleAgentMenu
+        | Action::AgentMenuPrevious
+        | Action::AgentMenuNext
+        | Action::AgentMenuFirst
+        | Action::AgentMenuLast
+        | Action::AgentMenuConfirm
+        | Action::AgentMenuClose
+        | Action::EnterComposer
+        | Action::EnterTerminal
+        | Action::TerminalInput(_) => false,
+    }
 }
 
 fn ui_element_modes() -> ElementModeRegistry<Mode> {
@@ -162,8 +227,7 @@ struct ExplorerState {
 #[derive(Default)]
 struct OverlayState {
     pending_session_trash: Option<usize>,
-    slash_completion_open: bool,
-    slash_completion_selected: usize,
+    slash: SlashCompletionState,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -293,6 +357,10 @@ struct InteractionState {
     focus: FocusTracker<KeybindingContext>,
     element_modes: ElementModeRegistry<Mode>,
     input_mode: InputModeState,
+    /// The surface an overlay borrowed focus from, so closing the overlay hands
+    /// focus back instead of dropping it on whichever element happens to sort
+    /// first.
+    borrowed_focus: Option<FocusId>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -356,6 +424,7 @@ impl Default for InteractionState {
             focus: ui_focus_tracker(),
             element_modes: ui_element_modes(),
             input_mode: InputModeState::default(),
+            borrowed_focus: None,
         }
     }
 }
@@ -412,9 +481,20 @@ impl InteractionState {
             None
         };
         if let Some(forced) = forced {
+            // Overlays stack, so only the first one to take focus records where
+            // it came from: closing them all returns to the original surface.
+            if self.focus.focused() != forced && !BORROWING_OVERLAYS.contains(&self.focus.focused())
+            {
+                self.borrowed_focus = Some(self.focus.focused());
+            }
             debug_assert!(self.focus.focus(forced));
-        } else if !self.focus.is_visible(self.focus.focused()) {
-            self.focus.focus_right();
+        } else {
+            let borrowed = self.borrowed_focus.take();
+            if !self.focus.is_visible(self.focus.focused())
+                && !borrowed.is_some_and(|element| self.focus.focus(element))
+            {
+                self.focus.focus_right();
+            }
         }
     }
 }
@@ -780,6 +860,9 @@ enum AppEvent {
     AnswerChoice(usize),
     CompleteSlashCommand(String, Option<Provider>),
     TabCompleteSlashCommand,
+    /// The composer's prompt text changed. Published *after* the change lands so
+    /// every prompt-derived affordance re-reads the text as it stands now.
+    ComposerPromptChanged,
     PluginInstallRequested {
         conversation_id: String,
         source: String,
@@ -946,7 +1029,7 @@ impl Agency {
             terminal: self.layout.terminal_visible,
             diff_viewer: diff_viewer_visible,
             diff_activity: diff_activity_visible,
-            slash_completion: self.overlays.slash_completion_open,
+            slash_completion: self.overlays.slash.is_open(),
             confirmation: self.overlays.pending_session_trash.is_some(),
             agent_menu: self.agent_menu.open,
         });
@@ -978,6 +1061,35 @@ impl Agency {
 
     fn emit(&mut self, event: AppEvent) {
         self.event_bus.publish(event);
+    }
+
+    /// Re-derives the slash completion overlay from the prompt. This has to run
+    /// after the prompt has already changed — reading it while the mutation is
+    /// still queued is what left the list a keystroke behind.
+    fn refresh_slash_completions(&mut self) {
+        let composer = ComposerState {
+            focused: self.interaction.focus.context() == KeybindingContext::Composer,
+            accepting_text: self.keybindings.is_composer_active(),
+        };
+        let prompt = self
+            .active_agent()
+            .map(|agent| agent.prompt.clone())
+            .unwrap_or_default();
+        let was_open = self.overlays.slash.is_open();
+        self.overlays
+            .slash
+            .refresh(&self.slash_command_catalog, &prompt, composer);
+        if self.overlays.slash.is_open() != was_open {
+            // Opening borrows focus from the composer and closing gives it
+            // back, so focus follows the overlay in the same pass.
+            self.sync_focus();
+        }
+    }
+
+    fn slash_completion_count(&self) -> usize {
+        self.active_agent().map_or(0, |agent| {
+            completion_count(&self.slash_command_catalog, &agent.prompt)
+        })
     }
 
     fn reduce_event(&mut self, message: AppEvent) -> Task<AppEvent> {
@@ -1035,6 +1147,9 @@ impl Agency {
                     self.keybindings.set_mode(Mode::Insert);
                 }
                 self.publish_input_mode();
+                // A prompt left holding a slash command gets its list back when
+                // the composer is re-entered.
+                self.refresh_slash_completions();
             }
             AppEvent::InputModeChanged { .. } => {}
             AppEvent::FocusNext => {
@@ -1117,8 +1232,13 @@ impl Agency {
                     agent.prompt_selection_anchor = None;
                     agent.command_provider = provider;
                 }
-                self.overlays.slash_completion_open = false;
+                // An accepted command usually still matches its own catalog
+                // entry, so the list is closed outright rather than refreshed.
+                // The next edit reopens it.
+                self.overlays.slash.close();
+                self.sync_focus();
             }
+            AppEvent::ComposerPromptChanged => self.refresh_slash_completions(),
             AppEvent::TabCompleteSlashCommand => {
                 let Some(prompt) = self.active_agent().map(|agent| agent.prompt.clone()) else {
                     return Task::none();
@@ -1126,7 +1246,7 @@ impl Agency {
                 match tab_completion(
                     &self.slash_command_catalog,
                     &prompt,
-                    self.overlays.slash_completion_selected,
+                    self.overlays.slash.selected(),
                 ) {
                     Some(TabCompletion::Fill(prefix)) => {
                         if let Some(agent) = self.active_agent_mut() {
@@ -1135,15 +1255,7 @@ impl Agency {
                             agent.prompt_cursor = agent.prompt.len();
                             agent.prompt_selection_anchor = None;
                         }
-                        let remaining = self.active_agent().map_or(0, |agent| {
-                            slash_command_completions(&self.slash_command_catalog, &agent.prompt)
-                                .count()
-                        });
-                        self.overlays.slash_completion_open = remaining > 0;
-                        self.overlays.slash_completion_selected = self
-                            .overlays
-                            .slash_completion_selected
-                            .min(remaining.saturating_sub(1));
+                        self.refresh_slash_completions();
                     }
                     // Accepting reuses the event a click publishes, so the
                     // prompt, provider, and overlay settle in one place.
@@ -1342,13 +1454,8 @@ impl Agency {
                     }
                     return Task::none();
                 }
-                let completion_count = self.active_agent().map_or(0, |agent| {
-                    slash_command_completions(&self.slash_command_catalog, &agent.prompt).count()
-                });
-                if self.overlays.slash_completion_open
-                    && completion_count > 0
-                    && modifiers.is_empty()
-                {
+                let completion_count = self.slash_completion_count();
+                if self.overlays.slash.is_open() && completion_count > 0 && modifiers.is_empty() {
                     let normal = self.keybindings.is_normal();
                     let previous = matches!(
                         key.as_ref(),
@@ -1361,16 +1468,11 @@ impl Agency {
                     ) || (normal
                         && matches!(key.as_ref(), keyboard::Key::Character(character) if character == "j"));
                     if previous {
-                        self.overlays.slash_completion_selected = self
-                            .overlays
-                            .slash_completion_selected
-                            .checked_sub(1)
-                            .unwrap_or(completion_count - 1);
+                        self.overlays.slash.select_previous(completion_count);
                         return Task::none();
                     }
                     if next {
-                        self.overlays.slash_completion_selected =
-                            (self.overlays.slash_completion_selected + 1) % completion_count;
+                        self.overlays.slash.select_next(completion_count);
                         return Task::none();
                     }
                     // Tab is claimed here in both modes so it completes the
@@ -1382,26 +1484,34 @@ impl Agency {
                         self.emit(AppEvent::TabCompleteSlashCommand);
                         return Task::none();
                     }
+                    // Enter takes the highlighted row through the same event a
+                    // click publishes, so the prompt, provider, and overlay
+                    // settle in one place. A row that would insert exactly what
+                    // is already typed has nothing to add, so Enter falls
+                    // through and submits instead of demanding a second press.
                     if matches!(
                         key.as_ref(),
                         keyboard::Key::Named(keyboard::key::Named::Enter)
                     ) {
                         let completion = self.active_agent().and_then(|agent| {
                             slash_command_completions(&self.slash_command_catalog, &agent.prompt)
-                                .nth(self.overlays.slash_completion_selected)
+                                .nth(self.overlays.slash.selected())
+                                .filter(|completion| completion.insertion != agent.prompt)
                                 .cloned()
                         });
-                        if let Some(completion) = completion {
-                            if let Some(agent) = self.active_agent_mut() {
-                                agent.prompt = completion.insertion;
-                                agent.prompt_selected = false;
-                                agent.prompt_cursor = agent.prompt.len();
-                                agent.prompt_selection_anchor = None;
-                                agent.command_provider = completion.provider;
+                        match completion {
+                            Some(completion) => {
+                                self.emit(AppEvent::CompleteSlashCommand(
+                                    completion.insertion,
+                                    completion.provider,
+                                ));
+                                return Task::none();
                             }
-                            self.overlays.slash_completion_open = false;
+                            None => {
+                                self.overlays.slash.close();
+                                self.sync_focus();
+                            }
                         }
-                        return Task::none();
                     }
                     if normal
                         && matches!(
@@ -1409,7 +1519,8 @@ impl Agency {
                             keyboard::Key::Named(keyboard::key::Named::Escape)
                         )
                     {
-                        self.overlays.slash_completion_open = false;
+                        self.overlays.slash.close();
+                        self.sync_focus();
                         return Task::none();
                     }
                 }
@@ -1443,23 +1554,10 @@ impl Agency {
                     agent.prompt_selection_anchor = None;
                     agent.prompt_selected = false;
                 }
-                if let Some(agent) = self.active_agent() {
-                    let new_completion_count =
-                        slash_command_completions(&self.slash_command_catalog, &agent.prompt)
-                            .count();
-                    if self.interaction.focus.context() == KeybindingContext::Composer
-                        && self.keybindings.is_composer_active()
-                        && new_completion_count > 0
-                    {
-                        self.overlays.slash_completion_open = true;
-                        self.overlays.slash_completion_selected = self
-                            .overlays
-                            .slash_completion_selected
-                            .min(new_completion_count - 1);
-                    } else if new_completion_count == 0 {
-                        self.overlays.slash_completion_open = false;
-                    }
-                }
+                // The prompt itself is edited by the queued `Action`, which
+                // refreshes the list once the text has actually changed. Only
+                // the mode transition is settled here.
+                self.refresh_slash_completions();
                 if !composer_was_active
                     && self.interaction.focus.context() == KeybindingContext::Composer
                     && self.keybindings.is_composer_active()
@@ -1535,6 +1633,14 @@ impl Agency {
     }
 
     fn apply(&mut self, action: Action) {
+        // Prompt edits are effects on the composer's text, so they announce
+        // themselves once the text has settled rather than leaving every
+        // prompt-derived affordance to guess when to re-read it. The event is
+        // published before the edit runs and reduced after it, because the bus
+        // drains once this action has been reduced.
+        if edits_prompt(&action) {
+            self.emit(AppEvent::ComposerPromptChanged);
+        }
         match action {
             Action::None => {}
             Action::FocusRight => self.emit(AppEvent::FocusNext),
@@ -2186,8 +2292,7 @@ impl Agency {
         self.active_worktree = index;
         self.cwd = cwd;
         self.slash_command_catalog = slash_command_catalog(&self.cwd);
-        self.overlays.slash_completion_open = false;
-        self.overlays.slash_completion_selected = 0;
+        self.overlays.slash.close();
         self.sessions = sessions;
         for agent in &self.agents {
             self.rpc_capabilities.revoke(&agent.rpc_token);
@@ -3533,16 +3638,14 @@ impl Agency {
                         .width(Fill)
                         .style(move |_theme: &Theme, status| {
                             ui_theme::slash_command_button(
-                                index == self.overlays.slash_completion_selected,
+                                index == self.overlays.slash.selected(),
                                 status,
                             )
                         }),
                     )
                 });
-            if self.overlays.slash_completion_open
-                && slash_command_completions(&self.slash_command_catalog, &agent.prompt)
-                    .next()
-                    .is_some()
+            if self.overlays.slash.is_open()
+                && completion_count(&self.slash_command_catalog, &agent.prompt) > 0
             {
                 let hint = row![
                     shortcut_badge("Tab".to_owned()),
@@ -4630,6 +4733,76 @@ mod focus_mode_tests {
         assert_eq!(interaction.focus.focused(), FOCUS_SLASH_COMPLETION);
         assert_eq!(interaction.focus.context(), KeybindingContext::Composer);
         assert_eq!(interaction.reconciled_mode(Mode::Insert), Mode::Insert);
+    }
+
+    /// Regression: closing the completion list used to drop focus on whichever
+    /// element sorted first — the sessions toolbar — which forced NORMAL and
+    /// stranded the user outside the composer mid-command.
+    #[test]
+    fn closing_the_slash_completion_overlay_returns_focus_to_the_composer() {
+        let mut interaction = InteractionState::default();
+        interaction.sync_visibility(workspace_with_agent());
+        assert!(interaction.focus.focus(FOCUS_COMPOSER));
+
+        interaction.sync_visibility(FocusVisibility {
+            slash_completion: true,
+            ..workspace_with_agent()
+        });
+        assert_eq!(interaction.focus.focused(), FOCUS_SLASH_COMPLETION);
+
+        interaction.sync_visibility(workspace_with_agent());
+
+        assert_eq!(interaction.focus.focused(), FOCUS_COMPOSER);
+        assert_eq!(interaction.reconciled_mode(Mode::Insert), Mode::Insert);
+    }
+
+    /// Overlays stack, so the surface underneath all of them is what focus
+    /// returns to once the last one closes.
+    #[test]
+    fn stacked_overlays_return_focus_to_the_surface_they_all_borrowed_from() {
+        let mut interaction = InteractionState::default();
+        interaction.sync_visibility(workspace_with_agent());
+        assert!(interaction.focus.focus(FOCUS_COMPOSER));
+
+        interaction.sync_visibility(FocusVisibility {
+            slash_completion: true,
+            ..workspace_with_agent()
+        });
+        interaction.sync_visibility(FocusVisibility {
+            slash_completion: true,
+            agent_menu: true,
+            ..workspace_with_agent()
+        });
+        assert_eq!(interaction.focus.focused(), FOCUS_AGENT_MENU);
+
+        interaction.sync_visibility(FocusVisibility {
+            slash_completion: true,
+            ..workspace_with_agent()
+        });
+        assert_eq!(interaction.focus.focused(), FOCUS_SLASH_COMPLETION);
+
+        interaction.sync_visibility(workspace_with_agent());
+        assert_eq!(interaction.focus.focused(), FOCUS_COMPOSER);
+    }
+
+    /// A borrowed surface that disappeared while the overlay was open cannot
+    /// take focus back, so the cycle picks the next visible element instead.
+    #[test]
+    fn a_vanished_borrower_falls_back_to_the_focus_cycle() {
+        let mut interaction = InteractionState::default();
+        interaction.sync_visibility(workspace_with_agent());
+        assert!(interaction.focus.focus(FOCUS_COMPOSER));
+
+        interaction.sync_visibility(FocusVisibility {
+            slash_completion: true,
+            ..workspace_with_agent()
+        });
+        interaction.sync_visibility(FocusVisibility {
+            toolbar: true,
+            ..FocusVisibility::default()
+        });
+
+        assert_eq!(interaction.focus.focused(), FOCUS_TOOLBAR);
     }
 
     /// The confirmation modal owns input and is driven from NORMAL.
