@@ -158,31 +158,64 @@ fn read_json(path: &Path) -> Option<Value> {
 /// Code's `/init` is omitted because Agency owns that command.
 const BUILT_INS: [(&str, &str); 27] = [
     ("agents", "Create or manage subagents"),
-    ("batch", "Orchestrate large-scale changes across a codebase in parallel"),
+    (
+        "batch",
+        "Orchestrate large-scale changes across a codebase in parallel",
+    ),
     ("claude-api", "Load Claude API reference material"),
-    ("code-review", "Review the current diff for bugs and cleanup opportunities"),
+    (
+        "code-review",
+        "Review the current diff for bugs and cleanup opportunities",
+    ),
     ("compact", "Free up context by summarizing the conversation"),
     ("context", "Visualize current context usage"),
     ("cost", "Show token usage and costs for the current session"),
-    ("dataviz", "Design guidance for charts, graphs, and dashboards"),
+    (
+        "dataviz",
+        "Design guidance for charts, graphs, and dashboards",
+    ),
     ("debug", "Enable debug logging and troubleshoot issues"),
-    ("deep-research", "Fan out web searches and synthesize a cited report"),
-    ("design-sync", "Convert a React design system and upload it to Claude Design"),
-    ("diff", "Open an interactive diff viewer for uncommitted changes"),
-    ("doctor", "Run a setup checkup that diagnoses and fixes issues"),
+    (
+        "deep-research",
+        "Fan out web searches and synthesize a cited report",
+    ),
+    (
+        "design-sync",
+        "Convert a React design system and upload it to Claude Design",
+    ),
+    (
+        "diff",
+        "Open an interactive diff viewer for uncommitted changes",
+    ),
+    (
+        "doctor",
+        "Run a setup checkup that diagnoses and fixes issues",
+    ),
     ("export", "Export the current conversation as plain text"),
-    ("fewer-permission-prompts", "Add an allowlist to reduce permission prompts"),
-    ("goal", "Set a goal to keep working until a condition is met"),
+    (
+        "fewer-permission-prompts",
+        "Add an allowlist to reduce permission prompts",
+    ),
+    (
+        "goal",
+        "Set a goal to keep working until a condition is met",
+    ),
     ("hooks", "View hook configurations for tool events"),
     ("insights", "Generate a usage insights report"),
-    ("loop", "Run a prompt repeatedly while the session stays open"),
+    (
+        "loop",
+        "Run a prompt repeatedly while the session stays open",
+    ),
     ("mcp", "Manage MCP server connections"),
     ("memory", "Edit CLAUDE.md memory files"),
     ("model", "Switch the model for this session"),
     ("permissions", "View and manage permission rules"),
     ("rewind", "Roll code and conversation back to a checkpoint"),
     ("status", "Show the current session status and model"),
-    ("usage", "Show token usage and costs for the current session"),
+    (
+        "usage",
+        "Show token usage and costs for the current session",
+    ),
     ("verify", "Verify code correctness and best practices"),
 ];
 
@@ -197,7 +230,14 @@ const BUILT_INS: [(&str, &str); 27] = [
 pub(super) fn catalog(home: &Path, workspace: &Path) -> Vec<AgentCommand> {
     let mut commands = BUILT_INS
         .into_iter()
-        .map(|(name, description)| command(name.to_owned(), description.to_owned(), None, CommandOrigin::BuiltIn))
+        .map(|(name, description)| {
+            command(
+                name.to_owned(),
+                description.to_owned(),
+                None,
+                CommandOrigin::BuiltIn,
+            )
+        })
         .collect::<Vec<_>>();
 
     for (root, origin) in [
@@ -403,7 +443,10 @@ mod tests {
         assert_eq!(found[0].name, "hookify");
         assert_eq!(found[0].marketplace, "claude-code-plugins");
         assert_eq!(found[1].name, "superpowers");
-        assert_eq!(found[1].install_path, PathBuf::from("/cache/superpowers/6.2.0"));
+        assert_eq!(
+            found[1].install_path,
+            PathBuf::from("/cache/superpowers/6.2.0")
+        );
         fs::remove_dir_all(home).unwrap();
     }
 
@@ -411,7 +454,10 @@ mod tests {
     fn a_missing_or_malformed_installed_plugins_file_yields_nothing() {
         let home = scratch("malformed");
         assert!(installed_plugins(&home).is_empty());
-        write(home.join(".claude/plugins/installed_plugins.json"), "{not json");
+        write(
+            home.join(".claude/plugins/installed_plugins.json"),
+            "{not json",
+        );
         assert!(installed_plugins(&home).is_empty());
         fs::remove_dir_all(home).unwrap();
     }
@@ -520,7 +566,10 @@ mod tests {
     }
 
     fn named(commands: &[AgentCommand], name: &str) -> Option<AgentCommand> {
-        commands.iter().find(|command| command.name == name).cloned()
+        commands
+            .iter()
+            .find(|command| command.name == name)
+            .cloned()
     }
 
     #[test]
@@ -581,7 +630,10 @@ mod tests {
 
         let commands = catalog(&home, &workspace);
 
-        assert_eq!(named(&commands, "deploy").unwrap().description, "From the skill");
+        assert_eq!(
+            named(&commands, "deploy").unwrap().description,
+            "From the skill"
+        );
         fs::remove_dir_all(home).unwrap();
         fs::remove_dir_all(workspace).unwrap();
     }
@@ -592,7 +644,10 @@ mod tests {
         let install_path = home.join("cache").join(name);
         fs::create_dir_all(&install_path).unwrap();
         if let Some(manifest_json) = manifest_json {
-            write(install_path.join(".claude-plugin/plugin.json"), manifest_json);
+            write(
+                install_path.join(".claude-plugin/plugin.json"),
+                manifest_json,
+            );
         }
         write(
             home.join(".claude/plugins/installed_plugins.json"),
@@ -609,7 +664,11 @@ mod tests {
         let home = scratch("plugin-home");
         let workspace = scratch("plugin-workspace");
         let install = install(&home, "superpowers", None);
-        skill(install.join("skills"), "brainstorming", "Turn ideas into designs");
+        skill(
+            install.join("skills"),
+            "brainstorming",
+            "Turn ideas into designs",
+        );
         write(
             install.join("commands/status.md"),
             "---\ndescription: Show status\n---\n",
@@ -677,11 +736,17 @@ mod tests {
         let home = scratch("root-skill-home");
         let workspace = scratch("root-skill-workspace");
         let install = install(&home, "solo", None);
-        write(install.join("SKILL.md"), "---\ndescription: The only one\n---\n");
+        write(
+            install.join("SKILL.md"),
+            "---\ndescription: The only one\n---\n",
+        );
 
         let commands = catalog(&home, &workspace);
 
-        assert_eq!(named(&commands, "solo:solo").unwrap().description, "The only one");
+        assert_eq!(
+            named(&commands, "solo:solo").unwrap().description,
+            "The only one"
+        );
         fs::remove_dir_all(home).unwrap();
         fs::remove_dir_all(workspace).unwrap();
     }
@@ -712,7 +777,11 @@ mod tests {
     fn a_plugin_opted_out_by_default_is_restored_by_a_settings_entry() {
         let home = scratch("opt-in-home");
         let workspace = scratch("opt-in-workspace");
-        let install = install(&home, "optional", Some(r#"{"name":"optional","defaultEnabled":false}"#));
+        let install = install(
+            &home,
+            "optional",
+            Some(r#"{"name":"optional","defaultEnabled":false}"#),
+        );
         skill(install.join("skills"), "extra", "Opt in");
 
         assert!(named(&catalog(&home, &workspace), "optional:extra").is_none());
@@ -731,8 +800,15 @@ mod tests {
     fn manifest_command_paths_replace_the_default_directory() {
         let home = scratch("replace-home");
         let workspace = scratch("replace-workspace");
-        let install = install(&home, "custom", Some(r#"{"name":"custom","commands":["./cmd/"]}"#));
-        write(install.join("commands/ignored.md"), "---\ndescription: No\n---\n");
+        let install = install(
+            &home,
+            "custom",
+            Some(r#"{"name":"custom","commands":["./cmd/"]}"#),
+        );
+        write(
+            install.join("commands/ignored.md"),
+            "---\ndescription: No\n---\n",
+        );
         write(install.join("cmd/used.md"), "---\ndescription: Yes\n---\n");
 
         let commands = catalog(&home, &workspace);
@@ -756,7 +832,10 @@ mod tests {
         let commands = catalog(&home, &workspace);
 
         assert_eq!(
-            commands.iter().filter(|command| command.name == "dup:once").count(),
+            commands
+                .iter()
+                .filter(|command| command.name == "dup:once")
+                .count(),
             1
         );
         fs::remove_dir_all(home).unwrap();
@@ -767,7 +846,11 @@ mod tests {
     fn manifest_skill_paths_add_to_the_default_directory() {
         let home = scratch("extend-home");
         let workspace = scratch("extend-workspace");
-        let install = install(&home, "both", Some(r#"{"name":"both","skills":["./extra/"]}"#));
+        let install = install(
+            &home,
+            "both",
+            Some(r#"{"name":"both","skills":["./extra/"]}"#),
+        );
         skill(install.join("skills"), "standard", "Default root");
         skill(install.join("extra"), "additional", "Extra root");
 
@@ -784,7 +867,12 @@ mod tests {
         let home = scratch("builtin-home");
         let workspace = scratch("builtin-workspace");
         let commands = catalog(&home, &workspace);
-        assert!(named(&commands, "code-review").unwrap().origin.is_built_in());
+        assert!(
+            named(&commands, "code-review")
+                .unwrap()
+                .origin
+                .is_built_in()
+        );
 
         skill(home.join(".claude/skills"), "code-review", "Mine");
         let commands = catalog(&home, &workspace);

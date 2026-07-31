@@ -69,8 +69,9 @@ pub fn agency_commands() -> Vec<SlashCommandCompletion> {
         },
         SlashCommandCompletion {
             command: "/plugin install".to_owned(),
-            description: "Install a plugin, or add a marketplace source, for every configured agent"
-                .to_owned(),
+            description:
+                "Install a plugin, or add a marketplace source, for every configured agent"
+                    .to_owned(),
             insertion: "/plugin install ".to_owned(),
             provider: None,
             built_in: false,
@@ -590,8 +591,16 @@ mod tests {
         assert_eq!(plugin.insertion, "/plugin install ");
         assert_eq!(plugin.provider, None);
         assert!(!plugin.built_in);
-        assert!(catalog.iter().any(|completion| completion.command == "/init"));
-        assert!(catalog.iter().any(|completion| completion.command == "/mcp add"));
+        assert!(
+            catalog
+                .iter()
+                .any(|completion| completion.command == "/init")
+        );
+        assert!(
+            catalog
+                .iter()
+                .any(|completion| completion.command == "/mcp add")
+        );
     }
 
     #[test]
@@ -992,7 +1001,9 @@ mod tests {
         );
         assert_eq!(
             tab_completion(&catalog, "/brain", 1),
-            Some(TabCompletion::Accept(completion("/hookify:brainstorming-lite")))
+            Some(TabCompletion::Accept(completion(
+                "/hookify:brainstorming-lite"
+            )))
         );
     }
 

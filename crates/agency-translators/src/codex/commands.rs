@@ -196,7 +196,10 @@ mod tests {
     }
 
     fn named(commands: &[AgentCommand], name: &str) -> Option<AgentCommand> {
-        commands.iter().find(|command| command.name == name).cloned()
+        commands
+            .iter()
+            .find(|command| command.name == name)
+            .cloned()
     }
 
     #[test]
@@ -212,7 +215,10 @@ mod tests {
         assert_eq!(deploy.invocation, "$deploy ");
         assert_eq!(deploy.description, "Ship it");
         assert_eq!(deploy.origin, CommandOrigin::Personal);
-        assert_eq!(named(&commands, "audit").unwrap().origin, CommandOrigin::Project);
+        assert_eq!(
+            named(&commands, "audit").unwrap().origin,
+            CommandOrigin::Project
+        );
 
         fs::remove_dir_all(home).unwrap();
         fs::remove_dir_all(workspace).unwrap();
@@ -228,13 +234,20 @@ mod tests {
     fn a_personal_skill_shadows_a_project_skill_of_the_same_name() {
         let home = scratch("shadow-personal-home");
         let workspace = scratch("shadow-personal-workspace");
-        skill(workspace.join(".agents/skills"), "shared", "Project version");
+        skill(
+            workspace.join(".agents/skills"),
+            "shared",
+            "Project version",
+        );
         skill(home.join(".agents/skills"), "shared", "Personal version");
 
         let commands = catalog(&home, &workspace);
 
         assert_eq!(
-            commands.iter().filter(|command| command.name == "shared").count(),
+            commands
+                .iter()
+                .filter(|command| command.name == "shared")
+                .count(),
             1
         );
         let shared = named(&commands, "shared").unwrap();
@@ -326,7 +339,10 @@ mod tests {
         let commands = catalog(&home, &workspace);
 
         assert_eq!(
-            commands.iter().filter(|command| command.name == "shared").count(),
+            commands
+                .iter()
+                .filter(|command| command.name == "shared")
+                .count(),
             1
         );
         let shared = named(&commands, "shared").unwrap();
@@ -357,12 +373,20 @@ mod tests {
             cache.join("0.1.0/.codex-plugin/plugin.json"),
             r#"{"name":"templates","skills":"./skills/"}"#,
         );
-        skill(cache.join("0.1.0/skills"), "old-only", "From the old version");
+        skill(
+            cache.join("0.1.0/skills"),
+            "old-only",
+            "From the old version",
+        );
         write(
             cache.join("0.2.0/.codex-plugin/plugin.json"),
             r#"{"name":"templates","skills":"./skills/"}"#,
         );
-        skill(cache.join("0.2.0/skills"), "new-only", "From the new version");
+        skill(
+            cache.join("0.2.0/skills"),
+            "new-only",
+            "From the new version",
+        );
 
         let commands = catalog(&home, &workspace);
 
@@ -378,7 +402,10 @@ mod tests {
         let home = scratch("default-home");
         let workspace = scratch("default-workspace");
         let install = home.join(".codex/plugins/cache/market/plain/1.0.0");
-        write(install.join(".codex-plugin/plugin.json"), r#"{"name":"plain"}"#);
+        write(
+            install.join(".codex-plugin/plugin.json"),
+            r#"{"name":"plain"}"#,
+        );
         skill(install.join("skills"), "included", "Found anyway");
 
         assert!(named(&catalog(&home, &workspace), "included").is_some());
@@ -409,7 +436,11 @@ mod tests {
 
         // Positive control: without this, the assertion above would also pass
         // if `catalog` returned nothing unconditionally, empty home or not.
-        skill(home.join(".agents/skills"), "present", "Now something is here");
+        skill(
+            home.join(".agents/skills"),
+            "present",
+            "Now something is here",
+        );
         assert!(named(&catalog(&home, &workspace), "present").is_some());
 
         fs::remove_dir_all(home).unwrap();

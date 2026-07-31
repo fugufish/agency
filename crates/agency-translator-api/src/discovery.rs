@@ -174,7 +174,10 @@ mod tests {
     fn frontmatter_keys_are_read_by_name() {
         let parsed = frontmatter(SKILL);
         assert_eq!(parsed.name.as_deref(), Some("brainstorming"));
-        assert_eq!(parsed.description.as_deref(), Some("Turn ideas into designs"));
+        assert_eq!(
+            parsed.description.as_deref(),
+            Some("Turn ideas into designs")
+        );
         assert_eq!(parsed.argument_hint.as_deref(), Some("[topic]"));
     }
 
@@ -206,7 +209,10 @@ mod tests {
     fn an_unterminated_block_is_not_treated_as_frontmatter() {
         let parsed = frontmatter("---\ndescription: never closed\n");
         assert_eq!(parsed.description, None);
-        assert_eq!(describe("---\ndescription: never closed\n"), "description: never closed");
+        assert_eq!(
+            describe("---\ndescription: never closed\n"),
+            "description: never closed"
+        );
     }
 
     #[test]
@@ -219,7 +225,10 @@ mod tests {
     fn blank_values_and_unknown_keys_are_ignored() {
         let parsed = frontmatter("---\ndescription:\nmodel: opus\n---\nBody\n");
         assert_eq!(parsed.description, None);
-        assert_eq!(describe("---\ndescription:\nmodel: opus\n---\nBody\n"), "Body");
+        assert_eq!(
+            describe("---\ndescription:\nmodel: opus\n---\nBody\n"),
+            "Body"
+        );
     }
 
     use std::fs;
@@ -244,7 +253,11 @@ mod tests {
     fn skills_are_directories_holding_a_skill_file() {
         let root = scratch("skills");
         fs::create_dir_all(root.join("deploy")).unwrap();
-        fs::write(root.join("deploy/SKILL.md"), "---\ndescription: Ship\n---\n").unwrap();
+        fs::write(
+            root.join("deploy/SKILL.md"),
+            "---\ndescription: Ship\n---\n",
+        )
+        .unwrap();
         fs::create_dir_all(root.join("audit")).unwrap();
         fs::write(root.join("audit/SKILL.md"), "body").unwrap();
         // A directory with no SKILL.md is not a skill.
@@ -253,7 +266,10 @@ mod tests {
         let found = skill_directories(&root);
 
         assert_eq!(
-            found.iter().map(|file| file.name.as_str()).collect::<Vec<_>>(),
+            found
+                .iter()
+                .map(|file| file.name.as_str())
+                .collect::<Vec<_>>(),
             ["audit", "deploy"]
         );
         assert_eq!(found[1].path, root.join("deploy/SKILL.md"));
@@ -272,7 +288,10 @@ mod tests {
         let found = command_files(&root);
 
         assert_eq!(
-            found.iter().map(|file| file.name.as_str()).collect::<Vec<_>>(),
+            found
+                .iter()
+                .map(|file| file.name.as_str())
+                .collect::<Vec<_>>(),
             ["commit", "deploy"]
         );
         fs::remove_dir_all(root).unwrap();
