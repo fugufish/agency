@@ -1,6 +1,8 @@
 use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
+use agency_translator_api::commands::{AgentCommand, CommandCatalog};
 use agency_translator_api::{
     ClientId, ContentBlock, Conversation, ConversationEvent, ConversationUpdate, EventPayload,
     ExportResult, ImportResult, LiveEventTranslator, MessageRole, NativeArtifact, NativeEnvelope,
@@ -8,6 +10,8 @@ use agency_translator_api::{
     TranslatorDescriptor, tools,
 };
 use serde_json::{Value, json};
+
+mod commands;
 
 const CLIENT: &str = "claude-code";
 const LIVE_ASSISTANT: &str = "claude-live-assistant";
@@ -57,6 +61,15 @@ impl LiveEventTranslator for ClaudeTranslator {
             }
             _ => Ok(Vec::new()),
         }
+    }
+}
+
+impl CommandCatalog for ClaudeTranslator {
+    fn commands(&self, workspace: &Path) -> Vec<AgentCommand> {
+        let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
+            return Vec::new();
+        };
+        commands::catalog(&home, workspace)
     }
 }
 

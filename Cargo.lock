@@ -53,6 +53,7 @@ dependencies = [
  "png 0.18.1",
  "serde",
  "serde_json",
+ "tokio",
  "toml",
 ]
 

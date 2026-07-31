@@ -25,4 +25,5 @@ libghostty-vt.workspace = true
 png = "0.18"
 serde = { version = "1.0", features = ["derive"] }
 serde_json.workspace = true
+tokio = { version = "1", features = ["rt"] }
 toml = "0.9"

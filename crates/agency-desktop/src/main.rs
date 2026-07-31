@@ -40,6 +40,7 @@ use agency_rpc::{
     ENV_CONVERSATION_ID, ENV_MCP_COMMAND, ENV_RPC_SOCKET, ENV_SESSION_TOKEN,
     Response as RpcResponse, Server as RpcServer, SessionCapabilities, SessionContext,
 };
+use agency_translator_api::commands::AgentCommand;
 use agency_translator_api::{
     ClientId, ContentBlock, Conversation, ConversationEvent, ConversationUpdate, EventPayload,
     MessageRole, tools,
@@ -54,8 +55,9 @@ use plugins::{PluginInstallEntry, PluginInstallEvent, PluginInstalls, Transcript
 use sessions::{SessionRegistry, name_from_prompt, new_conversation_id};
 use slash_commands::{
     ComposerState, INIT_AGENT_PROMPT, SlashCommand, SlashCommandCompletion, SlashCompletionState,
-    TabCompletion, completion_count, initialize_workspace, load_codex_mcp, parse_slash_command,
-    slash_command_catalog, slash_command_completions, tab_completion,
+    TabCompletion, agency_commands, completion_count, discover_agent_commands,
+    initialize_workspace, load_codex_mcp, merge_catalog, parse_slash_command,
+    slash_command_completions, tab_completion,
 };
 use terminal::TerminalSession;
 use worktrees::Worktree;
@@ -551,7 +553,7 @@ fn run_desktop() -> iced::Result {
         _ => window::Position::Default,
     };
 
-    iced::application(Agency::default, Agency::update, Agency::view)
+    iced::application(Agency::boot, Agency::update, Agency::view)
         .title("Agency")
         .theme(Agency::theme)
         .subscription(Agency::subscription)
@@ -863,6 +865,11 @@ enum AppEvent {
     /// The composer's prompt text changed. Published *after* the change lands so
     /// every prompt-derived affordance re-reads the text as it stands now.
     ComposerPromptChanged,
+    /// Ask the configured agents what they can run here. Published at startup,
+    /// on worktree switch, and after an install changes what is on disk.
+    SlashCatalogRequested,
+    SlashCatalogLoaded(Vec<(Provider, AgentCommand)>),
+    SlashCatalogFailed(String),
     PluginInstallRequested {
         conversation_id: String,
         source: String,
@@ -892,8 +899,13 @@ enum AppEvent {
     SelectAgent(Provider),
 }
 
-impl Default for Agency {
-    fn default() -> Self {
+impl Agency {
+    /// Shared by `Default` and the test-only constructor below. `spawn_agent_and_rpc`
+    /// gates the two effects a unit test must never trigger: binding the RPC unix
+    /// socket and spawning a real `codex`/`claude` child process. Everything else
+    /// (config load, worktree discovery, session registry) is read-only and safe
+    /// to run in either path.
+    fn build(spawn_agent_and_rpc: bool) -> Self {
         let (config, notice) = match GlobalConfig::load() {
             Ok(config) => (config, None),
             Err(error) => (GlobalConfig::default(), Some(error)),
@@ -930,10 +942,14 @@ impl Default for Agency {
             Err(error) => (SessionRegistry::empty(&cwd), Some(error)),
         };
         let rpc_capabilities = SessionCapabilities::default();
-        let slash_command_catalog = slash_command_catalog(&cwd);
-        let (rpc_server, rpc_notice) = match RpcServer::start(rpc_capabilities.clone()) {
-            Ok(server) => (Some(server), None),
-            Err(error) => (None, Some(error)),
+        let slash_command_catalog = agency_commands();
+        let (rpc_server, rpc_notice) = if spawn_agent_and_rpc {
+            match RpcServer::start(rpc_capabilities.clone()) {
+                Ok(server) => (Some(server), None),
+                Err(error) => (None, Some(error)),
+            }
+        } else {
+            (None, None)
         };
 
         let mut agency = Self {
@@ -973,7 +989,9 @@ impl Default for Agency {
             plugin_installs: PluginInstalls::default(),
         };
         let startup_notice = agency.notice.take();
-        agency.start_agent(default_agent);
+        if spawn_agent_and_rpc {
+            agency.start_agent(default_agent);
+        }
         if agency.notice.is_none() {
             agency.notice = startup_notice;
         }
@@ -981,7 +999,44 @@ impl Default for Agency {
     }
 }
 
+impl Default for Agency {
+    fn default() -> Self {
+        Self::build(true)
+    }
+}
+
+#[cfg(test)]
 impl Agency {
+    /// `Default` binds a real RPC socket and spawns a real agent process, which a
+    /// unit test must never do: nothing frees either when the test ends, so a
+    /// full suite run leaks a child process per test, and parallel tests race
+    /// over the same pid-derived socket path. Reducer tests that only care about
+    /// state transitions use this instead.
+    fn for_testing() -> Self {
+        Self::build(false)
+    }
+
+    /// Reducer tests call `reduce_event` directly rather than `update`, so
+    /// nothing else drains the bus for them. This gives a test the same view
+    /// `update`'s loop would have had, without processing the follow-up events
+    /// (which would blur "did this handler publish X" into "what did X do").
+    fn drain_events(&mut self) -> Vec<AppEvent> {
+        let mut events = Vec::new();
+        while let Some(envelope) = self.event_bus.next() {
+            events.push(envelope.event);
+        }
+        events
+    }
+}
+
+impl Agency {
+    /// iced's boot hook. The catalog starts with Agency's own commands and the
+    /// agent half is requested immediately, so the composer is usable while
+    /// the first index runs.
+    fn boot() -> (Self, Task<AppEvent>) {
+        (Self::default(), Task::done(AppEvent::SlashCatalogRequested))
+    }
+
     fn activate_focused_context(&mut self) {
         self.keybindings
             .activate_context(self.interaction.focus.context());
@@ -1181,6 +1236,10 @@ impl Agency {
                     .filter(|agent| agent.path.is_some())
                     .map(|agent| agent.provider)
                     .collect();
+                // A newly detected agent has its own slash commands, and a
+                // newly missing one should drop its rows; either way the
+                // catalog built from the old agent list is stale.
+                self.emit(AppEvent::SlashCatalogRequested);
             }
             AppEvent::SetDefaultAgent(provider) => {
                 let configured = match provider {
@@ -1268,6 +1327,34 @@ impl Agency {
                     None => {}
                 }
             }
+            AppEvent::SlashCatalogRequested => {
+                let workspace = self.cwd.clone();
+                let providers = self.configured_agents.clone();
+                return Task::perform(
+                    async move {
+                        // Discovery reads hundreds of directories under the
+                        // plugin caches. Running it on the async runtime would
+                        // stall every other effect for as long as it takes.
+                        tokio::task::spawn_blocking(move || {
+                            discover_agent_commands(&providers, &workspace)
+                        })
+                        .await
+                        .map_err(|error| format!("Could not index agent commands: {error}"))
+                    },
+                    |result| match result {
+                        Ok(commands) => AppEvent::SlashCatalogLoaded(commands),
+                        Err(error) => AppEvent::SlashCatalogFailed(error),
+                    },
+                );
+            }
+            AppEvent::SlashCatalogLoaded(commands) => {
+                self.slash_command_catalog = merge_catalog(commands);
+            }
+            AppEvent::SlashCatalogFailed(error) => {
+                // A stale catalog is more useful than an empty one, so the
+                // previous entries stay.
+                self.notice = Some(error);
+            }
             AppEvent::PluginInstallRequested {
                 conversation_id,
                 source,
@@ -1319,6 +1406,9 @@ impl Agency {
                             status.label().to_lowercase()
                         ),
                     });
+                    // An install changes what is on disk, so the catalog it
+                    // was built from is now stale.
+                    self.emit(AppEvent::SlashCatalogRequested);
                 }
                 let conversation_id = event.conversation_id().to_owned();
                 let changed = self
@@ -1948,7 +2038,7 @@ impl Agency {
                 );
                 return;
             }
-            if agent.session.provider() != provider {
+            if command_needs_agent_switch(agent.session.provider(), provider) {
                 self.start_agent(provider);
                 if !self
                     .active_agent()
@@ -2091,6 +2181,13 @@ impl Agency {
             return Err(format!("MCP server {name:?} is already connected"));
         }
         let server = load_codex_mcp(name)?;
+        self.connect_mcp_server(name, server)
+    }
+
+    /// Everything after Codex has confirmed the server exists, split out from
+    /// `add_mcp_server` so a test can exercise the reconnect-and-refresh
+    /// behavior without shelling out to a real `codex` binary.
+    fn connect_mcp_server(&mut self, name: &str, server: McpServer) -> Result<(), String> {
         if !server.enabled {
             return Err(format!("MCP server {name:?} is disabled in Codex"));
         }
@@ -2145,6 +2242,7 @@ impl Agency {
             agent.mcp_status = McpStatus::Waiting;
         }
         self.mcp_servers = servers;
+        self.emit(AppEvent::SlashCatalogRequested);
         self.notice = Some(format!(
             "Added MCP server {name:?} to {} connected agent{}",
             self.agents.len(),
@@ -2291,7 +2389,8 @@ impl Agency {
 
         self.active_worktree = index;
         self.cwd = cwd;
-        self.slash_command_catalog = slash_command_catalog(&self.cwd);
+        self.slash_command_catalog = agency_commands();
+        self.emit(AppEvent::SlashCatalogRequested);
         self.overlays.slash.close();
         self.sessions = sessions;
         for agent in &self.agents {
@@ -5474,6 +5573,17 @@ fn collect_explorer_entries(
     }
 }
 
+/// Whether an accepted agent command has to be sent somewhere other than the
+/// agent the composer is pointed at.
+///
+/// The catalog lists every configured agent's commands in one list, so picking
+/// a Claude Code skill while Codex is focused is ordinary. Sending it where it
+/// was typed would hand Codex a command it has never heard of, so the submit
+/// path routes it to the agent that owns it instead.
+fn command_needs_agent_switch(active: Provider, command: Provider) -> bool {
+    active != command
+}
+
 fn window_geometry(id: window::Id, close_after: bool) -> Task<AppEvent> {
     window::size(id).then(move |size| {
         window::position(id).then(move |position| {
@@ -6405,6 +6515,7 @@ fn fenced_command(command: &str, language: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use agency_translator_api::commands::AgentCommand;
 
     #[test]
     fn event_bus_preserves_publish_order_for_follow_up_events() {
@@ -6998,5 +7109,284 @@ mod tests {
             agency_mcp_server_state([McpStatus::Connected, McpStatus::Disconnected]),
             McpServerState::Error
         );
+    }
+
+    fn agent_command(name: &str) -> AgentCommand {
+        AgentCommand {
+            name: name.to_owned(),
+            description: "Does a thing".to_owned(),
+            invocation: format!("/{name} "),
+            argument_hint: None,
+            origin: agency_translator_api::commands::CommandOrigin::Personal,
+        }
+    }
+
+    /// A command belonging to another agent has to be routed there rather than
+    /// sent where it was typed.
+    #[test]
+    fn a_command_from_another_agent_needs_a_switch() {
+        assert!(command_needs_agent_switch(
+            Provider::Codex,
+            Provider::Claude
+        ));
+        assert!(command_needs_agent_switch(
+            Provider::Claude,
+            Provider::Codex
+        ));
+        assert!(!command_needs_agent_switch(
+            Provider::Claude,
+            Provider::Claude
+        ));
+        assert!(!command_needs_agent_switch(
+            Provider::Codex,
+            Provider::Codex
+        ));
+    }
+
+    /// The routing decision is only as good as the provider the catalog stamps
+    /// on each row, so this pins the two together: a Claude entry picked while
+    /// Codex is focused must route away, and Agency's own commands must carry no
+    /// provider at all so they never reach the switch.
+    #[test]
+    fn the_catalog_stamps_the_provider_that_routing_depends_on() {
+        let catalog = slash_commands::merge_catalog(vec![
+            (Provider::Claude, agent_command("superpowers:brainstorming")),
+            (Provider::Codex, agent_command("review")),
+        ]);
+
+        let brainstorming = catalog
+            .iter()
+            .find(|completion| completion.command == "/superpowers:brainstorming")
+            .expect("the Claude entry should be listed");
+        let owner = brainstorming
+            .provider
+            .expect("an agent command must name its owner or it cannot be routed");
+        assert_eq!(owner, Provider::Claude);
+        assert!(command_needs_agent_switch(Provider::Codex, owner));
+        assert!(!command_needs_agent_switch(Provider::Claude, owner));
+
+        // Agency handles its own commands, so there is nobody to switch to.
+        let init = catalog
+            .iter()
+            .find(|completion| completion.command == "/init")
+            .expect("Agency's own commands are always listed");
+        assert_eq!(init.provider, None);
+    }
+
+    // `slash_commands::tests::agency_commands_are_always_offered` and
+    // `a_translator_command_keeps_its_invocation_and_origin` already cover
+    // `merge_catalog`'s pure behavior (agency commands always present, agent
+    // commands take their own invocation). The reducer tests below instead
+    // pin how `Agency` *uses* that function: that loading is a replace, not
+    // an accumulate, and that failure leaves the prior state alone.
+
+    #[test]
+    fn a_second_loaded_catalog_replaces_the_first_rather_than_accumulating() {
+        let mut agency = Agency::for_testing();
+
+        let _ = agency.reduce_event(AppEvent::SlashCatalogLoaded(vec![(
+            Provider::Claude,
+            agent_command("deploy"),
+        )]));
+        let _ = agency.reduce_event(AppEvent::SlashCatalogLoaded(vec![(
+            Provider::Claude,
+            agent_command("audit"),
+        )]));
+
+        assert!(
+            agency
+                .slash_command_catalog
+                .iter()
+                .any(|completion| completion.command == "/audit")
+        );
+        assert!(
+            !agency
+                .slash_command_catalog
+                .iter()
+                .any(|completion| completion.command == "/deploy")
+        );
+    }
+
+    #[test]
+    fn a_failed_load_leaves_the_previous_catalog_in_place() {
+        let mut agency = Agency::for_testing();
+        let loaded =
+            slash_commands::merge_catalog(vec![(Provider::Claude, agent_command("deploy"))]);
+        agency.slash_command_catalog = loaded;
+        let before = agency.slash_command_catalog.clone();
+
+        let _ = agency.reduce_event(AppEvent::SlashCatalogFailed("disk on fire".to_owned()));
+
+        assert_eq!(agency.slash_command_catalog, before);
+        assert_eq!(agency.notice.as_deref(), Some("disk on fire"));
+    }
+
+    #[test]
+    fn a_loaded_catalog_is_stored_and_leaves_any_existing_notice_untouched() {
+        let mut agency = Agency::for_testing();
+        agency.notice = Some("unrelated notice".to_owned());
+
+        let _ = agency.reduce_event(AppEvent::SlashCatalogLoaded(vec![(
+            Provider::Claude,
+            agent_command("deploy"),
+        )]));
+
+        assert!(
+            agency
+                .slash_command_catalog
+                .iter()
+                .any(|completion| completion.command == "/deploy")
+        );
+        // Unlike SlashCatalogFailed, a successful load has no notice of its
+        // own to report, and must not clobber one set by something else.
+        assert_eq!(agency.notice.as_deref(), Some("unrelated notice"));
+    }
+
+    #[test]
+    fn a_loaded_or_failed_catalog_publishes_no_follow_up_events() {
+        // Both handlers only assign a field; if either started publishing
+        // events, a loaded/failed catalog could re-trigger its own reload.
+        let mut agency = Agency::for_testing();
+
+        let _ = agency.reduce_event(AppEvent::SlashCatalogLoaded(Vec::new()));
+        assert!(agency.drain_events().is_empty());
+
+        let _ = agency.reduce_event(AppEvent::SlashCatalogFailed("disk on fire".to_owned()));
+        assert!(agency.drain_events().is_empty());
+    }
+
+    #[test]
+    fn switching_worktrees_reseeds_agency_commands_and_requests_a_reload() {
+        let mut agency = Agency::for_testing();
+        agency.slash_command_catalog =
+            slash_commands::merge_catalog(vec![(Provider::Claude, agent_command("deploy"))]);
+
+        let other_root =
+            std::env::temp_dir().join(format!("agency-worktree-switch-{}", std::process::id()));
+        std::fs::create_dir_all(&other_root).unwrap();
+        agency.worktrees.push(Worktree {
+            label: "other".to_owned(),
+            path: other_root.clone(),
+            branch: None,
+        });
+        let other_index = agency.worktrees.len() - 1;
+        assert_ne!(other_index, agency.active_worktree);
+
+        let _ = agency.reduce_event(AppEvent::SelectWorktree(other_index));
+
+        // The agent half is stale the instant cwd changes, so the catalog
+        // drops back to what's always available while the reload is pending.
+        assert_eq!(
+            agency.slash_command_catalog,
+            slash_commands::agency_commands()
+        );
+        assert!(
+            agency
+                .drain_events()
+                .iter()
+                .any(|event| matches!(event, AppEvent::SlashCatalogRequested))
+        );
+
+        std::fs::remove_dir_all(&other_root).unwrap();
+    }
+
+    #[test]
+    fn a_finished_plugin_install_requests_a_reload_but_other_plugin_events_do_not() {
+        let mut agency = Agency::for_testing();
+        let finished = PluginInstallEvent::Finished {
+            id: 1,
+            conversation_id: "conversation".to_owned(),
+            provider: Provider::Claude,
+            kind: plugins::InstallKind::Plugin,
+            status: plugins::InstallStatus::Installed,
+            detail: None,
+        };
+
+        let _ = agency.reduce_event(AppEvent::PluginInstall(finished));
+
+        assert!(
+            agency
+                .drain_events()
+                .iter()
+                .any(|event| matches!(event, AppEvent::SlashCatalogRequested))
+        );
+
+        // Output streams one event per chunk of terminal text; re-indexing on
+        // every chunk would make every plugin install feel like it stalls.
+        let output = PluginInstallEvent::Output {
+            id: 1,
+            conversation_id: "conversation".to_owned(),
+            provider: Provider::Claude,
+            output: "installing...".to_owned(),
+        };
+
+        let _ = agency.reduce_event(AppEvent::PluginInstall(output));
+
+        assert!(
+            !agency
+                .drain_events()
+                .iter()
+                .any(|event| matches!(event, AppEvent::SlashCatalogRequested))
+        );
+    }
+
+    #[test]
+    fn connecting_an_mcp_server_requests_a_reload() {
+        // `add_mcp_server` itself shells out to a real `codex` binary to look
+        // the server up; `connect_mcp_server` is everything after that lookup
+        // succeeds, which is what actually wires the reload trigger in.
+        let mut agency = Agency::for_testing();
+        let server = McpServer {
+            name: "example".to_owned(),
+            enabled: true,
+            transport: McpTransport::Stdio {
+                command: "example-mcp".to_owned(),
+                args: Vec::new(),
+                env: None,
+                cwd: None,
+            },
+        };
+
+        agency.connect_mcp_server("example", server).unwrap();
+
+        assert!(
+            agency
+                .drain_events()
+                .iter()
+                .any(|event| matches!(event, AppEvent::SlashCatalogRequested))
+        );
+    }
+
+    #[test]
+    fn refreshing_agents_requests_a_reload() {
+        // A user who installs an agent after Agency starts and hits refresh
+        // gets an updated agent list; without this trigger the slash catalog
+        // would stay Agency-only until a worktree switch or restart.
+        let mut agency = Agency::for_testing();
+
+        let _ = agency.reduce_event(AppEvent::RefreshAgents);
+
+        assert!(
+            agency
+                .drain_events()
+                .iter()
+                .any(|event| matches!(event, AppEvent::SlashCatalogRequested))
+        );
+    }
+
+    /// `SlashCatalogRequested`'s handler must actually return the
+    /// `Task::perform(...)` that runs discovery, not `Task::none()` — a
+    /// deleted `return` would leave every other test in this file green.
+    /// `Task` does not expose its inner state for a direct equality check,
+    /// but `units()` distinguishes "does nothing" (`Task::none()`, 0 units)
+    /// from a real unit of work, which is exactly the distinction that
+    /// matters here.
+    #[test]
+    fn slash_catalog_requested_returns_a_real_task_rather_than_none() {
+        let mut agency = Agency::for_testing();
+
+        let task = agency.reduce_event(AppEvent::SlashCatalogRequested);
+
+        assert!(task.units() > 0);
     }
 }
