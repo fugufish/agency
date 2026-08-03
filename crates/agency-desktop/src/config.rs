@@ -275,6 +275,31 @@ pub fn workspace_config_directory(workspace: &Path) -> PathBuf {
     workspace.join(WORKSPACE_CONFIG_DIRECTORY)
 }
 
+/// Everything Agency stores per worktree lives under this directory.
+pub fn worktrees_directory(primary: &Path) -> PathBuf {
+    workspace_config_directory(primary).join("worktrees")
+}
+
+/// A branch name is not a directory name. Percent-encoding everything outside
+/// the portable set keeps `feature/tabs` one component deep and round-trips
+/// unambiguously, which matters because the encoded name is how a checkout and
+/// its session history find each other.
+pub fn path_component(value: &str) -> String {
+    let mut encoded = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.') {
+            encoded.push(byte as char);
+        } else {
+            encoded.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    if encoded.is_empty() {
+        "_".to_owned()
+    } else {
+        encoded
+    }
+}
+
 fn parse_hex_color(value: &str) -> Option<Color> {
     let hex = value.trim().strip_prefix('#').unwrap_or(value.trim());
     if hex.len() != 6 {
@@ -290,7 +315,8 @@ fn parse_hex_color(value: &str) -> Option<Color> {
 #[cfg(test)]
 mod tests {
     use super::{
-        DefaultAgent, GlobalConfig, WindowState, parse_hex_color, workspace_config_directory,
+        DefaultAgent, GlobalConfig, WindowState, parse_hex_color, path_component,
+        workspace_config_directory, worktrees_directory,
     };
     use std::path::Path;
 
@@ -389,5 +415,21 @@ mod tests {
     fn rejects_invalid_colors() {
         assert_eq!(parse_hex_color("#fff"), None);
         assert_eq!(parse_hex_color("not-a-color"), None);
+    }
+
+    #[test]
+    fn path_components_encode_anything_a_directory_name_cannot_hold() {
+        assert_eq!(path_component("feature"), "feature");
+        assert_eq!(path_component("feature/tabs"), "feature%2Ftabs");
+        assert_eq!(path_component("fix.v2_final-1"), "fix.v2_final-1");
+        assert_eq!(path_component(""), "_");
+    }
+
+    #[test]
+    fn worktrees_live_under_the_primary_dot_agency_directory() {
+        assert_eq!(
+            worktrees_directory(Path::new("/work/project")),
+            Path::new("/work/project/.agency/worktrees")
+        );
     }
 }

@@ -862,6 +862,17 @@ enum AppEvent {
     ToggleActivity(SidebarTool),
     ToggleExplorerEntry(usize),
     SelectWorktree(usize),
+    /// The tab strip as git reports it. Published at startup and after any
+    /// change to the worktree set, so all three paths land in one reducer.
+    WorktreesDiscovered {
+        worktrees: Vec<Worktree>,
+    },
+    WorktreeCreated {
+        worktree: Worktree,
+    },
+    WorktreeRemoved {
+        worktree: Worktree,
+    },
     StartAgent(Provider),
     ResumeSession(usize),
     RequestSessionTrash(usize),
@@ -945,6 +956,11 @@ impl Agency {
             .position(|worktree| worktree.path == cwd)
             .unwrap_or(0);
         let cwd = worktrees[active_worktree].path.clone();
+        // Keyed to the whole list, never to `cwd`: the legacy layout lived under
+        // the primary, so a launch from a linked worktree must still migrate the
+        // primary's history rather than search the worktree it started in.
+        sessions::migrate_legacy_sessions(&worktrees);
+        let _ = worktrees::ensure_agency_ignored(&cwd);
         let (sessions, session_notice) = match SessionRegistry::load(&cwd) {
             Ok(sessions) => (sessions, None),
             Err(error) => (SessionRegistry::empty(&cwd), Some(error)),
@@ -997,6 +1013,10 @@ impl Agency {
             plugin_installs: PluginInstalls::default(),
         };
         let startup_notice = agency.notice.take();
+        let discovered = agency.worktrees.clone();
+        agency.emit(AppEvent::WorktreesDiscovered {
+            worktrees: discovered,
+        });
         if spawn_agent_and_rpc {
             agency.start_agent(default_agent);
         }
@@ -1278,6 +1298,9 @@ impl Agency {
             }
             AppEvent::ToggleExplorerEntry(index) => self.toggle_explorer_entry(index),
             AppEvent::SelectWorktree(index) => self.select_worktree(index),
+            AppEvent::WorktreesDiscovered { worktrees } => self.worktrees_discovered(worktrees),
+            AppEvent::WorktreeCreated { worktree } => self.worktree_created(worktree),
+            AppEvent::WorktreeRemoved { worktree } => self.worktree_removed(&worktree),
             AppEvent::StartAgent(provider) => {
                 self.selected_agent = provider;
                 self.start_agent(provider);
@@ -2408,11 +2431,69 @@ impl Agency {
         });
     }
 
+    /// Replaces `worktrees` wholesale. `worktree_removed` is the only other
+    /// writer of that field after startup, and it drops a single tab rather
+    /// than replacing the list; `select_worktree` moves `active_worktree`
+    /// alone, always in lockstep with `cwd`. This is the one writer that can
+    /// leave the two diverged, when `cwd` is absent from the incoming list. An
+    /// empty list is refused rather than rendered: git always reports at least
+    /// the primary, so an empty result means the query failed, and dropping
+    /// every tab would leave nothing to switch back to.
+    fn worktrees_discovered(&mut self, worktrees: Vec<Worktree>) {
+        if worktrees.is_empty() {
+            return;
+        }
+        self.active_worktree = worktrees
+            .iter()
+            .position(|worktree| worktree.path == self.cwd)
+            .unwrap_or(0);
+        self.worktrees = worktrees;
+    }
+
+    /// Re-discovers rather than pushing the new worktree onto the list, so the
+    /// tab strip stays exactly what git reports. A worktree created in some
+    /// other repository simply will not appear, which is the correct outcome
+    /// and needs no workspace comparison to arrange.
+    fn worktree_created(&mut self, worktree: Worktree) {
+        match worktrees::discover(&self.cwd) {
+            Ok(discovered) => {
+                self.worktrees_discovered(discovered);
+                self.notice = Some(format!("Created worktree {}", worktree.label));
+            }
+            Err(error) => self.notice = Some(error),
+        }
+    }
+
+    /// Drops the tab. If the user was looking at it, the move to the primary is
+    /// published as a follow-up event rather than called directly, so ordering
+    /// stays deterministic and `select_worktree`'s teardown — revoking RPC
+    /// capabilities, clearing agents, reloading sessions — runs exactly once.
+    fn worktree_removed(&mut self, removed: &Worktree) {
+        let was_active = self
+            .worktrees
+            .get(self.active_worktree)
+            .is_some_and(|worktree| worktree.path == removed.path);
+        self.worktrees
+            .retain(|worktree| worktree.path != removed.path);
+        if self.worktrees.is_empty() {
+            return;
+        }
+        self.active_worktree = self
+            .worktrees
+            .iter()
+            .position(|worktree| worktree.path == self.cwd)
+            .unwrap_or(0);
+        if was_active {
+            self.emit(AppEvent::SelectWorktree(0));
+        }
+        self.notice = Some(format!("Removed worktree {}", removed.label));
+    }
+
     fn select_worktree(&mut self, index: usize) {
         let Some(worktree) = self.worktrees.get(index) else {
             return;
         };
-        if index == self.active_worktree {
+        if worktree.path == self.cwd {
             return;
         }
 
@@ -2451,7 +2532,13 @@ impl Agency {
 
     fn explorer_entries(&self) -> Vec<ExplorerEntry> {
         let mut entries = Vec::new();
-        collect_explorer_entries(&self.cwd, 0, &self.explorer.expanded, &mut entries);
+        collect_explorer_entries(
+            &self.cwd,
+            &self.cwd,
+            0,
+            &self.explorer.expanded,
+            &mut entries,
+        );
         entries
     }
 
@@ -2640,29 +2727,33 @@ impl Agency {
                         .ok_or_else(|| "create_worktree requires a branch".to_owned());
                     branch.and_then(|branch| {
                         let base = call.params.get("base").and_then(serde_json::Value::as_str);
-                        let path_hint = call
-                            .params
-                            .get("path_hint")
-                            .and_then(serde_json::Value::as_str);
-                        worktrees::create(&call.context.workspace, branch, base, path_hint).map(
-                            |worktree| {
-                                let value = worktree_json(worktree);
-                                if call.context.workspace == self.cwd
-                                    && let Ok(discovered) = worktrees::discover(&self.cwd)
-                                {
-                                    self.worktrees = discovered;
-                                    self.active_worktree = self
-                                        .worktrees
-                                        .iter()
-                                        .position(|candidate| candidate.path == self.cwd)
-                                        .unwrap_or(0);
-                                }
-                                serde_json::json!({
-                                    "caller": rpc_caller(&call.context),
-                                    "worktree": value
-                                })
-                            },
-                        )
+                        worktrees::create(&call.context.workspace, branch, base).map(|worktree| {
+                            let value = worktree_json(worktree.clone());
+                            self.emit(AppEvent::WorktreeCreated { worktree });
+                            serde_json::json!({
+                                "caller": rpc_caller(&call.context),
+                                "worktree": value
+                            })
+                        })
+                    })
+                }
+                "worktree.remove" => {
+                    let branch = call
+                        .params
+                        .get("branch")
+                        .and_then(serde_json::Value::as_str)
+                        .ok_or_else(|| "remove_worktree requires a branch".to_owned());
+                    branch.and_then(|branch| {
+                        worktrees::remove(&call.context.workspace, branch).map(|worktree| {
+                            self.emit(AppEvent::WorktreeRemoved {
+                                worktree: worktree.clone(),
+                            });
+                            let value = worktree_json(worktree);
+                            serde_json::json!({
+                                "caller": rpc_caller(&call.context),
+                                "worktree": value
+                            })
+                        })
                     })
                 }
                 "mcp.status" => {
@@ -5596,7 +5687,16 @@ fn diff_count_badge(count: usize) -> Element<'static, AppEvent> {
         .into()
 }
 
+/// Walks the workspace for the file explorer.
+///
+/// `root` is threaded through the recursion so the workspace's own
+/// `.agency/worktrees` can be skipped: every worktree is a full checkout of
+/// this repository, so rendering it here would show the project inside itself
+/// and let one file be opened under two paths. Matched by resolved path rather
+/// than by name, so a `worktrees` directory that belongs to the project stays
+/// visible.
 fn collect_explorer_entries(
+    root: &std::path::Path,
     directory: &std::path::Path,
     depth: usize,
     expanded: &HashSet<PathBuf>,
@@ -5616,8 +5716,12 @@ fn collect_explorer_entries(
                 .cmp(&right.file_name().to_string_lossy().to_lowercase())
         })
     });
+    let worktrees_directory = config::worktrees_directory(root);
     for child in children {
         let path = child.path();
+        if path == worktrees_directory {
+            continue;
+        }
         let directory = child.file_type().is_ok_and(|kind| kind.is_dir());
         entries.push(ExplorerEntry {
             path: path.clone(),
@@ -5625,7 +5729,7 @@ fn collect_explorer_entries(
             directory,
         });
         if directory && expanded.contains(&path) {
-            collect_explorer_entries(&path, depth + 1, expanded, entries);
+            collect_explorer_entries(root, &path, depth + 1, expanded, entries);
         }
     }
 }
@@ -7585,12 +7689,30 @@ mod tests {
         // Both handlers only assign a field; if either started publishing
         // events, a loaded/failed catalog could re-trigger its own reload.
         let mut agency = Agency::for_testing();
+        // `build` always publishes the initial `WorktreesDiscovered`, which is
+        // unrelated to what this test checks; drain it before asserting on
+        // events raised by the handlers under test.
+        agency.drain_events();
 
         let _ = agency.reduce_event(AppEvent::SlashCatalogLoaded(Vec::new()));
         assert!(agency.drain_events().is_empty());
 
         let _ = agency.reduce_event(AppEvent::SlashCatalogFailed("disk on fire".to_owned()));
         assert!(agency.drain_events().is_empty());
+    }
+
+    /// Startup discovery goes through the same reducer as creation and
+    /// removal, so a new Agency publishes its initial worktree list rather
+    /// than only assigning it. Without this, the startup publish is
+    /// indistinguishable from dead code.
+    #[test]
+    fn a_new_agency_publishes_its_initial_worktree_discovery() {
+        let mut agency = Agency::for_testing();
+
+        assert!(matches!(
+            agency.drain_events().as_slice(),
+            [AppEvent::WorktreesDiscovered { .. }]
+        ));
     }
 
     #[test]
@@ -7626,6 +7748,208 @@ mod tests {
         );
 
         std::fs::remove_dir_all(&other_root).unwrap();
+    }
+
+    fn worktree_at(path: &std::path::Path, branch: &str) -> Worktree {
+        Worktree {
+            path: path.to_path_buf(),
+            label: branch.to_owned(),
+            branch: Some(branch.to_owned()),
+        }
+    }
+
+    /// Discovery is the single source of truth for the tab strip, so the active
+    /// tab is re-derived from cwd rather than carried across. Git reports the
+    /// primary first, which is why index 0 is the fallback.
+    #[test]
+    fn discovering_worktrees_reresolves_the_active_tab_from_cwd() {
+        let mut agency = Agency::for_testing();
+        let primary = std::path::PathBuf::from("/repo");
+        let feature = std::path::PathBuf::from("/repo/.agency/worktrees/feature");
+        agency.cwd = feature.clone();
+
+        let _ = agency.reduce_event(AppEvent::WorktreesDiscovered {
+            worktrees: vec![
+                worktree_at(&primary, "main"),
+                worktree_at(&feature, "feature"),
+            ],
+        });
+
+        assert_eq!(agency.worktrees.len(), 2);
+        assert_eq!(agency.active_worktree, 1);
+    }
+
+    #[test]
+    fn discovering_worktrees_falls_back_to_the_primary_when_cwd_is_gone() {
+        let mut agency = Agency::for_testing();
+        agency.cwd = std::path::PathBuf::from("/repo/.agency/worktrees/deleted");
+
+        let _ = agency.reduce_event(AppEvent::WorktreesDiscovered {
+            worktrees: vec![worktree_at(std::path::Path::new("/repo"), "main")],
+        });
+
+        assert_eq!(agency.active_worktree, 0);
+    }
+
+    /// An agent creating a worktree in the background must not move the user's
+    /// view. The tab appears; focus stays put.
+    ///
+    /// This one needs a real repository: the reducer re-discovers rather than
+    /// pushing the payload onto the list, so a fabricated path would never show
+    /// up in the result.
+    #[test]
+    fn a_created_worktree_appends_a_tab_without_moving_focus() {
+        let root = worktrees::tests_support::repository("created-tab");
+        let mut agency = Agency::for_testing();
+        agency.cwd = root.clone();
+        agency.worktrees = vec![worktree_at(&root, "main")];
+        agency.active_worktree = 0;
+        let created = worktrees::create(&root, "feature", None).unwrap();
+
+        let _ = agency.reduce_event(AppEvent::WorktreeCreated { worktree: created });
+
+        assert_eq!(agency.worktrees.len(), 2);
+        assert!(
+            agency
+                .worktrees
+                .iter()
+                .any(|worktree| worktree.branch.as_deref() == Some("feature"))
+        );
+        assert_eq!(agency.active_worktree, 0);
+        assert_eq!(agency.cwd, root);
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// Task 5 removes the active worktree, clamps `active_worktree`, and
+    /// publishes `SelectWorktree(0)` while `cwd` still names the deleted
+    /// checkout. An index-equality guard would early-return and strand the app
+    /// there, so the guard compares paths.
+    #[test]
+    fn selecting_the_active_index_still_switches_when_cwd_no_longer_exists() {
+        let root = worktrees::tests_support::repository("stale-cwd");
+        let mut agency = Agency::for_testing();
+        agency.worktrees = vec![worktree_at(&root, "main")];
+        agency.active_worktree = 0;
+        agency.cwd = root.join(".agency/worktrees/deleted");
+
+        let _ = agency.reduce_event(AppEvent::SelectWorktree(0));
+
+        assert_eq!(agency.cwd, root);
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn removing_an_inactive_worktree_drops_its_tab_and_keeps_focus() {
+        let mut agency = Agency::for_testing();
+        let primary = std::path::PathBuf::from("/repo");
+        agency.cwd = primary.clone();
+        agency.worktrees = vec![
+            worktree_at(&primary, "main"),
+            worktree_at(
+                std::path::Path::new("/repo/.agency/worktrees/feature"),
+                "feature",
+            ),
+        ];
+        agency.active_worktree = 0;
+        // `Agency::for_testing` leaves the startup `WorktreesDiscovered` on the
+        // bus; drain it so the assertion below reflects only this reducer.
+        let _ = agency.drain_events();
+
+        let _ = agency.reduce_event(AppEvent::WorktreeRemoved {
+            worktree: worktree_at(
+                std::path::Path::new("/repo/.agency/worktrees/feature"),
+                "feature",
+            ),
+        });
+
+        assert_eq!(agency.worktrees.len(), 1);
+        assert_eq!(agency.worktrees[0].path, primary);
+        assert_eq!(agency.active_worktree, 0);
+        assert_eq!(agency.cwd, primary);
+        assert!(agency.drain_events().is_empty());
+    }
+
+    /// Removing the worktree the user is looking at cannot fail the caller —
+    /// the tool would then succeed or fail based on which tab happens to be
+    /// focused. The app moves to the primary instead, as a follow-up event so
+    /// ordering stays deterministic rather than recursing into the handler.
+    #[test]
+    fn removing_the_active_worktree_falls_back_to_the_primary_tab() {
+        let mut agency = Agency::for_testing();
+        let primary = std::path::PathBuf::from("/repo");
+        let feature = std::path::PathBuf::from("/repo/.agency/worktrees/feature");
+        agency.cwd = feature.clone();
+        agency.worktrees = vec![
+            worktree_at(&primary, "main"),
+            worktree_at(&feature, "feature"),
+        ];
+        agency.active_worktree = 1;
+
+        let _ = agency.reduce_event(AppEvent::WorktreeRemoved {
+            worktree: worktree_at(&feature, "feature"),
+        });
+
+        assert_eq!(agency.worktrees.len(), 1);
+        assert_eq!(agency.worktrees[0].path, primary);
+        assert!(
+            agency
+                .drain_events()
+                .iter()
+                .any(|event| matches!(event, AppEvent::SelectWorktree(0))),
+            "the app must move off the worktree it just deleted"
+        );
+    }
+
+    /// `remove` trims the branch it is given, so the identifier the caller sent
+    /// and the identifier git knows can differ. The event carries the resolved
+    /// worktree for exactly that reason: a tab that survives its own removal
+    /// leaves the app pointed at a directory that no longer exists.
+    #[test]
+    fn removing_a_worktree_named_with_stray_whitespace_still_drops_its_tab() {
+        let root = worktrees::tests_support::repository("remove-whitespace");
+        let created = worktrees::create(&root, "feature", None).unwrap();
+        let removed = worktrees::remove(&root, "  feature\n").unwrap();
+        assert_eq!(removed.path, created.path);
+
+        let mut agency = Agency::for_testing();
+        let _ = agency.drain_events();
+        agency.cwd = root.clone();
+        agency.worktrees = vec![worktree_at(&root, "main"), created];
+        agency.active_worktree = 0;
+
+        let _ = agency.reduce_event(AppEvent::WorktreeRemoved { worktree: removed });
+
+        assert_eq!(agency.worktrees.len(), 1);
+        assert_eq!(agency.worktrees[0].path, root);
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// Worktree resolution must not care who is calling. `blueprint` is not a
+    /// provider Agency ships, and the caller block has to carry it through
+    /// unchanged — a `match` on provider anywhere in this path fails here
+    /// rather than at the next integration.
+    #[test]
+    fn worktree_calls_resolve_for_a_provider_agency_does_not_ship() {
+        let context = SessionContext {
+            conversation_id: "conversation-1".to_owned(),
+            workspace: std::path::PathBuf::from("/repo"),
+            provider: "blueprint".to_owned(),
+            provider_session_id: Some("blueprint-9".to_owned()),
+            generation: 3,
+        };
+
+        assert_eq!(
+            rpc_caller(&context),
+            serde_json::json!({
+                "agency_session_id": "conversation-1",
+                "provider": "blueprint",
+                "provider_session_id": "blueprint-9",
+                "generation": 3
+            })
+        );
     }
 
     #[test]
@@ -7726,5 +8050,40 @@ mod tests {
         let task = agency.reduce_event(AppEvent::SlashCatalogRequested);
 
         assert!(task.units() > 0);
+    }
+
+    /// The skip matches the resolved path, not the directory name, so a
+    /// `worktrees` directory that is part of the project stays visible.
+    #[test]
+    fn the_explorer_hides_the_worktrees_directory_but_not_others() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "agency-explorer-worktrees-{}-{unique}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(root.join(".agency").join("worktrees").join("feature")).unwrap();
+        std::fs::create_dir_all(root.join("docs").join("worktrees")).unwrap();
+        let mut expanded = HashSet::new();
+        expanded.insert(root.join(".agency"));
+        expanded.insert(root.join("docs"));
+
+        let mut entries = Vec::new();
+        collect_explorer_entries(&root, &root, 0, &expanded, &mut entries);
+        let paths = entries
+            .iter()
+            .map(|entry| entry.path.clone())
+            .collect::<Vec<_>>();
+
+        assert!(paths.contains(&root.join(".agency")));
+        assert!(
+            !paths.contains(&root.join(".agency").join("worktrees")),
+            "the worktrees directory must not appear in the primary's tree"
+        );
+        assert!(paths.contains(&root.join("docs").join("worktrees")));
+
+        std::fs::remove_dir_all(root).unwrap();
     }
 }
