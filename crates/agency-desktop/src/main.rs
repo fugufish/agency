@@ -65,6 +65,12 @@ use terminal::TerminalSession;
 use worktrees::Worktree;
 
 const AGENT_TRANSCRIPT_ID: &str = "agent-transcript";
+/// Shared by both places `submit_agent_input` rejects an image alongside a
+/// command already bound to an agent: a slash command typed and resolved
+/// against the catalog, and one accepted from the overlay or Tab-filled, so
+/// `command_provider` was already set before Enter was pressed.
+const AGENT_COMMAND_IMAGE_ATTACHMENT_NOTICE: &str =
+    "Agent slash commands and skills cannot include image attachments";
 const FOCUS_TOOLBAR: FocusId = FocusId(0);
 const FOCUS_EXPLORER: FocusId = FocusId(1);
 const FOCUS_WORKSPACE: FocusId = FocusId(2);
@@ -1287,7 +1293,7 @@ impl Agency {
             }
             AppEvent::CompleteSlashCommand(insertion, provider) => {
                 if let Some(agent) = self.active_agent_mut() {
-                    agent.prompt = insertion;
+                    agent.prompt = normalized_prompt(insertion);
                     agent.prompt_selected = false;
                     agent.prompt_cursor = agent.prompt.len();
                     agent.prompt_selection_anchor = None;
@@ -1315,7 +1321,7 @@ impl Agency {
                 ) {
                     Some(TabCompletion::Fill(prefix)) => {
                         if let Some(agent) = self.active_agent_mut() {
-                            agent.prompt = prefix;
+                            agent.prompt = normalized_prompt(prefix);
                             agent.prompt_selected = false;
                             agent.prompt_cursor = agent.prompt.len();
                             agent.prompt_selection_anchor = None;
@@ -2056,7 +2062,7 @@ impl Agency {
         // entry's own insertion, so the composer's text is not what should be
         // sent even when no switch happened.
         if let Some(agent) = self.active_agent_mut() {
-            agent.prompt = prompt;
+            agent.prompt = normalized_prompt(prompt);
             agent.prompt_cursor = agent.prompt.len();
             agent.prompt_selection_anchor = None;
             agent.command_provider = Some(provider);
@@ -2078,9 +2084,7 @@ impl Agency {
         let command_provider = agent.command_provider;
         if let Some(provider) = command_provider {
             if has_images {
-                self.notice = Some(
-                    "Agent slash commands and skills cannot include image attachments".to_owned(),
-                );
+                self.notice = Some(AGENT_COMMAND_IMAGE_ATTACHMENT_NOTICE.to_owned());
                 return;
             }
             self.route_agent_command(provider, prompt);
@@ -2104,10 +2108,7 @@ impl Agency {
             }
             Ok(Submission::Agent { provider, prompt }) => {
                 if has_images {
-                    self.notice = Some(
-                        "Agent slash commands and skills cannot include image attachments"
-                            .to_owned(),
-                    );
+                    self.notice = Some(AGENT_COMMAND_IMAGE_ATTACHMENT_NOTICE.to_owned());
                     return;
                 }
                 self.route_agent_command(provider, prompt);
@@ -5686,6 +5687,31 @@ fn clamped_prompt_cursor(text: &str, cursor: usize) -> usize {
     cursor
 }
 
+/// Inserts `text` at `cursor`, normalized, and returns the cursor position
+/// after it. Split out from `AgentView::insert_prompt_text` because the
+/// arithmetic is what breaks — a cursor computed from the pre-normalized
+/// length lands short by one per `\r` stripped — and `AgentView` owns a
+/// spawned session, so it cannot be built in a test.
+fn insert_normalized(prompt: &mut String, cursor: usize, text: &str) -> usize {
+    let text = normalize_newlines(text);
+    prompt.insert_str(cursor, &text);
+    cursor + text.len()
+}
+
+/// Normalizes `text` for a wholesale prompt replacement, without paying for a
+/// clone when there is nothing to normalize. Every other path that carries
+/// external text into the prompt goes through `insert_prompt_text`, which
+/// normalizes; the completion, tab-fill, and resolved-submission paths
+/// replace the prompt outright instead of inserting into it, so they need
+/// this to hold the same invariant against a translator that hands back a
+/// `\r`.
+fn normalized_prompt(text: String) -> String {
+    match normalize_newlines(&text) {
+        Cow::Borrowed(_) => text,
+        Cow::Owned(normalized) => normalized,
+    }
+}
+
 fn previous_char_boundary(text: &str, cursor: usize) -> usize {
     text[..cursor]
         .char_indices()
@@ -5958,11 +5984,9 @@ impl AgentView {
     }
 
     fn insert_prompt_text(&mut self, text: &str) {
-        let text = normalize_newlines(text);
         self.delete_prompt_selection();
         let cursor = clamped_prompt_cursor(&self.prompt, self.prompt_cursor);
-        self.prompt.insert_str(cursor, &text);
-        self.prompt_cursor = cursor + text.len();
+        self.prompt_cursor = insert_normalized(&mut self.prompt, cursor, text);
     }
 
     fn clear_prompt(&mut self) {
@@ -6764,6 +6788,30 @@ mod tests {
         assert_eq!(normalize_newlines("a\r\nb\rc"), "a\nb\nc");
         assert_eq!(normalize_newlines("already\nfine"), "already\nfine");
         assert_eq!(normalize_newlines("no breaks"), "no breaks");
+    }
+
+    /// The arithmetic `insert_prompt_text` depends on: a cursor computed from
+    /// the pre-normalized length would land short by one per `\r` stripped, so
+    /// after inserting `"a\r\nb\rc"` into an empty prompt the cursor must sit
+    /// at the end of the normalized `"a\nb\nc"`, not the end of the original
+    /// six-byte string.
+    #[test]
+    fn insert_normalized_normalizes_and_advances_the_cursor_past_the_inserted_text() {
+        let mut prompt = String::new();
+        let cursor = insert_normalized(&mut prompt, 0, "a\r\nb\rc");
+        assert_eq!(prompt, "a\nb\nc");
+        assert_eq!(cursor, prompt.len());
+    }
+
+    /// A midstream insertion, so the returned cursor is not trivially the
+    /// whole string's length — it has to be the insertion point plus the
+    /// normalized text's own length.
+    #[test]
+    fn insert_normalized_advances_from_a_cursor_in_the_middle_of_existing_text() {
+        let mut prompt = "before after".to_owned();
+        let cursor = insert_normalized(&mut prompt, "before".len(), " middle");
+        assert_eq!(prompt, "before middle after");
+        assert_eq!(cursor, "before middle".len());
     }
 
     #[test]

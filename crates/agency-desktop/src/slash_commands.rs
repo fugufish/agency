@@ -361,13 +361,14 @@ pub fn resolve_submission(
         return Ok(Submission::Verbatim);
     };
 
-    let arguments = prompt[token.len()..].trim_start();
-    let invocation = entry.insertion.trim_end();
-    let prompt = if arguments.is_empty() {
-        invocation.to_owned()
-    } else {
-        format!("{invocation} {arguments}")
-    };
+    // `rest` keeps whatever separated the token from what follows it —
+    // a space, a newline Shift+Enter inserted, or nothing at all — rather
+    // than a hard space synthesized here. Re-synthesizing it would eat the
+    // user's own line break: `/code-review` then Shift+Enter then
+    // "focus on the parser" must reach the agent with that newline intact,
+    // not rewritten into one line.
+    let rest = &prompt[token.len()..];
+    let prompt = format!("{}{rest}", entry.insertion.trim_end());
     Ok(Submission::Agent { provider, prompt })
 }
 
@@ -423,7 +424,7 @@ fn names(entry: &SlashCommandCompletion, token: &str) -> bool {
         .is_some_and(|segment| segment == bare)
 }
 
-pub fn parse_slash_command(input: &str) -> Result<Option<SlashCommand>, String> {
+fn parse_slash_command(input: &str) -> Result<Option<SlashCommand>, String> {
     let input = input.trim();
     if !input.starts_with('/') {
         return Ok(None);
@@ -962,6 +963,32 @@ mod tests {
             Ok(Submission::Agent {
                 provider: Provider::Claude,
                 prompt: "/superpowers:brainstorming an idea".to_owned(),
+            })
+        );
+    }
+
+    /// Shift+Enter makes a newline typable inside the composer, and this is
+    /// the shape that produces: a command token, then a line break, then more
+    /// text. Rewriting the token to the entry's own invocation must not
+    /// rewrite the user's separator along with it — a hard space synthesized
+    /// here instead of preserving `\n` would silently collapse the two lines
+    /// back into one by the time the agent saw them.
+    #[test]
+    fn a_newline_separator_survives_the_token_rewrite() {
+        let catalog = vec![provider_completion(
+            "/superpowers:brainstorming",
+            Provider::Claude,
+        )];
+
+        assert_eq!(
+            resolve_submission(
+                &catalog,
+                "/brainstorming\nfocus on the parser",
+                Some(Provider::Claude)
+            ),
+            Ok(Submission::Agent {
+                provider: Provider::Claude,
+                prompt: "/superpowers:brainstorming\nfocus on the parser".to_owned(),
             })
         );
     }
