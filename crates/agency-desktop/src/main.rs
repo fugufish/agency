@@ -57,8 +57,8 @@ use plugins::{PluginInstallEntry, PluginInstallEvent, PluginInstalls, Transcript
 use sessions::{SessionRegistry, name_from_prompt, new_conversation_id};
 use slash_commands::{
     ComposerState, INIT_AGENT_PROMPT, SlashCommand, SlashCommandCompletion, SlashCompletionState,
-    TabCompletion, agency_commands, completion_count, discover_agent_commands,
-    initialize_workspace, load_codex_mcp, merge_catalog, parse_slash_command,
+    Submission, TabCompletion, agency_commands, completion_count, discover_agent_commands,
+    initialize_workspace, load_codex_mcp, merge_catalog, resolve_submission,
     slash_command_completions, tab_completion,
 };
 use terminal::TerminalSession;
@@ -2035,6 +2035,40 @@ impl Agency {
         }
     }
 
+    /// Sends `prompt` to `provider`, switching agents first when it belongs to
+    /// the one that is not focused. An accepted completion and a resolved
+    /// submission share this, because they must route identically: the only
+    /// difference between them is how the provider was learned.
+    fn route_agent_command(&mut self, provider: Provider, prompt: String) {
+        if self
+            .active_agent()
+            .is_some_and(|agent| command_needs_agent_switch(agent.session.provider(), provider))
+        {
+            self.start_agent(provider);
+            if !self
+                .active_agent()
+                .is_some_and(|agent| agent.session.provider() == provider)
+            {
+                return;
+            }
+        }
+        // Set unconditionally: a resolved submission rewrites the token to the
+        // entry's own insertion, so the composer's text is not what should be
+        // sent even when no switch happened.
+        if let Some(agent) = self.active_agent_mut() {
+            agent.prompt = prompt;
+            agent.prompt_cursor = agent.prompt.len();
+            agent.prompt_selection_anchor = None;
+            agent.command_provider = Some(provider);
+        }
+        let submitted = self.active_agent_mut().and_then(AgentView::submit);
+        if let Some((provider, id, name)) = submitted
+            && let Err(error) = self.sessions.name_if_missing(provider, &id, name)
+        {
+            self.notice = Some(error);
+        }
+    }
+
     fn submit_agent_input(&mut self) {
         let Some(agent) = self.active_agent() else {
             return;
@@ -2049,34 +2083,17 @@ impl Agency {
                 );
                 return;
             }
-            if command_needs_agent_switch(agent.session.provider(), provider) {
-                self.start_agent(provider);
-                if !self
-                    .active_agent()
-                    .is_some_and(|agent| agent.session.provider() == provider)
-                {
-                    return;
-                }
-                if let Some(agent) = self.active_agent_mut() {
-                    agent.prompt = prompt;
-                    agent.prompt_cursor = agent.prompt.len();
-                    agent.prompt_selection_anchor = None;
-                    agent.command_provider = Some(provider);
-                }
-            }
-            let submitted = self.active_agent_mut().and_then(AgentView::submit);
-            if let Some((provider, id, name)) = submitted
-                && let Err(error) = self.sessions.name_if_missing(provider, &id, name)
-            {
-                self.notice = Some(error);
-            }
+            self.route_agent_command(provider, prompt);
             return;
         }
-        match parse_slash_command(&prompt) {
-            Ok(Some(_command)) if has_images => {
+
+        let active = self.active_agent().map(|agent| agent.session.provider());
+        match resolve_submission(&self.slash_command_catalog, &prompt, active) {
+            Err(error) => self.notice = Some(error),
+            Ok(Submission::Agency(_)) if has_images => {
                 self.notice = Some("Slash commands cannot include image attachments".to_owned());
             }
-            Ok(Some(command)) => {
+            Ok(Submission::Agency(command)) => {
                 if let Err(error) = self.run_slash_command(command) {
                     self.notice = Some(error);
                     return;
@@ -2085,7 +2102,17 @@ impl Agency {
                     agent.clear_prompt();
                 }
             }
-            Ok(None) => {
+            Ok(Submission::Agent { provider, prompt }) => {
+                if has_images {
+                    self.notice = Some(
+                        "Agent slash commands and skills cannot include image attachments"
+                            .to_owned(),
+                    );
+                    return;
+                }
+                self.route_agent_command(provider, prompt);
+            }
+            Ok(Submission::Verbatim) => {
                 let submitted = self.active_agent_mut().and_then(AgentView::submit);
                 if let Some((provider, id, name)) = submitted
                     && let Err(error) = self.sessions.name_if_missing(provider, &id, name)
@@ -2093,7 +2120,6 @@ impl Agency {
                     self.notice = Some(error);
                 }
             }
-            Err(error) => self.notice = Some(error),
         }
     }
 
@@ -7372,6 +7398,33 @@ mod tests {
             .find(|completion| completion.command == "/init")
             .expect("Agency's own commands are always listed");
         assert_eq!(init.provider, None);
+    }
+
+    /// Resolution and routing have to agree. The provider a resolved submission
+    /// names is the one `command_needs_agent_switch` is asked about, so if they
+    /// ever disagreed a command would either strand on the wrong agent or churn
+    /// between two. This also pins that the rewritten prompt is what gets sent.
+    #[test]
+    fn a_resolved_submission_names_the_agent_that_routing_will_switch_to() {
+        let catalog = slash_commands::merge_catalog(vec![(
+            Provider::Claude,
+            agent_command("superpowers:brainstorming"),
+        )]);
+
+        let resolved = slash_commands::resolve_submission(
+            &catalog,
+            "/brainstorming an idea",
+            Some(Provider::Codex),
+        )
+        .expect("a catalog command is not an Agency usage error");
+
+        let slash_commands::Submission::Agent { provider, prompt } = resolved else {
+            panic!("a catalog command must resolve to the agent that owns it");
+        };
+        assert_eq!(provider, Provider::Claude);
+        assert_eq!(prompt, "/superpowers:brainstorming an idea");
+        assert!(command_needs_agent_switch(Provider::Codex, provider));
+        assert!(!command_needs_agent_switch(Provider::Claude, provider));
     }
 
     /// The rows offered first must be exactly the ones that will not be
