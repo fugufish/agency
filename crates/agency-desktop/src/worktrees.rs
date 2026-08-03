@@ -1,3 +1,4 @@
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -60,6 +61,7 @@ pub fn create(workspace: &Path, branch: &str, base: Option<&str>) -> Result<Work
     if path.exists() {
         return Err(format!("Worktree path already exists: {}", path.display()));
     }
+    ensure_agency_ignored(&primary.path)?;
 
     let base = base
         .map(str::trim)
@@ -128,6 +130,60 @@ pub fn remove(workspace: &Path, branch: &str) -> Result<Worktree, String> {
         ));
     }
     Ok(target)
+}
+
+/// The ignore rules Agency needs in every repository it operates on.
+const AGENCY_EXCLUDE_RULES: [&str; 2] = [".agency/sessions/", ".agency/worktrees/"];
+
+/// Teaches the repository to ignore what Agency stores in it.
+///
+/// Git refuses to remove a worktree that reports untracked files, and a
+/// worktree's session history lives inside it — so without these rules, every
+/// worktree Agency creates becomes unremovable the moment it records a
+/// session, and there is deliberately no force option to escape with.
+///
+/// The rules go in `info/exclude` rather than `.gitignore`: it lives in the
+/// common directory, so one write covers the primary and every linked
+/// worktree, and it is not a tracked file, so Agency never edits something the
+/// user committed.
+pub fn ensure_agency_ignored(workspace: &Path) -> Result<(), String> {
+    let output = Command::new("git")
+        .args(["rev-parse", "--path-format=absolute", "--git-common-dir"])
+        .current_dir(workspace)
+        .output()
+        .map_err(|error| format!("Could not locate the Git directory: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "Could not locate the Git directory: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    let common = PathBuf::from(String::from_utf8_lossy(&output.stdout).trim().to_owned());
+    let exclude = common.join("info").join("exclude");
+    let existing = fs::read_to_string(&exclude).unwrap_or_default();
+    let missing = AGENCY_EXCLUDE_RULES
+        .iter()
+        .filter(|rule| !existing.lines().any(|line| line.trim() == **rule))
+        .copied()
+        .collect::<Vec<_>>();
+    if missing.is_empty() {
+        return Ok(());
+    }
+
+    let mut updated = existing;
+    if !updated.is_empty() && !updated.ends_with('\n') {
+        updated.push('\n');
+    }
+    for rule in missing {
+        updated.push_str(rule);
+        updated.push('\n');
+    }
+    if let Some(parent) = exclude.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|error| format!("Could not create {}: {error}", parent.display()))?;
+    }
+    fs::write(&exclude, updated)
+        .map_err(|error| format!("Could not write {}: {error}", exclude.display()))
 }
 
 fn parse_porcelain(output: &str) -> Vec<Worktree> {
@@ -214,6 +270,29 @@ pub mod tests_support {
             ".agency/sessions/\n.agency/worktrees/**\n",
         )
         .unwrap();
+        git(&root, &["add", "-A"]);
+        git(&root, &["commit", "-qm", "init"]);
+        root
+    }
+
+    /// A repository with no ignore rules at all — the state a user's project
+    /// is in before Agency touches it. The rule-bearing `repository` fixture
+    /// cannot catch a missing product-side guarantee, because it supplies the
+    /// guarantee itself.
+    pub fn repository_without_ignore_rules(name: &str) -> PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "agency-worktree-{name}-{}-{unique}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        git(&root, &["init", "-q", "--initial-branch", "main"]);
+        git(&root, &["config", "user.email", "test@example.com"]);
+        git(&root, &["config", "user.name", "Agency Test"]);
+        std::fs::write(root.join("README.md"), "test\n").unwrap();
         git(&root, &["add", "-A"]);
         git(&root, &["commit", "-qm", "init"]);
         root
@@ -439,6 +518,89 @@ mod tests {
 
         assert_eq!(removed.path, worktree.path);
         assert!(!worktree.path.exists());
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    use super::tests_support::repository_without_ignore_rules;
+
+    /// The bug this task fixes. A user's repository does not ignore
+    /// `.agency/`, so the session history Agency writes inside a worktree
+    /// reads as untracked, and `git worktree remove` refuses it — forever,
+    /// since there is no force option. Agency has to supply the rule itself.
+    #[test]
+    fn a_worktree_stays_removable_in_a_repository_with_no_ignore_rules() {
+        let root = repository_without_ignore_rules("no-ignore-rules");
+        let worktree = create(&root, "feature", None).unwrap();
+        let sessions = worktree.path.join(".agency").join("sessions").join("one");
+        std::fs::create_dir_all(&sessions).unwrap();
+        std::fs::write(
+            sessions.join("session.json"),
+            r#"{"conversation_id":"one"}"#,
+        )
+        .unwrap();
+
+        let removed = remove(&root, "feature").unwrap();
+
+        assert_eq!(removed.path, worktree.path);
+        assert!(!worktree.path.exists());
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn ignore_rules_are_written_once_and_survive_existing_content() {
+        let root = repository_without_ignore_rules("exclude-idempotent");
+        let exclude = root.join(".git").join("info").join("exclude");
+        std::fs::create_dir_all(exclude.parent().unwrap()).unwrap();
+        std::fs::write(&exclude, "# a user's own rule\nbuild/\n").unwrap();
+
+        ensure_agency_ignored(&root).unwrap();
+        let after_first = std::fs::read_to_string(&exclude).unwrap();
+        ensure_agency_ignored(&root).unwrap();
+        let after_second = std::fs::read_to_string(&exclude).unwrap();
+
+        assert_eq!(after_first, after_second, "the writer must be idempotent");
+        assert!(
+            after_first.contains("build/"),
+            "existing rules must survive"
+        );
+        assert_eq!(
+            after_first
+                .lines()
+                .filter(|line| line.trim() == ".agency/sessions/")
+                .count(),
+            1
+        );
+        assert!(
+            after_first
+                .lines()
+                .any(|line| line.trim() == ".agency/worktrees/")
+        );
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// One write has to cover every worktree, which is why the rule goes in
+    /// the common directory rather than in each checkout.
+    #[test]
+    fn ignore_rules_apply_inside_a_linked_worktree() {
+        let root = repository_without_ignore_rules("exclude-linked");
+        let worktree = create(&root, "feature", None).unwrap();
+        let sessions = worktree.path.join(".agency").join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        std::fs::write(sessions.join("session.json"), "{}").unwrap();
+
+        let output = Command::new("git")
+            .args(["status", "--porcelain"])
+            .current_dir(&worktree.path)
+            .output()
+            .unwrap();
+
+        assert!(
+            String::from_utf8_lossy(&output.stdout).trim().is_empty(),
+            "session data must not read as untracked inside the worktree"
+        );
 
         std::fs::remove_dir_all(root).unwrap();
     }

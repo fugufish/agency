@@ -957,6 +957,7 @@ impl Agency {
             .unwrap_or(0);
         let cwd = worktrees[active_worktree].path.clone();
         sessions::migrate_legacy_root_sessions(&cwd);
+        let _ = worktrees::ensure_agency_ignored(&cwd);
         let (sessions, session_notice) = match SessionRegistry::load(&cwd) {
             Ok(sessions) => (sessions, None),
             Err(error) => (SessionRegistry::empty(&cwd), Some(error)),
