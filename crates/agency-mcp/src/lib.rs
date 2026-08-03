@@ -94,10 +94,6 @@ fn tools() -> Value {
                     "base": {
                         "type": "string",
                         "description": "Existing revision from which to create the branch."
-                    },
-                    "path_hint": {
-                        "type": "string",
-                        "description": "Optional directory-name hint. Agency chooses the parent directory."
                     }
                 },
                 "required": ["branch"],

@@ -275,10 +275,7 @@ pub fn workspace_config_directory(workspace: &Path) -> PathBuf {
     workspace.join(WORKSPACE_CONFIG_DIRECTORY)
 }
 
-/// Everything Agency stores per worktree lives under this directory. Gains a
-/// production caller in a later task of this series (worktree creation and
-/// the explorer's worktree filter); until then it is exercised only by tests.
-#[allow(dead_code)]
+/// Everything Agency stores per worktree lives under this directory.
 pub fn worktrees_directory(primary: &Path) -> PathBuf {
     workspace_config_directory(primary).join("worktrees")
 }

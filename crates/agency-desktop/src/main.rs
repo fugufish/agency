@@ -2641,29 +2641,23 @@ impl Agency {
                         .ok_or_else(|| "create_worktree requires a branch".to_owned());
                     branch.and_then(|branch| {
                         let base = call.params.get("base").and_then(serde_json::Value::as_str);
-                        let path_hint = call
-                            .params
-                            .get("path_hint")
-                            .and_then(serde_json::Value::as_str);
-                        worktrees::create(&call.context.workspace, branch, base, path_hint).map(
-                            |worktree| {
-                                let value = worktree_json(worktree);
-                                if call.context.workspace == self.cwd
-                                    && let Ok(discovered) = worktrees::discover(&self.cwd)
-                                {
-                                    self.worktrees = discovered;
-                                    self.active_worktree = self
-                                        .worktrees
-                                        .iter()
-                                        .position(|candidate| candidate.path == self.cwd)
-                                        .unwrap_or(0);
-                                }
-                                serde_json::json!({
-                                    "caller": rpc_caller(&call.context),
-                                    "worktree": value
-                                })
-                            },
-                        )
+                        worktrees::create(&call.context.workspace, branch, base).map(|worktree| {
+                            let value = worktree_json(worktree);
+                            if call.context.workspace == self.cwd
+                                && let Ok(discovered) = worktrees::discover(&self.cwd)
+                            {
+                                self.worktrees = discovered;
+                                self.active_worktree = self
+                                    .worktrees
+                                    .iter()
+                                    .position(|candidate| candidate.path == self.cwd)
+                                    .unwrap_or(0);
+                            }
+                            serde_json::json!({
+                                "caller": rpc_caller(&call.context),
+                                "worktree": value
+                            })
+                        })
                     })
                 }
                 "mcp.status" => {
