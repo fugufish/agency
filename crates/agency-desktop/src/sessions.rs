@@ -324,6 +324,28 @@ pub fn worktree_sessions_directory(workspace: &Path) -> PathBuf {
     workspace_config_directory(workspace).join("sessions")
 }
 
+/// Sessions used to live under the primary worktree keyed by branch, with
+/// `root` for the primary itself. Moves that one directory into place beside
+/// the primary. Silent on failure: a launch that cannot move history is still
+/// a launch that should start.
+pub fn migrate_legacy_root_sessions(workspace: &Path) {
+    let config = workspace_config_directory(workspace);
+    let legacy_root = config.join("worktrees").join("root");
+    let legacy = legacy_root.join("sessions");
+    let current = worktree_sessions_directory(workspace);
+    if !legacy.is_dir() || current.exists() {
+        return;
+    }
+    if let Some(parent) = current.parent()
+        && fs::create_dir_all(parent).is_err()
+    {
+        return;
+    }
+    if fs::rename(&legacy, &current).is_ok() {
+        let _ = fs::remove_dir(&legacy_root);
+    }
+}
+
 pub fn new_conversation_id() -> String {
     let timestamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -503,5 +525,91 @@ mod tests {
             worktree_sessions_directory(Path::new("/work/project/.agency/worktrees/feature")),
             Path::new("/work/project/.agency/worktrees/feature/.agency/sessions")
         );
+    }
+
+    /// Sessions used to be keyed by branch under the primary, with the literal
+    /// `root` standing in for the primary itself. That directory is the only
+    /// one this migration can claim: every other key belonged to a worktree
+    /// whose history now lives inside the worktree.
+    #[test]
+    fn legacy_root_sessions_move_beside_the_primary_worktree() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let workspace = std::env::temp_dir().join(format!(
+            "agency-session-root-migration-{}-{unique}",
+            std::process::id()
+        ));
+        let legacy = workspace_config_directory(&workspace)
+            .join("worktrees")
+            .join("root")
+            .join("sessions")
+            .join("conversation-1");
+        std::fs::create_dir_all(&legacy).unwrap();
+        std::fs::write(
+            legacy.join(SESSION_CONFIG_FILE),
+            r#"{"conversation_id":"conversation-1","codex_id":"codex-1"}"#,
+        )
+        .unwrap();
+
+        migrate_legacy_root_sessions(&workspace);
+
+        let registry = SessionRegistry::load(&workspace).unwrap();
+        assert_eq!(registry.records().len(), 1);
+        assert_eq!(
+            registry.records()[0].binding(Provider::Codex),
+            Some("codex-1")
+        );
+        assert!(
+            !workspace_config_directory(&workspace)
+                .join("worktrees")
+                .join("root")
+                .exists()
+        );
+
+        std::fs::remove_dir_all(workspace).unwrap();
+    }
+
+    /// A second launch must not clobber history written since the first.
+    #[test]
+    fn the_root_session_migration_does_not_overwrite_current_history() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let workspace = std::env::temp_dir().join(format!(
+            "agency-session-root-noop-{}-{unique}",
+            std::process::id()
+        ));
+        let legacy = workspace_config_directory(&workspace)
+            .join("worktrees")
+            .join("root")
+            .join("sessions")
+            .join("conversation-old");
+        std::fs::create_dir_all(&legacy).unwrap();
+        std::fs::write(
+            legacy.join(SESSION_CONFIG_FILE),
+            r#"{"conversation_id":"conversation-old","codex_id":"codex-old"}"#,
+        )
+        .unwrap();
+        let current = worktree_sessions_directory(&workspace).join("conversation-new");
+        std::fs::create_dir_all(&current).unwrap();
+        std::fs::write(
+            current.join(SESSION_CONFIG_FILE),
+            r#"{"conversation_id":"conversation-new","codex_id":"codex-new"}"#,
+        )
+        .unwrap();
+
+        migrate_legacy_root_sessions(&workspace);
+
+        let registry = SessionRegistry::load(&workspace).unwrap();
+        assert_eq!(registry.records().len(), 1);
+        assert_eq!(
+            registry.records()[0].binding(Provider::Codex),
+            Some("codex-new")
+        );
+
+        std::fs::remove_dir_all(workspace).unwrap();
     }
 }
