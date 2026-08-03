@@ -423,9 +423,13 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
-    /// An agent inside a worktree may remove it. Running git from the primary
-    /// rather than from the caller's workspace means the command is not
-    /// executing inside the directory it is deleting.
+    /// An agent inside a worktree may remove it: calling `remove` with
+    /// `workspace` equal to the worktree being removed must still resolve and
+    /// succeed via `discover`. This does not exercise the `current_dir`
+    /// choice in the implementation — on Linux, `git worktree remove` can run
+    /// from inside the directory it is deleting, since POSIX permits
+    /// unlinking a process's own cwd. `current_dir(&primary.path)` is kept
+    /// for platforms that do not allow that.
     #[test]
     fn removes_a_worktree_from_inside_that_worktree() {
         let root = repository("remove-self");

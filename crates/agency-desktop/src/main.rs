@@ -871,7 +871,7 @@ enum AppEvent {
         worktree: Worktree,
     },
     WorktreeRemoved {
-        branch: String,
+        worktree: Worktree,
     },
     StartAgent(Provider),
     ResumeSession(usize),
@@ -1296,7 +1296,7 @@ impl Agency {
             AppEvent::SelectWorktree(index) => self.select_worktree(index),
             AppEvent::WorktreesDiscovered { worktrees } => self.worktrees_discovered(worktrees),
             AppEvent::WorktreeCreated { worktree } => self.worktree_created(worktree),
-            AppEvent::WorktreeRemoved { branch } => self.worktree_removed(&branch),
+            AppEvent::WorktreeRemoved { worktree } => self.worktree_removed(&worktree),
             AppEvent::StartAgent(provider) => {
                 self.selected_agent = provider;
                 self.start_agent(provider);
@@ -2463,13 +2463,13 @@ impl Agency {
     /// published as a follow-up event rather than called directly, so ordering
     /// stays deterministic and `select_worktree`'s teardown — revoking RPC
     /// capabilities, clearing agents, reloading sessions — runs exactly once.
-    fn worktree_removed(&mut self, branch: &str) {
+    fn worktree_removed(&mut self, removed: &Worktree) {
         let was_active = self
             .worktrees
             .get(self.active_worktree)
-            .is_some_and(|worktree| worktree.branch.as_deref() == Some(branch));
+            .is_some_and(|worktree| worktree.path == removed.path);
         self.worktrees
-            .retain(|worktree| worktree.branch.as_deref() != Some(branch));
+            .retain(|worktree| worktree.path != removed.path);
         if self.worktrees.is_empty() {
             return;
         }
@@ -2481,7 +2481,7 @@ impl Agency {
         if was_active {
             self.emit(AppEvent::SelectWorktree(0));
         }
-        self.notice = Some(format!("Removed worktree {branch}"));
+        self.notice = Some(format!("Removed worktree {}", removed.label));
     }
 
     fn select_worktree(&mut self, index: usize) {
@@ -2734,10 +2734,10 @@ impl Agency {
                         .ok_or_else(|| "remove_worktree requires a branch".to_owned());
                     branch.and_then(|branch| {
                         worktrees::remove(&call.context.workspace, branch).map(|worktree| {
-                            let value = worktree_json(worktree);
                             self.emit(AppEvent::WorktreeRemoved {
-                                branch: branch.to_owned(),
+                                worktree: worktree.clone(),
                             });
+                            let value = worktree_json(worktree);
                             serde_json::json!({
                                 "caller": rpc_caller(&call.context),
                                 "worktree": value
@@ -7834,7 +7834,10 @@ mod tests {
         let _ = agency.drain_events();
 
         let _ = agency.reduce_event(AppEvent::WorktreeRemoved {
-            branch: "feature".to_owned(),
+            worktree: worktree_at(
+                std::path::Path::new("/repo/.agency/worktrees/feature"),
+                "feature",
+            ),
         });
 
         assert_eq!(agency.worktrees.len(), 1);
@@ -7860,7 +7863,7 @@ mod tests {
         agency.active_worktree = 1;
 
         let _ = agency.reduce_event(AppEvent::WorktreeRemoved {
-            branch: "feature".to_owned(),
+            worktree: worktree_at(&feature, "feature"),
         });
 
         assert_eq!(agency.worktrees.len(), 1);
@@ -7871,6 +7874,30 @@ mod tests {
                 .any(|event| matches!(event, AppEvent::SelectWorktree(0))),
             "the app must move off the worktree it just deleted"
         );
+    }
+
+    /// `remove` trims the branch it is given, so the identifier the caller sent
+    /// and the identifier git knows can differ. The event carries the resolved
+    /// worktree for exactly that reason: a tab that survives its own removal
+    /// leaves the app pointed at a directory that no longer exists.
+    #[test]
+    fn removing_a_worktree_named_with_stray_whitespace_still_drops_its_tab() {
+        let root = worktrees::tests_support::repository("remove-whitespace");
+        let created = worktrees::create(&root, "feature", None).unwrap();
+        let removed = worktrees::remove(&root, "  feature\n").unwrap();
+        assert_eq!(removed.path, created.path);
+
+        let mut agency = Agency::for_testing();
+        let _ = agency.drain_events();
+        agency.cwd = root.clone();
+        agency.worktrees = vec![worktree_at(&root, "main"), created];
+        agency.active_worktree = 0;
+
+        let _ = agency.reduce_event(AppEvent::WorktreeRemoved { worktree: removed });
+
+        assert_eq!(agency.worktrees.len(), 1);
+
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     /// Worktree resolution must not care who is calling. `blueprint` is not a
