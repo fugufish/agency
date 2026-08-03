@@ -2423,10 +2423,13 @@ impl Agency {
         });
     }
 
-    /// The one place `worktrees` and `active_worktree` are written. An empty
-    /// list is refused rather than rendered: git always reports at least the
-    /// primary, so an empty result means the query failed, and dropping every
-    /// tab would leave nothing to switch back to.
+    /// The only place `worktrees` is replaced after startup. `select_worktree`
+    /// also moves `active_worktree`, always in lockstep with `cwd`;
+    /// `worktrees_discovered` is the one writer that can leave them diverged,
+    /// when `cwd` is absent from the incoming list. An empty list is refused
+    /// rather than rendered: git always reports at least the primary, so an
+    /// empty result means the query failed, and dropping every tab would leave
+    /// nothing to switch back to.
     fn worktrees_discovered(&mut self, worktrees: Vec<Worktree>) {
         if worktrees.is_empty() {
             return;
@@ -7626,6 +7629,20 @@ mod tests {
         assert!(agency.drain_events().is_empty());
     }
 
+    /// Startup discovery goes through the same reducer as creation and
+    /// removal, so a new Agency publishes its initial worktree list rather
+    /// than only assigning it. Without this, the startup publish is
+    /// indistinguishable from dead code.
+    #[test]
+    fn a_new_agency_publishes_its_initial_worktree_discovery() {
+        let mut agency = Agency::for_testing();
+
+        assert!(matches!(
+            agency.drain_events().as_slice(),
+            [AppEvent::WorktreesDiscovered { .. }]
+        ));
+    }
+
     #[test]
     fn switching_worktrees_reseeds_agency_commands_and_requests_a_reload() {
         let mut agency = Agency::for_testing();
@@ -7727,6 +7744,25 @@ mod tests {
                 .any(|worktree| worktree.branch.as_deref() == Some("feature"))
         );
         assert_eq!(agency.active_worktree, 0);
+        assert_eq!(agency.cwd, root);
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// Task 5 removes the active worktree, clamps `active_worktree`, and
+    /// publishes `SelectWorktree(0)` while `cwd` still names the deleted
+    /// checkout. An index-equality guard would early-return and strand the app
+    /// there, so the guard compares paths.
+    #[test]
+    fn selecting_the_active_index_still_switches_when_cwd_no_longer_exists() {
+        let root = worktrees::tests_support::repository("stale-cwd");
+        let mut agency = Agency::for_testing();
+        agency.worktrees = vec![worktree_at(&root, "main")];
+        agency.active_worktree = 0;
+        agency.cwd = root.join(".agency/worktrees/deleted");
+
+        let _ = agency.reduce_event(AppEvent::SelectWorktree(0));
+
         assert_eq!(agency.cwd, root);
 
         std::fs::remove_dir_all(root).unwrap();
