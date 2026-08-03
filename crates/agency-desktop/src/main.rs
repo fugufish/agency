@@ -12,6 +12,7 @@ mod worktrees;
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
+use std::ops::Range;
 use std::path::PathBuf;
 use std::process::Command;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -5786,11 +5787,78 @@ fn composer_operation_range(
     (start < end).then_some((start, end))
 }
 
+/// The height of one composer line, matched to the block cursor so a blank
+/// line keeps its vertical space instead of collapsing.
+const COMPOSER_LINE_HEIGHT: f32 = 17.0;
+
+/// One drawn piece of a composer line.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PromptSpan {
+    Cursor,
+    Text { range: Range<usize>, selected: bool },
+}
+
+/// The composer laid out one row per line.
+///
+/// Splitting uses `split('\n')` rather than `lines()`, which drops a trailing
+/// empty line and would leave a cursor after a final newline with nowhere to
+/// draw. Line boundaries stay unambiguous because the `'\n'` occupies a byte:
+/// `cursor == line_end` is the end of one line, and `cursor == line_start` is
+/// the start of the next, so exactly one line claims the cursor.
+fn composer_lines(
+    prompt: &str,
+    cursor: usize,
+    selection: Option<(usize, usize)>,
+) -> Vec<Vec<PromptSpan>> {
+    let mut lines = Vec::new();
+    let mut line_start = 0;
+    for line in prompt.split('\n') {
+        let line_end = line_start + line.len();
+        let span = line_start..=line_end;
+        let mut boundaries = vec![line_start, line_end];
+        if span.contains(&cursor) {
+            boundaries.push(cursor);
+        }
+        if let Some((start, end)) = selection {
+            boundaries.extend(
+                [start, end]
+                    .into_iter()
+                    .filter(|bound| span.contains(bound)),
+            );
+        }
+        boundaries.sort_unstable();
+        boundaries.dedup();
+
+        let mut spans = Vec::new();
+        for window in boundaries.windows(2) {
+            let (start, end) = (window[0], window[1]);
+            if start == cursor {
+                spans.push(PromptSpan::Cursor);
+            }
+            let selected = selection.is_some_and(|(selection_start, selection_end)| {
+                start >= selection_start && end <= selection_end
+            });
+            spans.push(PromptSpan::Text {
+                range: start..end,
+                selected,
+            });
+        }
+        // A cursor at the very end of a line closes no window, so it is pushed
+        // here rather than by the loop above.
+        if cursor == line_end {
+            spans.push(PromptSpan::Cursor);
+        }
+        lines.push(spans);
+        line_start = line_end + 1;
+    }
+    lines
+}
+
 fn composer_prompt(agent: &AgentView, cursor_visible: bool) -> Element<'_, AppEvent> {
     let cursor = || -> Element<'_, AppEvent> {
         container(text(" ").font(Font::MONOSPACE).size(14))
             .width(Length::Fixed(8.0))
-            .height(Length::Fixed(17.0))
+            .height(Length::Fixed(COMPOSER_LINE_HEIGHT))
             .style(move |_theme: &Theme| {
                 if cursor_visible {
                     ui_theme::block_cursor()
@@ -5812,44 +5880,28 @@ fn composer_prompt(agent: &AgentView, cursor_visible: bool) -> Element<'_, AppEv
         .into();
     }
 
-    let selection = agent.prompt_selection();
-    let mut boundaries = vec![0, agent.prompt_cursor, agent.prompt.len()];
-    if let Some((start, end)) = selection {
-        boundaries.extend([start, end]);
-    }
-    boundaries.sort_unstable();
-    boundaries.dedup();
-
-    let mut prompt = iced::widget::Row::new().spacing(0);
-    for window in boundaries.windows(2) {
-        let start = window[0];
-        let end = window[1];
-        if start == agent.prompt_cursor {
-            prompt = prompt.push(cursor());
-        }
-        if start == end {
-            continue;
-        }
-        let selected = selection.is_some_and(|(selection_start, selection_end)| {
-            start >= selection_start && end <= selection_end
-        });
-        prompt = prompt.push(
-            container(
-                text(&agent.prompt[start..end])
-                    .font(Font::MONOSPACE)
-                    .size(14),
-            )
-            .style(move |_theme: &Theme| {
-                if selected {
-                    ui_theme::text_selection()
-                } else {
-                    container::Style::default()
+    let mut prompt = iced::widget::Column::new();
+    for spans in composer_lines(&agent.prompt, agent.prompt_cursor, agent.prompt_selection()) {
+        let mut line = iced::widget::Row::new()
+            .spacing(0)
+            .height(Length::Fixed(COMPOSER_LINE_HEIGHT));
+        for span in spans {
+            line = line.push(match span {
+                PromptSpan::Cursor => cursor(),
+                PromptSpan::Text { range, selected } => {
+                    container(text(&agent.prompt[range]).font(Font::MONOSPACE).size(14))
+                        .style(move |_theme: &Theme| {
+                            if selected {
+                                ui_theme::text_selection()
+                            } else {
+                                container::Style::default()
+                            }
+                        })
+                        .into()
                 }
-            }),
-        );
-    }
-    if agent.prompt_cursor == agent.prompt.len() {
-        prompt = prompt.push(cursor());
+            });
+        }
+        prompt = prompt.push(line);
     }
     prompt.into()
 }
@@ -6557,6 +6609,104 @@ fn fenced_command(command: &str, language: &str) -> String {
 mod tests {
     use super::*;
     use agency_translator_api::commands::AgentCommand;
+
+    /// The cursor has to sit on the line and column the byte offset names. Drawn
+    /// from a single row, as it was, it landed at a horizontal offset that ignored
+    /// every line break before it.
+    #[test]
+    fn the_composer_cursor_lands_on_its_own_line_and_column() {
+        assert_eq!(
+            composer_lines("abc\ndef", 5, None),
+            vec![
+                vec![PromptSpan::Text {
+                    range: 0..3,
+                    selected: false
+                }],
+                vec![
+                    PromptSpan::Text {
+                        range: 4..5,
+                        selected: false
+                    },
+                    PromptSpan::Cursor,
+                    PromptSpan::Text {
+                        range: 5..7,
+                        selected: false
+                    },
+                ],
+            ]
+        );
+    }
+
+    /// `str::lines` drops a trailing empty line, which would leave the cursor
+    /// after a final newline with nowhere to draw.
+    #[test]
+    fn a_trailing_newline_keeps_a_final_line_for_the_cursor() {
+        assert_eq!(
+            composer_lines("abc\n", 4, None),
+            vec![
+                vec![PromptSpan::Text {
+                    range: 0..3,
+                    selected: false
+                }],
+                vec![PromptSpan::Cursor],
+            ]
+        );
+    }
+
+    #[test]
+    fn a_blank_interior_line_still_occupies_a_row() {
+        let lines = composer_lines("a\n\nb", 0, None);
+
+        assert_eq!(lines.len(), 3);
+        assert_eq!(
+            lines[0],
+            vec![
+                PromptSpan::Cursor,
+                PromptSpan::Text {
+                    range: 0..1,
+                    selected: false
+                }
+            ]
+        );
+        assert!(lines[1].is_empty());
+    }
+
+    /// A selection crossing line breaks has to mark a partial first line, a whole
+    /// middle line, and a partial last line, with the newline itself drawing
+    /// nothing.
+    #[test]
+    fn a_selection_spanning_lines_marks_each_line_it_covers() {
+        assert_eq!(
+            composer_lines("one\ntwo\nthree", 9, Some((2, 9))),
+            vec![
+                vec![
+                    PromptSpan::Text {
+                        range: 0..2,
+                        selected: false
+                    },
+                    PromptSpan::Text {
+                        range: 2..3,
+                        selected: true
+                    },
+                ],
+                vec![PromptSpan::Text {
+                    range: 4..7,
+                    selected: true
+                }],
+                vec![
+                    PromptSpan::Text {
+                        range: 8..9,
+                        selected: true
+                    },
+                    PromptSpan::Cursor,
+                    PromptSpan::Text {
+                        range: 9..13,
+                        selected: false
+                    },
+                ],
+            ]
+        );
+    }
 
     #[test]
     fn event_bus_preserves_publish_order_for_follow_up_events() {
