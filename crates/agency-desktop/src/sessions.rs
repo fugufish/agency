@@ -6,6 +6,7 @@ use agency_agents::Provider;
 use serde::{Deserialize, Serialize};
 
 use crate::config::{path_component, workspace_config_directory};
+use crate::worktrees::Worktree;
 
 const LEGACY_SESSION_REGISTRY_FILE: &str = "sessions.json";
 const SESSION_CONFIG_FILE: &str = "session.json";
@@ -324,25 +325,107 @@ pub fn worktree_sessions_directory(workspace: &Path) -> PathBuf {
     workspace_config_directory(workspace).join("sessions")
 }
 
-/// Sessions used to live under the primary worktree keyed by branch, with
-/// `root` for the primary itself. Moves that one directory into place beside
-/// the primary. Silent on failure: a launch that cannot move history is still
-/// a launch that should start.
-pub fn migrate_legacy_root_sessions(workspace: &Path) {
-    let config = workspace_config_directory(workspace);
-    let legacy_root = config.join("worktrees").join("root");
-    let legacy = legacy_root.join("sessions");
-    let current = worktree_sessions_directory(workspace);
-    if !legacy.is_dir() || current.exists() {
+/// Where history moves when nothing claims it. Never deleted: a legacy key
+/// with no live worktree is still a user's conversation history.
+const LEGACY_SESSIONS_DIRECTORY: &str = "legacy-sessions";
+
+/// Sessions used to live under the primary worktree, in
+/// `.agency/worktrees/<encoded-branch>/sessions/`, with the literal `root`
+/// standing in for the primary itself. Checkouts now occupy exactly that
+/// namespace under exactly that encoding, so every stale key is a directory
+/// name a future worktree cannot have — `create` refuses a path that already
+/// exists, permanently, for a path the user never sees.
+///
+/// Runs against the **primary** worktree, which `worktrees[0]` always is: git
+/// reports the primary first, and the discovery fallback in `build` yields a
+/// single entry. Taking the list rather than a path is what keys the migration
+/// to the primary no matter which worktree Agency was launched from; passing
+/// the active worktree instead would look in the wrong repository root, find
+/// nothing, and strand the history behind the destination-exists guard.
+///
+/// Every entry under `.agency/worktrees/` that is not a live checkout and that
+/// holds a `sessions/` directory is claimed:
+///
+/// - `root` moves beside the primary,
+/// - a key that encodes some live worktree's branch moves inside that worktree,
+/// - anything else moves to `.agency/legacy-sessions/<key>`, freeing the name.
+///
+/// Best effort and infallible. A launch that cannot move history is still a
+/// launch that should start, and an existing destination is never overwritten.
+pub fn migrate_legacy_sessions(worktrees: &[Worktree]) {
+    let Some(primary) = worktrees.first() else {
+        return;
+    };
+    let legacy_directory = workspace_config_directory(&primary.path).join("worktrees");
+    let Ok(entries) = fs::read_dir(&legacy_directory) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let key_directory = entry.path();
+        if !key_directory.is_dir() || holds_a_live_worktree(&key_directory, worktrees) {
+            continue;
+        }
+        if !key_directory.join("sessions").is_dir() {
+            continue;
+        }
+        let Some(key) = key_directory.file_name().and_then(|key| key.to_str()) else {
+            continue;
+        };
+
+        if key == "root" {
+            adopt_legacy_sessions(&key_directory, &worktree_sessions_directory(&primary.path));
+        } else if let Some(owner) = worktrees.iter().find(|worktree| {
+            worktree
+                .branch
+                .as_deref()
+                .is_some_and(|branch| path_component(branch) == key)
+        }) {
+            adopt_legacy_sessions(&key_directory, &worktree_sessions_directory(&owner.path));
+        } else {
+            let destination = workspace_config_directory(&primary.path)
+                .join(LEGACY_SESSIONS_DIRECTORY)
+                .join(key);
+            if destination.exists() {
+                continue;
+            }
+            if let Some(parent) = destination.parent()
+                && fs::create_dir_all(parent).is_err()
+            {
+                continue;
+            }
+            let _ = fs::rename(&key_directory, &destination);
+        }
+    }
+}
+
+/// A checkout is never migration's business. Matches a worktree sitting at the
+/// entry *or* beneath it, so a directory that turned out to contain live work
+/// is left alone rather than moved out from under git.
+fn holds_a_live_worktree(directory: &Path, worktrees: &[Worktree]) -> bool {
+    let canonical = fs::canonicalize(directory);
+    worktrees.iter().any(|worktree| {
+        worktree.path.starts_with(directory)
+            || canonical.as_ref().is_ok_and(|canonical| {
+                fs::canonicalize(&worktree.path)
+                    .is_ok_and(|worktree| worktree.starts_with(canonical))
+            })
+    })
+}
+
+/// Moves `<key>/sessions` to `destination` unless something already lives
+/// there, then collects the key directory if the move emptied it.
+fn adopt_legacy_sessions(key_directory: &Path, destination: &Path) {
+    let legacy = key_directory.join("sessions");
+    if destination.exists() {
         return;
     }
-    if let Some(parent) = current.parent()
+    if let Some(parent) = destination.parent()
         && fs::create_dir_all(parent).is_err()
     {
         return;
     }
-    if fs::rename(&legacy, &current).is_ok() {
-        let _ = fs::remove_dir(&legacy_root);
+    if fs::rename(&legacy, destination).is_ok() {
+        let _ = fs::remove_dir(key_directory);
     }
 }
 
@@ -527,20 +610,44 @@ mod tests {
         );
     }
 
-    /// Sessions used to be keyed by branch under the primary, with the literal
-    /// `root` standing in for the primary itself. That directory is the only
-    /// one this migration can claim: every other key belonged to a worktree
-    /// whose history now lives inside the worktree.
-    #[test]
-    fn legacy_root_sessions_move_beside_the_primary_worktree() {
+    /// A scratch directory that is not a repository. The migration never shells
+    /// out to git, so a plain directory is enough to drive it.
+    fn scratch(name: &str) -> PathBuf {
         let unique = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let workspace = std::env::temp_dir().join(format!(
-            "agency-session-root-migration-{}-{unique}",
-            std::process::id()
-        ));
+        let workspace =
+            std::env::temp_dir().join(format!("agency-{name}-{}-{unique}", std::process::id()));
+        std::fs::create_dir_all(&workspace).unwrap();
+        workspace
+    }
+
+    fn worktree(path: &Path, branch: &str) -> Worktree {
+        Worktree {
+            path: path.to_path_buf(),
+            label: branch.to_owned(),
+            branch: Some(branch.to_owned()),
+        }
+    }
+
+    fn write_legacy_session(directory: &Path, conversation: &str, codex: &str) {
+        std::fs::create_dir_all(directory.join(conversation)).unwrap();
+        std::fs::write(
+            directory.join(conversation).join(SESSION_CONFIG_FILE),
+            format!(r#"{{"conversation_id":"{conversation}","codex_id":"{codex}"}}"#),
+        )
+        .unwrap();
+    }
+
+    /// Sessions used to be keyed by branch under the primary, with the literal
+    /// `root` standing in for the primary itself. `root` moves beside the
+    /// primary; the other keys are handled by the cases below, because a
+    /// repository being upgraded still holds one directory per branch it ever
+    /// ran a session on, in the namespace checkouts now occupy.
+    #[test]
+    fn legacy_root_sessions_move_beside_the_primary_worktree() {
+        let workspace = scratch("session-root-migration");
         let legacy = workspace_config_directory(&workspace)
             .join("worktrees")
             .join("root")
@@ -553,7 +660,7 @@ mod tests {
         )
         .unwrap();
 
-        migrate_legacy_root_sessions(&workspace);
+        migrate_legacy_sessions(&[worktree(&workspace, "main")]);
 
         let registry = SessionRegistry::load(&workspace).unwrap();
         assert_eq!(registry.records().len(), 1);
@@ -574,14 +681,7 @@ mod tests {
     /// A second launch must not clobber history written since the first.
     #[test]
     fn the_root_session_migration_does_not_overwrite_current_history() {
-        let unique = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let workspace = std::env::temp_dir().join(format!(
-            "agency-session-root-noop-{}-{unique}",
-            std::process::id()
-        ));
+        let workspace = scratch("session-root-noop");
         let legacy = workspace_config_directory(&workspace)
             .join("worktrees")
             .join("root")
@@ -601,7 +701,7 @@ mod tests {
         )
         .unwrap();
 
-        migrate_legacy_root_sessions(&workspace);
+        migrate_legacy_sessions(&[worktree(&workspace, "main")]);
 
         let registry = SessionRegistry::load(&workspace).unwrap();
         assert_eq!(registry.records().len(), 1);
@@ -611,5 +711,211 @@ mod tests {
         );
 
         std::fs::remove_dir_all(workspace).unwrap();
+    }
+
+    /// A branch that ran sessions under the old layout and has a worktree
+    /// today: its history belongs inside that worktree, where the rest of the
+    /// worktree's history now lives and where removal will collect it.
+    #[test]
+    fn legacy_branch_sessions_move_inside_the_worktree_that_owns_them() {
+        let workspace = scratch("session-branch-migration");
+        // A worktree created under the old sibling scheme: still live, still a
+        // tab, and its history is still keyed by branch under the primary.
+        let checkout = scratch("session-branch-sibling");
+        let legacy = workspace_config_directory(&workspace)
+            .join("worktrees")
+            .join(path_component("feature/tabs"))
+            .join("sessions");
+        write_legacy_session(&legacy, "conversation-1", "codex-1");
+
+        migrate_legacy_sessions(&[
+            worktree(&workspace, "main"),
+            worktree(&checkout, "feature/tabs"),
+        ]);
+
+        let registry = SessionRegistry::load(&checkout).unwrap();
+        assert_eq!(registry.records().len(), 1);
+        assert_eq!(
+            registry.records()[0].binding(Provider::Codex),
+            Some("codex-1")
+        );
+        assert!(
+            SessionRegistry::load(&workspace)
+                .unwrap()
+                .records()
+                .is_empty(),
+            "the primary must not adopt another worktree's history"
+        );
+        assert!(
+            !legacy.parent().unwrap().exists(),
+            "the legacy key must be freed for a checkout of that branch"
+        );
+
+        std::fs::remove_dir_all(workspace).unwrap();
+        std::fs::remove_dir_all(checkout).unwrap();
+    }
+
+    /// A branch nobody has checked out. The name still has to be freed, or
+    /// `create` refuses that branch forever — but the history behind it is a
+    /// user's conversations, so it is moved aside rather than deleted.
+    #[test]
+    fn orphaned_legacy_sessions_move_aside_rather_than_being_deleted() {
+        let workspace = scratch("session-orphan-migration");
+        let legacy = workspace_config_directory(&workspace)
+            .join("worktrees")
+            .join("abandoned")
+            .join("sessions");
+        write_legacy_session(&legacy, "conversation-1", "codex-1");
+
+        migrate_legacy_sessions(&[worktree(&workspace, "main")]);
+
+        assert!(
+            !workspace_config_directory(&workspace)
+                .join("worktrees")
+                .join("abandoned")
+                .exists(),
+            "the key must be freed"
+        );
+        assert!(
+            workspace_config_directory(&workspace)
+                .join("legacy-sessions")
+                .join("abandoned")
+                .join("sessions")
+                .join("conversation-1")
+                .join(SESSION_CONFIG_FILE)
+                .is_file(),
+            "the history must survive the move"
+        );
+
+        std::fs::remove_dir_all(workspace).unwrap();
+    }
+
+    /// The property that matters most: a live checkout sits under
+    /// `.agency/worktrees/` too, so a migration that claims one moves a user's
+    /// working tree out from under git.
+    ///
+    /// Both shapes are here, because the two arms fail differently. A checkout
+    /// whose key still encodes its branch would have its own tracked
+    /// `sessions/` directory relocated into `.agency/sessions/`; a checkout
+    /// whose key no longer matches any branch — git lets a branch be renamed
+    /// after the worktree is made — would be moved wholesale into
+    /// `legacy-sessions/`, checkout, `.git` file and all.
+    #[test]
+    fn a_live_checkout_is_left_untouched() {
+        let workspace = scratch("session-live-checkout");
+        let worktrees_directory = workspace_config_directory(&workspace).join("worktrees");
+        let named = worktrees_directory.join("feature");
+        let renamed = worktrees_directory.join("stale-name");
+        for checkout in [&named, &renamed] {
+            std::fs::create_dir_all(checkout).unwrap();
+            std::fs::write(checkout.join(".git"), "gitdir: elsewhere\n").unwrap();
+            // A tracked directory that happens to be called `sessions`. The
+            // migration has no business reading a checkout's contents at all.
+            std::fs::create_dir_all(checkout.join("sessions")).unwrap();
+            std::fs::write(checkout.join("sessions").join("fixture.rs"), "fn main() {}").unwrap();
+        }
+
+        migrate_legacy_sessions(&[
+            worktree(&workspace, "main"),
+            worktree(&named, "feature"),
+            worktree(&renamed, "renamed"),
+        ]);
+
+        for checkout in [&named, &renamed] {
+            assert!(
+                checkout.join("sessions").join("fixture.rs").is_file(),
+                "nothing inside a live checkout may be moved: {}",
+                checkout.display()
+            );
+            assert!(checkout.join(".git").is_file());
+            assert!(
+                !worktree_sessions_directory(checkout).exists(),
+                "the checkout's own files must not be re-filed as session history"
+            );
+        }
+        assert!(
+            !workspace_config_directory(&workspace)
+                .join(LEGACY_SESSIONS_DIRECTORY)
+                .exists(),
+            "a live checkout must never be moved aside"
+        );
+
+        std::fs::remove_dir_all(workspace).unwrap();
+    }
+
+    /// The reported failure: a session recorded under the old layout on branch
+    /// `feature` left `.agency/worktrees/feature/` behind, and `create` refuses
+    /// a path that already exists — so that branch could never get a worktree
+    /// again, for a directory the user never sees.
+    #[test]
+    fn migration_frees_a_branch_name_a_legacy_session_directory_had_claimed() {
+        let root = crate::worktrees::tests_support::repository("session-legacy-blocks-create");
+        write_legacy_session(
+            &workspace_config_directory(&root)
+                .join("worktrees")
+                .join("feature")
+                .join("sessions"),
+            "conversation-1",
+            "codex-1",
+        );
+
+        migrate_legacy_sessions(&crate::worktrees::discover(&root).unwrap());
+
+        let created = crate::worktrees::create(&root, "feature", None).unwrap();
+        assert_eq!(
+            created.path,
+            workspace_config_directory(&root)
+                .join("worktrees")
+                .join("feature")
+        );
+        assert!(
+            workspace_config_directory(&root)
+                .join("legacy-sessions")
+                .join("feature")
+                .join("sessions")
+                .join("conversation-1")
+                .join(SESSION_CONFIG_FILE)
+                .is_file()
+        );
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// Launched from a linked worktree — the habit the old sibling layout
+    /// encouraged — the migration must still work on the primary. Keying it to
+    /// the active worktree looks in a directory the legacy layout never used,
+    /// finds nothing, and strands the history the moment a new session writes
+    /// `.agency/sessions/` and trips the destination-exists guard.
+    #[test]
+    fn the_migration_runs_against_the_primary_when_launched_from_a_worktree() {
+        let root = crate::worktrees::tests_support::repository("session-launch-from-worktree");
+        let linked = crate::worktrees::create(&root, "feature", None).unwrap();
+        write_legacy_session(
+            &workspace_config_directory(&root)
+                .join("worktrees")
+                .join("root")
+                .join("sessions"),
+            "conversation-1",
+            "codex-1",
+        );
+
+        // Exactly what `build` does when Agency starts inside a worktree.
+        let worktrees = crate::worktrees::discover(&linked.path).unwrap();
+        migrate_legacy_sessions(&worktrees);
+
+        let registry = SessionRegistry::load(&root).unwrap();
+        assert_eq!(registry.records().len(), 1);
+        assert_eq!(
+            registry.records()[0].binding(Provider::Codex),
+            Some("codex-1")
+        );
+        assert!(
+            !workspace_config_directory(&root)
+                .join("worktrees")
+                .join("root")
+                .exists()
+        );
+
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

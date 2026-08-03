@@ -956,7 +956,10 @@ impl Agency {
             .position(|worktree| worktree.path == cwd)
             .unwrap_or(0);
         let cwd = worktrees[active_worktree].path.clone();
-        sessions::migrate_legacy_root_sessions(&cwd);
+        // Keyed to the whole list, never to `cwd`: the legacy layout lived under
+        // the primary, so a launch from a linked worktree must still migrate the
+        // primary's history rather than search the worktree it started in.
+        sessions::migrate_legacy_sessions(&worktrees);
         let _ = worktrees::ensure_agency_ignored(&cwd);
         let (sessions, session_notice) = match SessionRegistry::load(&cwd) {
             Ok(sessions) => (sessions, None),
@@ -2428,10 +2431,12 @@ impl Agency {
         });
     }
 
-    /// The only place `worktrees` is replaced after startup. `select_worktree`
-    /// also moves `active_worktree`, always in lockstep with `cwd`;
-    /// `worktrees_discovered` is the one writer that can leave them diverged,
-    /// when `cwd` is absent from the incoming list. An empty list is refused
+    /// Replaces `worktrees` wholesale. `worktree_removed` is the only other
+    /// writer of that field after startup, and it drops a single tab rather
+    /// than replacing the list; `select_worktree` moves `active_worktree`
+    /// alone, always in lockstep with `cwd`. This is the one writer that can
+    /// leave the two diverged, when `cwd` is absent from the incoming list.
+    /// An empty list is refused
     /// rather than rendered: git always reports at least the primary, so an
     /// empty result means the query failed, and dropping every tab would leave
     /// nothing to switch back to.
