@@ -319,6 +319,110 @@ pub fn shared_completion_prefix(catalog: &[SlashCommandCompletion], input: &str)
     (prefix.len() > input.len()).then_some(prefix)
 }
 
+/// What a submitted prompt turns out to be.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Submission {
+    /// One of Agency's own commands, for the harness to run.
+    Agency(SlashCommand),
+    /// A command the catalog attributes to an agent. `prompt` carries the
+    /// entry's own insertion in place of the token that was typed, so an agent
+    /// receives the command in the form it expects regardless of how the user
+    /// reached it.
+    Agent { provider: Provider, prompt: String },
+    /// Nothing Agency recognizes. The focused agent gets the text as typed and
+    /// reports on it itself.
+    Verbatim,
+}
+
+/// What to do with `prompt` when it is submitted.
+///
+/// Agency's own commands come first, then the catalog. Anything left over goes
+/// to the focused agent untouched: Agency rejecting a name it does not know
+/// would make every command an agent gained after the last catalog load
+/// unreachable, which is the failure this exists to remove.
+pub fn resolve_submission(
+    catalog: &[SlashCommandCompletion],
+    prompt: &str,
+    active: Option<Provider>,
+) -> Result<Submission, String> {
+    let prompt = prompt.trim();
+    if let Some(command) = parse_slash_command(prompt)? {
+        return Ok(Submission::Agency(command));
+    }
+    let Some(token) = prompt.split_whitespace().next() else {
+        return Ok(Submission::Verbatim);
+    };
+    let Some(entry) = resolve_entry(catalog, token, active) else {
+        return Ok(Submission::Verbatim);
+    };
+    // Agency's own rows carry no provider and were handled above; one reaching
+    // here has nobody to route to.
+    let Some(provider) = entry.provider else {
+        return Ok(Submission::Verbatim);
+    };
+
+    let arguments = prompt[token.len()..].trim_start();
+    let invocation = entry.insertion.trim_end();
+    let prompt = if arguments.is_empty() {
+        invocation.to_owned()
+    } else {
+        format!("{invocation} {arguments}")
+    };
+    Ok(Submission::Agent { provider, prompt })
+}
+
+/// The one catalog entry `token` names, if exactly one survives.
+///
+/// Matching is exact, unlike the overlay's `matches`. A prefix match is right
+/// for a live-filtered list and wrong for deciding what a submitted line means:
+/// under it a submitted `/b` would silently fire whichever command sorted
+/// first.
+fn resolve_entry<'a>(
+    catalog: &'a [SlashCommandCompletion],
+    token: &str,
+    active: Option<Provider>,
+) -> Option<&'a SlashCommandCompletion> {
+    let mut candidates = catalog
+        .iter()
+        .filter(|entry| names(entry, token))
+        .collect::<Vec<_>>();
+    // A name both agents offer belongs to the one being talked to; routing it
+    // elsewhere would switch agents behind a command that needed no switch.
+    if let Some(active) = active
+        && candidates
+            .iter()
+            .any(|entry| entry.provider == Some(active))
+    {
+        candidates.retain(|entry| entry.provider == Some(active));
+    }
+    match candidates.as_slice() {
+        [entry] => Some(entry),
+        _ => None,
+    }
+}
+
+/// Whether `token` names `entry` exactly.
+///
+/// Three forms count: the catalog's own `/namespace:name`, the entry's
+/// insertion as the overlay itself would have typed it, and the bare trailing
+/// segment under Agency's `/` sigil. The insertion comparison is a plain string
+/// comparison against whatever the entry carries, never a match on a known set
+/// of sigils, so a translator that invokes with `^` resolves with no change
+/// here.
+fn names(entry: &SlashCommandCompletion, token: &str) -> bool {
+    if entry.command == token || entry.insertion.trim_end() == token {
+        return true;
+    }
+    let Some(bare) = token.strip_prefix('/') else {
+        return false;
+    };
+    entry
+        .command
+        .rsplit(':')
+        .next()
+        .is_some_and(|segment| segment == bare)
+}
+
 pub fn parse_slash_command(input: &str) -> Result<Option<SlashCommand>, String> {
     let input = input.trim();
     if !input.starts_with('/') {
@@ -336,8 +440,9 @@ pub fn parse_slash_command(input: &str) -> Result<Option<SlashCommand>, String> 
         ["/mcp", ..] => Err("Usage: /mcp add <name>".to_owned()),
         ["/plugin", "install", arguments @ ..] => parse_plugin_install(arguments).map(Some),
         ["/plugin", ..] => Err(PLUGIN_INSTALL_USAGE.to_owned()),
-        [command, ..] => Err(format!("Unknown Agency command: {command}")),
-        [] => Ok(None),
+        // Not Agency's. `resolve_submission` takes it from here: the catalog
+        // may own it, and if nothing does, the focused agent gets it verbatim.
+        _ => Ok(None),
     }
 }
 
@@ -755,12 +860,11 @@ mod tests {
         fs::remove_dir_all(&workspace).unwrap();
     }
 
+    /// The inverse of the behavior this replaces: Agency parsing a command it
+    /// does not own must yield to the catalog rather than reject it.
     #[test]
-    fn unknown_commands_are_rejected_locally() {
-        assert_eq!(
-            parse_slash_command("/wat").unwrap_err(),
-            "Unknown Agency command: /wat"
-        );
+    fn an_unknown_command_is_left_for_the_catalog_to_resolve() {
+        assert_eq!(parse_slash_command("/wat"), Ok(None));
     }
 
     #[test]
@@ -804,6 +908,138 @@ mod tests {
             provider: Some(provider),
             built_in: false,
         }
+    }
+
+    /// `provider_completion` derives its insertion from the command, which is
+    /// right for Claude-shaped entries and wrong for any agent whose sigil is
+    /// not `/`. Resolution has to be tested against both.
+    fn invoked_completion(
+        command: &str,
+        insertion: &str,
+        provider: Provider,
+    ) -> SlashCommandCompletion {
+        SlashCommandCompletion {
+            command: command.to_owned(),
+            description: String::new(),
+            insertion: insertion.to_owned(),
+            provider: Some(provider),
+            built_in: false,
+        }
+    }
+
+    #[test]
+    fn a_typed_command_resolves_to_the_agent_that_owns_it() {
+        let catalog = vec![provider_completion(
+            "/superpowers:brainstorming",
+            Provider::Claude,
+        )];
+
+        assert_eq!(
+            resolve_submission(
+                &catalog,
+                "/superpowers:brainstorming",
+                Some(Provider::Codex)
+            ),
+            Ok(Submission::Agent {
+                provider: Provider::Claude,
+                prompt: "/superpowers:brainstorming".to_owned(),
+            })
+        );
+    }
+
+    /// Indexing exists so the short name a user remembers finds the command.
+    /// The namespace and the entry's own invocation are filled in on the way
+    /// out, and everything typed after the token is left alone.
+    #[test]
+    fn a_bare_namespace_segment_resolves_and_arguments_survive() {
+        let catalog = vec![provider_completion(
+            "/superpowers:brainstorming",
+            Provider::Claude,
+        )];
+
+        assert_eq!(
+            resolve_submission(&catalog, "/brainstorming an idea", Some(Provider::Claude)),
+            Ok(Submission::Agent {
+                provider: Provider::Claude,
+                prompt: "/superpowers:brainstorming an idea".to_owned(),
+            })
+        );
+    }
+
+    /// The harness must not know any provider's sigil. `$` is Codex's today;
+    /// `^` belongs to no shipped agent, and resolving it is what proves the
+    /// comparison is against catalog data rather than a hardcoded set.
+    #[test]
+    fn a_provider_sigil_resolves_without_the_harness_knowing_it() {
+        let catalog = vec![
+            invoked_completion("/letterhead", "$letterhead ", Provider::Codex),
+            invoked_completion("/blueprint", "^blueprint ", Provider::Claude),
+        ];
+
+        assert_eq!(
+            resolve_submission(&catalog, "$letterhead", Some(Provider::Codex)),
+            Ok(Submission::Agent {
+                provider: Provider::Codex,
+                prompt: "$letterhead".to_owned(),
+            })
+        );
+        assert_eq!(
+            resolve_submission(&catalog, "^blueprint", Some(Provider::Claude)),
+            Ok(Submission::Agent {
+                provider: Provider::Claude,
+                prompt: "^blueprint".to_owned(),
+            })
+        );
+    }
+
+    /// The defect this replaces. An unresolvable name is the focused agent's
+    /// to report, not Agency's.
+    #[test]
+    fn an_unresolvable_command_reaches_the_agent_instead_of_a_notice() {
+        assert_eq!(
+            resolve_submission(&[], "/wat", Some(Provider::Claude)),
+            Ok(Submission::Verbatim)
+        );
+    }
+
+    #[test]
+    fn the_focused_agent_wins_a_tie_and_a_tie_within_one_agent_falls_through() {
+        let across_agents = vec![
+            provider_completion("/review", Provider::Claude),
+            provider_completion("/review", Provider::Codex),
+        ];
+        assert_eq!(
+            resolve_submission(&across_agents, "/review", Some(Provider::Codex)),
+            Ok(Submission::Agent {
+                provider: Provider::Codex,
+                prompt: "/review".to_owned(),
+            })
+        );
+
+        // Two plugins under one agent: guessing between them would send the
+        // wrong command, so the agent gets the text and reports it itself.
+        let within_one_agent = vec![
+            provider_completion("/one:review", Provider::Claude),
+            provider_completion("/two:review", Provider::Claude),
+        ];
+        assert_eq!(
+            resolve_submission(&within_one_agent, "/review", Some(Provider::Claude)),
+            Ok(Submission::Verbatim)
+        );
+    }
+
+    #[test]
+    fn agency_keeps_its_own_commands_and_its_usage_errors() {
+        let catalog = agency_commands();
+
+        assert_eq!(
+            resolve_submission(&catalog, "/init", Some(Provider::Claude)),
+            Ok(Submission::Agency(SlashCommand::Init))
+        );
+        assert_eq!(
+            resolve_submission(&catalog, "/mcp", Some(Provider::Claude)),
+            Err("Usage: /mcp add <name>".to_owned())
+        );
     }
 
     fn ordered_commands(
