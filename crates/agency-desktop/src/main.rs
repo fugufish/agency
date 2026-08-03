@@ -2527,7 +2527,13 @@ impl Agency {
 
     fn explorer_entries(&self) -> Vec<ExplorerEntry> {
         let mut entries = Vec::new();
-        collect_explorer_entries(&self.cwd, 0, &self.explorer.expanded, &mut entries);
+        collect_explorer_entries(
+            &self.cwd,
+            &self.cwd,
+            0,
+            &self.explorer.expanded,
+            &mut entries,
+        );
         entries
     }
 
@@ -5676,7 +5682,16 @@ fn diff_count_badge(count: usize) -> Element<'static, AppEvent> {
         .into()
 }
 
+/// Walks the workspace for the file explorer.
+///
+/// `root` is threaded through the recursion so the workspace's own
+/// `.agency/worktrees` can be skipped: every worktree is a full checkout of
+/// this repository, so rendering it here would show the project inside itself
+/// and let one file be opened under two paths. Matched by resolved path rather
+/// than by name, so a `worktrees` directory that belongs to the project stays
+/// visible.
 fn collect_explorer_entries(
+    root: &std::path::Path,
     directory: &std::path::Path,
     depth: usize,
     expanded: &HashSet<PathBuf>,
@@ -5696,8 +5711,12 @@ fn collect_explorer_entries(
                 .cmp(&right.file_name().to_string_lossy().to_lowercase())
         })
     });
+    let worktrees_directory = config::worktrees_directory(root);
     for child in children {
         let path = child.path();
+        if path == worktrees_directory {
+            continue;
+        }
         let directory = child.file_type().is_ok_and(|kind| kind.is_dir());
         entries.push(ExplorerEntry {
             path: path.clone(),
@@ -5705,7 +5724,7 @@ fn collect_explorer_entries(
             directory,
         });
         if directory && expanded.contains(&path) {
-            collect_explorer_entries(&path, depth + 1, expanded, entries);
+            collect_explorer_entries(root, &path, depth + 1, expanded, entries);
         }
     }
 }
@@ -8026,5 +8045,40 @@ mod tests {
         let task = agency.reduce_event(AppEvent::SlashCatalogRequested);
 
         assert!(task.units() > 0);
+    }
+
+    /// The skip matches the resolved path, not the directory name, so a
+    /// `worktrees` directory that is part of the project stays visible.
+    #[test]
+    fn the_explorer_hides_the_worktrees_directory_but_not_others() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "agency-explorer-worktrees-{}-{unique}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(root.join(".agency").join("worktrees").join("feature")).unwrap();
+        std::fs::create_dir_all(root.join("docs").join("worktrees")).unwrap();
+        let mut expanded = HashSet::new();
+        expanded.insert(root.join(".agency"));
+        expanded.insert(root.join("docs"));
+
+        let mut entries = Vec::new();
+        collect_explorer_entries(&root, &root, 0, &expanded, &mut entries);
+        let paths = entries
+            .iter()
+            .map(|entry| entry.path.clone())
+            .collect::<Vec<_>>();
+
+        assert!(paths.contains(&root.join(".agency")));
+        assert!(
+            !paths.contains(&root.join(".agency").join("worktrees")),
+            "the worktrees directory must not appear in the primary's tree"
+        );
+        assert!(paths.contains(&root.join("docs").join("worktrees")));
+
+        std::fs::remove_dir_all(root).unwrap();
     }
 }
