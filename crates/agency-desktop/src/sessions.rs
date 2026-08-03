@@ -1,12 +1,11 @@
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use agency_agents::Provider;
 use serde::{Deserialize, Serialize};
 
-use crate::config::workspace_config_directory;
+use crate::config::{path_component, workspace_config_directory};
 
 const LEGACY_SESSION_REGISTRY_FILE: &str = "sessions.json";
 const SESSION_CONFIG_FILE: &str = "session.json";
@@ -317,67 +316,12 @@ fn modified_at_millis(path: &Path) -> u64 {
         .unwrap_or_default()
 }
 
+/// Sessions live beside the worktree that produced them. `git worktree remove`
+/// deletes a worktree directory wholesale, ignored files included, so a
+/// worktree's history is collected with it and nothing has to sweep for
+/// orphans later.
 pub fn worktree_sessions_directory(workspace: &Path) -> PathBuf {
-    let Some(current_root) = git_output(workspace, &["rev-parse", "--show-toplevel"]) else {
-        return workspace_config_directory(workspace)
-            .join("worktrees")
-            .join("root")
-            .join("sessions");
-    };
-    let current_root = PathBuf::from(current_root);
-    let worktrees = git_output(workspace, &["worktree", "list", "--porcelain"]);
-    let primary_root = worktrees
-        .as_deref()
-        .and_then(|output| {
-            output
-                .lines()
-                .find_map(|line| line.strip_prefix("worktree "))
-        })
-        .map(PathBuf::from)
-        .unwrap_or_else(|| current_root.clone());
-    let worktree = if current_root == primary_root {
-        "root".to_owned()
-    } else {
-        git_output(workspace, &["branch", "--show-current"])
-            .filter(|branch| !branch.is_empty())
-            .unwrap_or_else(|| {
-                let commit = git_output(workspace, &["rev-parse", "--short", "HEAD"])
-                    .unwrap_or_else(|| "unknown".to_owned());
-                format!("detached-{commit}")
-            })
-    };
-    workspace_config_directory(&primary_root)
-        .join("worktrees")
-        .join(path_component(&worktree))
-        .join("sessions")
-}
-
-fn git_output(workspace: &Path, arguments: &[&str]) -> Option<String> {
-    let output = Command::new("git")
-        .args(arguments)
-        .current_dir(workspace)
-        .output()
-        .ok()?;
-    output
-        .status
-        .success()
-        .then(|| String::from_utf8_lossy(&output.stdout).trim().to_owned())
-}
-
-fn path_component(value: &str) -> String {
-    let mut encoded = String::with_capacity(value.len());
-    for byte in value.bytes() {
-        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.') {
-            encoded.push(byte as char);
-        } else {
-            encoded.push_str(&format!("%{byte:02X}"));
-        }
-    }
-    if encoded.is_empty() {
-        "_".to_owned()
-    } else {
-        encoded
-    }
+    workspace_config_directory(workspace).join("sessions")
 }
 
 pub fn new_conversation_id() -> String {
@@ -541,5 +485,23 @@ mod tests {
             Some("claude-one")
         );
         std::fs::remove_dir_all(workspace).unwrap();
+    }
+
+    /// Sessions belong to the worktree that produced them, so the path is a
+    /// plain join and not a git query. Asserted against a directory that is not
+    /// a repository at all — the previous implementation shelled out to
+    /// `rev-parse` and could not answer here.
+    #[test]
+    fn sessions_live_beside_the_worktree_that_owns_them() {
+        let workspace = Path::new("/work/project");
+
+        assert_eq!(
+            worktree_sessions_directory(workspace),
+            Path::new("/work/project/.agency/sessions")
+        );
+        assert_eq!(
+            worktree_sessions_directory(Path::new("/work/project/.agency/worktrees/feature")),
+            Path::new("/work/project/.agency/worktrees/feature/.agency/sessions")
+        );
     }
 }

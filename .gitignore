@@ -3,5 +3,6 @@
 *.swo
 .DS_Store
 .agency/sessions.json
+.agency/sessions/
 .agency/worktrees/**
 .agency/config.local.toml
