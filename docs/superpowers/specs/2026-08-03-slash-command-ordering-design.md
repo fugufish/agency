@@ -52,10 +52,12 @@ The sort must be stable. That is what preserves each translator's discovery
 order — built-ins, then personal, project, and plugin entries — inside a block,
 so this change moves whole blocks and nothing within them.
 
-`active` is `Option<Provider>` rather than a bare `Provider` because one caller
-genuinely has no agent: `refresh_slash_completions` defaults the prompt when no
-pane is focused. `None` ranks every agent command equally, so a stable sort
-leaves the list in exactly its current order rather than in a special case.
+`active` is `Option<Provider>` rather than a bare `Provider` because the app
+genuinely runs without an agent: `Agency::for_testing` has no session at all,
+and the real app has none until the first one starts. `None` ranks every agent
+command equally, so a stable sort leaves the agents in their catalog order
+rather than in a special case; Agency's own rows still lead, which is already
+where `merge_catalog` puts them.
 
 The return type becomes `Vec<&SlashCommandCompletion>` because sorting cannot be
 lazy. Callers use `.iter()`, `.len()`, and `.get(selected)` in place of the
@@ -63,23 +65,26 @@ iterator methods they use now.
 
 ### Call sites
 
-Five, all mechanical. Four already hold the focused agent and pass
-`Some(agent.provider)`:
+Only the order-sensitive callers need the parameter. `tab_completion` takes it
+and forwards it, because it accepts a row *by index*. `completion_count`,
+`shared_completion_prefix`, and `SlashCompletionState::refresh` only count or
+fold over the whole match set, so ordering cannot change their results: they
+keep their current signatures and pass `None` internally. That keeps roughly
+twenty existing test call sites untouched and says something true about those
+functions rather than threading a parameter they ignore.
 
-- the Enter handler in `main.rs`, inside its `active_agent()` closure
+Three call sites in `main.rs`, all mechanical, all already holding the focused
+agent:
+
+- the Enter handler, inside its `active_agent()` closure
 - the completion list in the agent view, inside `if let Some(agent) =
   self.active_agent()`
-- `slash_completion_count`
 - `TabCompleteSlashCommand`, which currently pulls only the prompt out of
   `active_agent()` and pulls the provider alongside it
 
-The fifth is `SlashCompletionState::refresh`, which gains the parameter and
-receives it from `refresh_slash_completions`. That caller already does
-`self.active_agent().map(...).unwrap_or_default()` for the prompt and extends
-the same expression to carry `Option<Provider>`.
-
-`completion_count` and `tab_completion` forward the parameter through to
-`slash_command_completions`.
+`AgentView` has no `provider` field; the focused agent's provider is
+`agent.session.provider()` — the same expression the submit path already feeds
+to `command_needs_agent_switch`.
 
 ### What does not change
 
@@ -105,17 +110,25 @@ Codex and one Claude command that all match the same input:
   cannot pass
 - two commands from the same provider keep their catalog order, pinning the
   stability guarantee
-- `active: None` yields the pre-change order
+- `active: None` leaves the agents in catalog order
 - `tab_completion` with `selected: 0` accepts the focused agent's row rather
   than the other agent's
 
-**`main.rs`**, at the reducer level:
+**`main.rs`**:
 
-- with a catalog spanning both providers, `SelectAgent` flips which command the
-  Enter handler resolves at index 0
+- for a catalog spanning both providers and either agent focused, every row
+  offered above the first one that would reroute is a row that needs no
+  switch — the ranking and `command_needs_agent_switch` agree
 
-The ordering is only useful if it follows a live agent switch, so that last test
-is what pins the requirement end to end.
+Ranking and routing are separate decisions that know nothing about each other.
+If they disagree, the top of the list stops meaning "the agent you are talking
+to" and Enter starts committing a row that silently switches agents, so that
+agreement is what needs pinning.
+
+A test driving `SelectAgent` end to end is not possible: `select_agent` with no
+session calls `start_agent`, which spawns a real `codex`/`claude` process, and
+every `Session` constructor in `agency-agents` does the same, so no test can
+hold an `AgentView`. `Agency::for_testing` exists precisely to avoid that.
 
 Existing `SlashCompletionState` tests are unaffected beyond the added parameter;
 the state machine itself does not change.
