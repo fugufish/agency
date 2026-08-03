@@ -602,9 +602,12 @@ mod tests {
     /// One write has to cover every worktree, which is why the rule goes in
     /// the common directory rather than in each checkout — and it has to cover
     /// everything Agency writes, since one untracked file is enough for
-    /// `git worktree remove` to refuse forever. The primary is asserted too:
-    /// without the `.agency/worktrees/` rule it reports `?? .agency/`, and
-    /// `git add -A` stages the checkout as an embedded repository.
+    /// `git worktree remove` to refuse forever. The primary is asserted too,
+    /// for the two things that only appear there: without the
+    /// `.agency/worktrees/` rule it reports `?? .agency/` and `git add -A`
+    /// stages the checkout as an embedded repository, and without the
+    /// `.agency/legacy-sessions/` rule the same command commits the history the
+    /// startup migration parked.
     #[test]
     fn ignore_rules_apply_inside_a_linked_worktree() {
         let root = repository_without_ignore_rules("exclude-linked");
@@ -631,6 +634,17 @@ mod tests {
             "nothing Agency writes may read as untracked inside the worktree: {}",
             String::from_utf8_lossy(&output.stdout)
         );
+
+        // Where the startup migration parks history it cannot attribute to a
+        // live worktree. It only ever appears under the primary, so this is the
+        // only status that can see it.
+        let parked = root
+            .join(".agency")
+            .join("legacy-sessions")
+            .join("old-branch")
+            .join("sessions");
+        std::fs::create_dir_all(&parked).unwrap();
+        std::fs::write(parked.join("session.json"), "{}").unwrap();
 
         let primary = Command::new("git")
             .args(["status", "--porcelain"])

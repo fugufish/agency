@@ -336,12 +336,15 @@ const LEGACY_SESSIONS_DIRECTORY: &str = "legacy-sessions";
 /// name a future worktree cannot have — `create` refuses a path that already
 /// exists, permanently, for a path the user never sees.
 ///
-/// Runs against the **primary** worktree, which `worktrees[0]` always is: git
-/// reports the primary first, and the discovery fallback in `build` yields a
-/// single entry. Taking the list rather than a path is what keys the migration
-/// to the primary no matter which worktree Agency was launched from; passing
-/// the active worktree instead would look in the wrong repository root, find
-/// nothing, and strand the history behind the destination-exists guard.
+/// Runs against `worktrees[0]`, which git reports as the primary. When
+/// discovery fails, `build` falls back to a single entry for the launch
+/// directory, which may be a linked worktree rather than the primary; that
+/// costs nothing, because a linked worktree has no `.agency/worktrees` to read
+/// and the walk ends immediately. Taking the list rather than a path is what
+/// keys the migration to the primary no matter which worktree Agency was
+/// launched from; passing the active worktree instead would look in the wrong
+/// repository root, find nothing, and strand the history behind the
+/// destination-exists guard.
 ///
 /// Every entry under `.agency/worktrees/` that is not a live checkout and that
 /// holds a `sessions/` directory is claimed:

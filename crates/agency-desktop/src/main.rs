@@ -2435,11 +2435,10 @@ impl Agency {
     /// writer of that field after startup, and it drops a single tab rather
     /// than replacing the list; `select_worktree` moves `active_worktree`
     /// alone, always in lockstep with `cwd`. This is the one writer that can
-    /// leave the two diverged, when `cwd` is absent from the incoming list.
-    /// An empty list is refused
-    /// rather than rendered: git always reports at least the primary, so an
-    /// empty result means the query failed, and dropping every tab would leave
-    /// nothing to switch back to.
+    /// leave the two diverged, when `cwd` is absent from the incoming list. An
+    /// empty list is refused rather than rendered: git always reports at least
+    /// the primary, so an empty result means the query failed, and dropping
+    /// every tab would leave nothing to switch back to.
     fn worktrees_discovered(&mut self, worktrees: Vec<Worktree>) {
         if worktrees.is_empty() {
             return;
