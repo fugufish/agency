@@ -7841,6 +7841,7 @@ mod tests {
         });
 
         assert_eq!(agency.worktrees.len(), 1);
+        assert_eq!(agency.worktrees[0].path, primary);
         assert_eq!(agency.active_worktree, 0);
         assert_eq!(agency.cwd, primary);
         assert!(agency.drain_events().is_empty());
@@ -7867,6 +7868,7 @@ mod tests {
         });
 
         assert_eq!(agency.worktrees.len(), 1);
+        assert_eq!(agency.worktrees[0].path, primary);
         assert!(
             agency
                 .drain_events()
@@ -7896,6 +7898,7 @@ mod tests {
         let _ = agency.reduce_event(AppEvent::WorktreeRemoved { worktree: removed });
 
         assert_eq!(agency.worktrees.len(), 1);
+        assert_eq!(agency.worktrees[0].path, root);
 
         std::fs::remove_dir_all(root).unwrap();
     }
