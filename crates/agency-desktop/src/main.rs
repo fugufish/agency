@@ -7187,6 +7187,42 @@ mod tests {
         assert_eq!(init.provider, None);
     }
 
+    /// The rows offered first must be exactly the ones that will not be
+    /// rerouted. Ranking and `command_needs_agent_switch` are separate
+    /// decisions; if they ever disagree, the top of the list stops meaning
+    /// "the agent you are talking to" and Enter starts committing a row that
+    /// silently switches agents.
+    #[test]
+    fn the_commands_offered_first_are_the_ones_that_need_no_switch() {
+        let catalog = slash_commands::merge_catalog(vec![
+            (Provider::Claude, agent_command("superpowers:brainstorming")),
+            (Provider::Codex, agent_command("review")),
+        ]);
+
+        for active in [Provider::Codex, Provider::Claude] {
+            let mut seen_a_switch = false;
+            for completion in slash_command_completions(&catalog, "/", Some(active)) {
+                let Some(owner) = completion.provider else {
+                    assert!(
+                        !seen_a_switch,
+                        "Agency's own commands must lead, but {} came after an agent's",
+                        completion.command
+                    );
+                    continue;
+                };
+                if command_needs_agent_switch(active, owner) {
+                    seen_a_switch = true;
+                } else {
+                    assert!(
+                        !seen_a_switch,
+                        "{} needs no switch but was listed below one that does",
+                        completion.command
+                    );
+                }
+            }
+        }
+    }
+
     // `slash_commands::tests::agency_commands_are_always_offered` and
     // `a_translator_command_keeps_its_invocation_and_origin` already cover
     // `merge_catalog`'s pure behavior (agency commands always present, agent
