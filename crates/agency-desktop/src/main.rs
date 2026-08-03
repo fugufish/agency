@@ -9,6 +9,7 @@ mod terminal;
 mod ui_theme;
 mod worktrees;
 
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::path::PathBuf;
@@ -5639,6 +5640,17 @@ fn next_provider(provider: Provider) -> Provider {
     }
 }
 
+/// The prompt model treats `'\n'` as the only line break, because every motion
+/// helper splits on it. Platforms hand us `"\r\n"` from a paste and `"\r"` from
+/// the Enter key, so text is normalized at the one point where it enters the
+/// model rather than at each of the places that read it.
+fn normalize_newlines(text: &str) -> Cow<'_, str> {
+    if !text.contains('\r') {
+        return Cow::Borrowed(text);
+    }
+    Cow::Owned(text.replace("\r\n", "\n").replace('\r', "\n"))
+}
+
 fn clamped_prompt_cursor(text: &str, cursor: usize) -> usize {
     let mut cursor = cursor.min(text.len());
     while !text.is_char_boundary(cursor) {
@@ -5868,9 +5880,10 @@ impl AgentView {
     }
 
     fn insert_prompt_text(&mut self, text: &str) {
+        let text = normalize_newlines(text);
         self.delete_prompt_selection();
         let cursor = clamped_prompt_cursor(&self.prompt, self.prompt_cursor);
-        self.prompt.insert_str(cursor, text);
+        self.prompt.insert_str(cursor, &text);
         self.prompt_cursor = cursor + text.len();
     }
 
@@ -6565,6 +6578,16 @@ mod tests {
         assert_eq!(clamped_prompt_cursor("", 7), 0);
         assert_eq!(clamped_prompt_cursor("héllo", 99), "héllo".len());
         assert_eq!(clamped_prompt_cursor("héllo", 2), 1);
+    }
+
+    /// Every motion helper splits lines on `'\n'`, so a `'\r'` that reaches the
+    /// model is a line break nothing can see. Normalizing at the single point
+    /// where text enters the prompt is what makes that invariant hold.
+    #[test]
+    fn text_entering_the_prompt_normalizes_every_line_break_to_a_newline() {
+        assert_eq!(normalize_newlines("a\r\nb\rc"), "a\nb\nc");
+        assert_eq!(normalize_newlines("already\nfine"), "already\nfine");
+        assert_eq!(normalize_newlines("no breaks"), "no breaks");
     }
 
     #[test]

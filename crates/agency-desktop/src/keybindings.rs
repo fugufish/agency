@@ -985,6 +985,10 @@ impl Keybindings {
                     Action::None
                 }
                 Key::Named(Named::Enter) if !modifiers.shift() => Action::AgentSubmit,
+                // Shift+Enter would otherwise fall through to `printable_text`,
+                // which returns the platform's text for the key — `"\r"` — and
+                // no motion helper recognizes that as a line break.
+                Key::Named(Named::Enter) => Action::AgentAppend("\n".to_owned()),
                 Key::Named(Named::Backspace) => Action::AgentBackspace,
                 _ if !modifiers.control()
                     && !modifiers.logo()
@@ -2083,6 +2087,28 @@ mod tests {
         );
 
         assert!(matches!(action, Action::AgentAppend(text) if text == "h"));
+        assert_eq!(bindings.mode_label(), "INSERT");
+    }
+
+    /// Shift+Enter must produce a newline the motion helpers recognize. Left to
+    /// the printable-text fallthrough it produces the platform's text for the
+    /// key — `"\r"` — which nothing downstream treats as a line break.
+    #[test]
+    fn shift_enter_inserts_a_newline_rather_than_submitting() {
+        let mut bindings = Keybindings {
+            mode: Mode::Insert,
+            ..Keybindings::default()
+        };
+
+        let action = bindings.handle_in_context(
+            &Key::Named(Named::Enter),
+            Physical::Code(Code::Enter),
+            Modifiers::SHIFT,
+            Some("\r"),
+            DispatchContext::focused(KeybindingContext::Composer),
+        );
+
+        assert_eq!(action, Action::AgentAppend("\n".to_owned()));
         assert_eq!(bindings.mode_label(), "INSERT");
     }
 
