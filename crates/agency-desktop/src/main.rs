@@ -1299,13 +1299,17 @@ impl Agency {
             }
             AppEvent::ComposerPromptChanged => self.refresh_slash_completions(),
             AppEvent::TabCompleteSlashCommand => {
-                let Some(prompt) = self.active_agent().map(|agent| agent.prompt.clone()) else {
+                let Some((prompt, active)) = self
+                    .active_agent()
+                    .map(|agent| (agent.prompt.clone(), agent.session.provider()))
+                else {
                     return Task::none();
                 };
                 match tab_completion(
                     &self.slash_command_catalog,
                     &prompt,
                     self.overlays.slash.selected(),
+                    Some(active),
                 ) {
                     Some(TabCompletion::Fill(prefix)) => {
                         if let Some(agent) = self.active_agent_mut() {
@@ -1584,10 +1588,15 @@ impl Agency {
                         keyboard::Key::Named(keyboard::key::Named::Enter)
                     ) {
                         let completion = self.active_agent().and_then(|agent| {
-                            slash_command_completions(&self.slash_command_catalog, &agent.prompt)
-                                .nth(self.overlays.slash.selected())
-                                .filter(|completion| completion.insertion != agent.prompt)
-                                .cloned()
+                            slash_command_completions(
+                                &self.slash_command_catalog,
+                                &agent.prompt,
+                                Some(agent.session.provider()),
+                            )
+                            .into_iter()
+                            .nth(self.overlays.slash.selected())
+                            .filter(|completion| completion.insertion != agent.prompt)
+                            .cloned()
                         });
                         match completion {
                             Some(completion) => {
@@ -2526,6 +2535,10 @@ impl Agency {
                     plugin_installs: TranscriptInstalls::default(),
                 });
                 self.active_agent = Some(self.agents.len() - 1);
+                // The completion ranking depends on the focused agent's
+                // provider, so a highlighted row that survived the switch
+                // could silently point at a different command.
+                self.overlays.slash.close();
                 self.emit(AppEvent::TerminalVisibilityChanged(false));
                 self.emit(AppEvent::EnterComposer);
                 self.notice = None;
@@ -2666,6 +2679,9 @@ impl Agency {
             self.toolbar.selected_session = index;
             self.selected_agent = self.agents[running_index].session.provider();
             self.active_agent = Some(running_index);
+            // Same reasoning as `start_agent`: the focused agent just
+            // changed, so a highlighted completion row cannot be trusted.
+            self.overlays.slash.close();
             self.emit(AppEvent::TerminalVisibilityChanged(false));
             self.notice = None;
             return;
@@ -2737,6 +2753,9 @@ impl Agency {
                     plugin_installs: TranscriptInstalls::default(),
                 });
                 self.active_agent = Some(self.agents.len() - 1);
+                // Same reasoning as `start_agent`: the focused agent just
+                // changed, so a highlighted completion row cannot be trusted.
+                self.overlays.slash.close();
                 self.emit(AppEvent::TerminalVisibilityChanged(false));
                 self.notice = None;
             }
@@ -2857,6 +2876,10 @@ impl Agency {
         agent.transcript_dirty = true;
 
         self.active_agent = Some(index);
+        // The completion ranking follows the focused agent's provider, and
+        // that provider just changed under this same index, so a highlighted
+        // row would silently point at a different command.
+        self.overlays.slash.close();
         if let Some(session) = self
             .sessions
             .records()
@@ -3696,53 +3719,58 @@ impl Agency {
             if let Some(question) = question {
                 content = content.push(question).push(rule::horizontal(1));
             }
-            let completions = slash_command_completions(&self.slash_command_catalog, &agent.prompt)
-                .enumerate()
-                .fold(column![].spacing(4), |completions, (index, completion)| {
-                    let provider_tag: Element<'_, AppEvent> = completion.provider.map_or_else(
-                        || {
-                            container(text("AGENCY").size(10))
-                                .padding([2, 6])
-                                .style(|_theme: &Theme| ui_theme::agent_type_badge(true))
-                                .into()
-                        },
-                        |provider| {
-                            let label = if completion.built_in {
-                                format!("BUILT-IN · {}", provider.label().to_uppercase())
-                            } else {
-                                provider.label().to_uppercase()
-                            };
-                            container(text(label).size(10))
-                                .padding([2, 6])
-                                .style(move |_theme: &Theme| {
-                                    ui_theme::agent_type_badge(provider == Provider::Codex)
-                                })
-                                .into()
-                        },
-                    );
-                    completions.push(
-                        button(
-                            row![
-                                provider_tag,
-                                text(&completion.command).font(Font::MONOSPACE).size(14),
-                                text(&completion.description).size(12),
-                            ]
-                            .spacing(16)
-                            .align_y(iced::Alignment::Center),
-                        )
-                        .on_press(AppEvent::CompleteSlashCommand(
-                            completion.insertion.clone(),
-                            completion.provider,
-                        ))
-                        .width(Fill)
-                        .style(move |_theme: &Theme, status| {
-                            ui_theme::slash_command_button(
-                                index == self.overlays.slash.selected(),
-                                status,
-                            )
-                        }),
+            let completions = slash_command_completions(
+                &self.slash_command_catalog,
+                &agent.prompt,
+                Some(agent.session.provider()),
+            )
+            .into_iter()
+            .enumerate()
+            .fold(column![].spacing(4), |completions, (index, completion)| {
+                let provider_tag: Element<'_, AppEvent> = completion.provider.map_or_else(
+                    || {
+                        container(text("AGENCY").size(10))
+                            .padding([2, 6])
+                            .style(|_theme: &Theme| ui_theme::agent_type_badge(true))
+                            .into()
+                    },
+                    |provider| {
+                        let label = if completion.built_in {
+                            format!("BUILT-IN · {}", provider.label().to_uppercase())
+                        } else {
+                            provider.label().to_uppercase()
+                        };
+                        container(text(label).size(10))
+                            .padding([2, 6])
+                            .style(move |_theme: &Theme| {
+                                ui_theme::agent_type_badge(provider == Provider::Codex)
+                            })
+                            .into()
+                    },
+                );
+                completions.push(
+                    button(
+                        row![
+                            provider_tag,
+                            text(&completion.command).font(Font::MONOSPACE).size(14),
+                            text(&completion.description).size(12),
+                        ]
+                        .spacing(16)
+                        .align_y(iced::Alignment::Center),
                     )
-                });
+                    .on_press(AppEvent::CompleteSlashCommand(
+                        completion.insertion.clone(),
+                        completion.provider,
+                    ))
+                    .width(Fill)
+                    .style(move |_theme: &Theme, status| {
+                        ui_theme::slash_command_button(
+                            index == self.overlays.slash.selected(),
+                            status,
+                        )
+                    }),
+                )
+            });
             if self.overlays.slash.is_open()
                 && completion_count(&self.slash_command_catalog, &agent.prompt) > 0
             {
@@ -7171,6 +7199,42 @@ mod tests {
             .find(|completion| completion.command == "/init")
             .expect("Agency's own commands are always listed");
         assert_eq!(init.provider, None);
+    }
+
+    /// The rows offered first must be exactly the ones that will not be
+    /// rerouted. Ranking and `command_needs_agent_switch` are separate
+    /// decisions; if they ever disagree, the top of the list stops meaning
+    /// "the agent you are talking to" and Enter starts committing a row that
+    /// silently switches agents.
+    #[test]
+    fn the_commands_offered_first_are_the_ones_that_need_no_switch() {
+        let catalog = slash_commands::merge_catalog(vec![
+            (Provider::Claude, agent_command("superpowers:brainstorming")),
+            (Provider::Codex, agent_command("review")),
+        ]);
+
+        for active in [Provider::Codex, Provider::Claude] {
+            let mut seen_a_switch = false;
+            for completion in slash_command_completions(&catalog, "/", Some(active)) {
+                let Some(owner) = completion.provider else {
+                    assert!(
+                        !seen_a_switch,
+                        "Agency's own commands must lead, but {} came after an agent's",
+                        completion.command
+                    );
+                    continue;
+                };
+                if command_needs_agent_switch(active, owner) {
+                    seen_a_switch = true;
+                } else {
+                    assert!(
+                        !seen_a_switch,
+                        "{} needs no switch but was listed below one that does",
+                        completion.command
+                    );
+                }
+            }
+        }
     }
 
     // `slash_commands::tests::agency_commands_are_always_offered` and
