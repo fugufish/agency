@@ -15,6 +15,27 @@ Worktrees may isolate concurrent tasks, while repository instructions and the
 current worktree state remain authoritative. Follow the closest `AGENTS.md`,
 report blockers clearly, and do not overwrite unrelated work.
 
+## Provider-neutral resolution
+
+- The harness must not hardcode any provider's surface syntax. Command sigils,
+  invocation grammar, prompt file formats, and naming conventions belong to
+  that provider's translator and reach the harness only as data on translator
+  API types, such as `AgentCommand.invocation`.
+- Agency owns one neutral surface the user types against. `/` is Agency's
+  command sigil no matter what an agent uses natively; the translator maps it
+  to and from the provider's native form.
+- Any code that resolves a user action to an agent — commands, skills, prompts,
+  MCP entries, sessions, worktrees — must decide from translator-supplied data,
+  never from a literal sigil or a `match` on which provider it is. Adding an
+  agent should mean adding a translator, not editing resolution logic.
+- Cover each resolution path with a test using a fabricated provider whose
+  syntax matches no shipped agent, so a hardcoded assumption fails a test
+  instead of the next integration.
+
+This is scoped to resolution and syntax, not to the existence of the `Provider`
+enum, which the harness legitimately matches on elsewhere — mapping a provider
+to its translator ID, or wiring each agent's process at startup.
+
 ## UI color and theming
 
 - All fixed application colors must come from

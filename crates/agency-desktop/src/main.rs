@@ -9,8 +9,10 @@ mod terminal;
 mod ui_theme;
 mod worktrees;
 
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
+use std::ops::Range;
 use std::path::PathBuf;
 use std::process::Command;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -55,14 +57,20 @@ use plugins::{PluginInstallEntry, PluginInstallEvent, PluginInstalls, Transcript
 use sessions::{SessionRegistry, name_from_prompt, new_conversation_id};
 use slash_commands::{
     ComposerState, INIT_AGENT_PROMPT, SlashCommand, SlashCommandCompletion, SlashCompletionState,
-    TabCompletion, agency_commands, completion_count, discover_agent_commands,
-    initialize_workspace, load_codex_mcp, merge_catalog, parse_slash_command,
+    Submission, TabCompletion, agency_commands, completion_count, discover_agent_commands,
+    initialize_workspace, load_codex_mcp, merge_catalog, resolve_submission,
     slash_command_completions, tab_completion,
 };
 use terminal::TerminalSession;
 use worktrees::Worktree;
 
 const AGENT_TRANSCRIPT_ID: &str = "agent-transcript";
+/// Shared by both places `submit_agent_input` rejects an image alongside a
+/// command already bound to an agent: a slash command typed and resolved
+/// against the catalog, and one accepted from the overlay or Tab-filled, so
+/// `command_provider` was already set before Enter was pressed.
+const AGENT_COMMAND_IMAGE_ATTACHMENT_NOTICE: &str =
+    "Agent slash commands and skills cannot include image attachments";
 const FOCUS_TOOLBAR: FocusId = FocusId(0);
 const FOCUS_EXPLORER: FocusId = FocusId(1);
 const FOCUS_WORKSPACE: FocusId = FocusId(2);
@@ -1285,7 +1293,7 @@ impl Agency {
             }
             AppEvent::CompleteSlashCommand(insertion, provider) => {
                 if let Some(agent) = self.active_agent_mut() {
-                    agent.prompt = insertion;
+                    agent.prompt = normalized_prompt(insertion);
                     agent.prompt_selected = false;
                     agent.prompt_cursor = agent.prompt.len();
                     agent.prompt_selection_anchor = None;
@@ -1313,7 +1321,7 @@ impl Agency {
                 ) {
                     Some(TabCompletion::Fill(prefix)) => {
                         if let Some(agent) = self.active_agent_mut() {
-                            agent.prompt = prefix;
+                            agent.prompt = normalized_prompt(prefix);
                             agent.prompt_selected = false;
                             agent.prompt_cursor = agent.prompt.len();
                             agent.prompt_selection_anchor = None;
@@ -2033,6 +2041,40 @@ impl Agency {
         }
     }
 
+    /// Sends `prompt` to `provider`, switching agents first when it belongs to
+    /// the one that is not focused. An accepted completion and a resolved
+    /// submission share this, because they must route identically: the only
+    /// difference between them is how the provider was learned.
+    fn route_agent_command(&mut self, provider: Provider, prompt: String) {
+        if self
+            .active_agent()
+            .is_some_and(|agent| command_needs_agent_switch(agent.session.provider(), provider))
+        {
+            self.start_agent(provider);
+            if !self
+                .active_agent()
+                .is_some_and(|agent| agent.session.provider() == provider)
+            {
+                return;
+            }
+        }
+        // Set unconditionally: a resolved submission rewrites the token to the
+        // entry's own insertion, so the composer's text is not what should be
+        // sent even when no switch happened.
+        if let Some(agent) = self.active_agent_mut() {
+            agent.prompt = normalized_prompt(prompt);
+            agent.prompt_cursor = agent.prompt.len();
+            agent.prompt_selection_anchor = None;
+            agent.command_provider = Some(provider);
+        }
+        let submitted = self.active_agent_mut().and_then(AgentView::submit);
+        if let Some((provider, id, name)) = submitted
+            && let Err(error) = self.sessions.name_if_missing(provider, &id, name)
+        {
+            self.notice = Some(error);
+        }
+    }
+
     fn submit_agent_input(&mut self) {
         let Some(agent) = self.active_agent() else {
             return;
@@ -2042,39 +2084,20 @@ impl Agency {
         let command_provider = agent.command_provider;
         if let Some(provider) = command_provider {
             if has_images {
-                self.notice = Some(
-                    "Agent slash commands and skills cannot include image attachments".to_owned(),
-                );
+                self.notice = Some(AGENT_COMMAND_IMAGE_ATTACHMENT_NOTICE.to_owned());
                 return;
             }
-            if command_needs_agent_switch(agent.session.provider(), provider) {
-                self.start_agent(provider);
-                if !self
-                    .active_agent()
-                    .is_some_and(|agent| agent.session.provider() == provider)
-                {
-                    return;
-                }
-                if let Some(agent) = self.active_agent_mut() {
-                    agent.prompt = prompt;
-                    agent.prompt_cursor = agent.prompt.len();
-                    agent.prompt_selection_anchor = None;
-                    agent.command_provider = Some(provider);
-                }
-            }
-            let submitted = self.active_agent_mut().and_then(AgentView::submit);
-            if let Some((provider, id, name)) = submitted
-                && let Err(error) = self.sessions.name_if_missing(provider, &id, name)
-            {
-                self.notice = Some(error);
-            }
+            self.route_agent_command(provider, prompt);
             return;
         }
-        match parse_slash_command(&prompt) {
-            Ok(Some(_command)) if has_images => {
+
+        let active = self.active_agent().map(|agent| agent.session.provider());
+        match resolve_submission(&self.slash_command_catalog, &prompt, active) {
+            Err(error) => self.notice = Some(error),
+            Ok(Submission::Agency(_)) if has_images => {
                 self.notice = Some("Slash commands cannot include image attachments".to_owned());
             }
-            Ok(Some(command)) => {
+            Ok(Submission::Agency(command)) => {
                 if let Err(error) = self.run_slash_command(command) {
                     self.notice = Some(error);
                     return;
@@ -2083,7 +2106,14 @@ impl Agency {
                     agent.clear_prompt();
                 }
             }
-            Ok(None) => {
+            Ok(Submission::Agent { provider, prompt }) => {
+                if has_images {
+                    self.notice = Some(AGENT_COMMAND_IMAGE_ATTACHMENT_NOTICE.to_owned());
+                    return;
+                }
+                self.route_agent_command(provider, prompt);
+            }
+            Ok(Submission::Verbatim) => {
                 let submitted = self.active_agent_mut().and_then(AgentView::submit);
                 if let Some((provider, id, name)) = submitted
                     && let Err(error) = self.sessions.name_if_missing(provider, &id, name)
@@ -2091,7 +2121,6 @@ impl Agency {
                     self.notice = Some(error);
                 }
             }
-            Err(error) => self.notice = Some(error),
         }
     }
 
@@ -5639,12 +5668,48 @@ fn next_provider(provider: Provider) -> Provider {
     }
 }
 
+/// The prompt model treats `'\n'` as the only line break, because every motion
+/// helper splits on it. Platforms hand us `"\r\n"` from a paste and `"\r"` from
+/// the Enter key, so text is normalized at the one point where it enters the
+/// model rather than at each of the places that read it.
+fn normalize_newlines(text: &str) -> Cow<'_, str> {
+    if !text.contains('\r') {
+        return Cow::Borrowed(text);
+    }
+    Cow::Owned(text.replace("\r\n", "\n").replace('\r', "\n"))
+}
+
 fn clamped_prompt_cursor(text: &str, cursor: usize) -> usize {
     let mut cursor = cursor.min(text.len());
     while !text.is_char_boundary(cursor) {
         cursor -= 1;
     }
     cursor
+}
+
+/// Inserts `text` at `cursor`, normalized, and returns the cursor position
+/// after it. Split out from `AgentView::insert_prompt_text` because the
+/// arithmetic is what breaks — a cursor computed from the pre-normalized
+/// length lands short by one per `\r` stripped — and `AgentView` owns a
+/// spawned session, so it cannot be built in a test.
+fn insert_normalized(prompt: &mut String, cursor: usize, text: &str) -> usize {
+    let text = normalize_newlines(text);
+    prompt.insert_str(cursor, &text);
+    cursor + text.len()
+}
+
+/// Normalizes `text` for a wholesale prompt replacement, without paying for a
+/// clone when there is nothing to normalize. Every other path that carries
+/// external text into the prompt goes through `insert_prompt_text`, which
+/// normalizes; the completion, tab-fill, and resolved-submission paths
+/// replace the prompt outright instead of inserting into it, so they need
+/// this to hold the same invariant against a translator that hands back a
+/// `\r`.
+fn normalized_prompt(text: String) -> String {
+    match normalize_newlines(&text) {
+        Cow::Borrowed(_) => text,
+        Cow::Owned(normalized) => normalized,
+    }
 }
 
 fn previous_char_boundary(text: &str, cursor: usize) -> usize {
@@ -5774,11 +5839,78 @@ fn composer_operation_range(
     (start < end).then_some((start, end))
 }
 
+/// The height of one composer line, matched to the block cursor so a blank
+/// line keeps its vertical space instead of collapsing.
+const COMPOSER_LINE_HEIGHT: f32 = 17.0;
+
+/// One drawn piece of a composer line.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PromptSpan {
+    Cursor,
+    Text { range: Range<usize>, selected: bool },
+}
+
+/// The composer laid out one row per line.
+///
+/// Splitting uses `split('\n')` rather than `lines()`, which drops a trailing
+/// empty line and would leave a cursor after a final newline with nowhere to
+/// draw. Line boundaries stay unambiguous because the `'\n'` occupies a byte:
+/// `cursor == line_end` is the end of one line, and `cursor == line_start` is
+/// the start of the next, so exactly one line claims the cursor.
+fn composer_lines(
+    prompt: &str,
+    cursor: usize,
+    selection: Option<(usize, usize)>,
+) -> Vec<Vec<PromptSpan>> {
+    let mut lines = Vec::new();
+    let mut line_start = 0;
+    for line in prompt.split('\n') {
+        let line_end = line_start + line.len();
+        let span = line_start..=line_end;
+        let mut boundaries = vec![line_start, line_end];
+        if span.contains(&cursor) {
+            boundaries.push(cursor);
+        }
+        if let Some((start, end)) = selection {
+            boundaries.extend(
+                [start, end]
+                    .into_iter()
+                    .filter(|bound| span.contains(bound)),
+            );
+        }
+        boundaries.sort_unstable();
+        boundaries.dedup();
+
+        let mut spans = Vec::new();
+        for window in boundaries.windows(2) {
+            let (start, end) = (window[0], window[1]);
+            if start == cursor {
+                spans.push(PromptSpan::Cursor);
+            }
+            let selected = selection.is_some_and(|(selection_start, selection_end)| {
+                start >= selection_start && end <= selection_end
+            });
+            spans.push(PromptSpan::Text {
+                range: start..end,
+                selected,
+            });
+        }
+        // A cursor at the very end of a line closes no window, so it is pushed
+        // here rather than by the loop above.
+        if cursor == line_end {
+            spans.push(PromptSpan::Cursor);
+        }
+        lines.push(spans);
+        line_start = line_end + 1;
+    }
+    lines
+}
+
 fn composer_prompt(agent: &AgentView, cursor_visible: bool) -> Element<'_, AppEvent> {
     let cursor = || -> Element<'_, AppEvent> {
         container(text(" ").font(Font::MONOSPACE).size(14))
             .width(Length::Fixed(8.0))
-            .height(Length::Fixed(17.0))
+            .height(Length::Fixed(COMPOSER_LINE_HEIGHT))
             .style(move |_theme: &Theme| {
                 if cursor_visible {
                     ui_theme::block_cursor()
@@ -5800,44 +5932,28 @@ fn composer_prompt(agent: &AgentView, cursor_visible: bool) -> Element<'_, AppEv
         .into();
     }
 
-    let selection = agent.prompt_selection();
-    let mut boundaries = vec![0, agent.prompt_cursor, agent.prompt.len()];
-    if let Some((start, end)) = selection {
-        boundaries.extend([start, end]);
-    }
-    boundaries.sort_unstable();
-    boundaries.dedup();
-
-    let mut prompt = iced::widget::Row::new().spacing(0);
-    for window in boundaries.windows(2) {
-        let start = window[0];
-        let end = window[1];
-        if start == agent.prompt_cursor {
-            prompt = prompt.push(cursor());
-        }
-        if start == end {
-            continue;
-        }
-        let selected = selection.is_some_and(|(selection_start, selection_end)| {
-            start >= selection_start && end <= selection_end
-        });
-        prompt = prompt.push(
-            container(
-                text(&agent.prompt[start..end])
-                    .font(Font::MONOSPACE)
-                    .size(14),
-            )
-            .style(move |_theme: &Theme| {
-                if selected {
-                    ui_theme::text_selection()
-                } else {
-                    container::Style::default()
+    let mut prompt = iced::widget::Column::new();
+    for spans in composer_lines(&agent.prompt, agent.prompt_cursor, agent.prompt_selection()) {
+        let mut line = iced::widget::Row::new()
+            .spacing(0)
+            .height(Length::Fixed(COMPOSER_LINE_HEIGHT));
+        for span in spans {
+            line = line.push(match span {
+                PromptSpan::Cursor => cursor(),
+                PromptSpan::Text { range, selected } => {
+                    container(text(&agent.prompt[range]).font(Font::MONOSPACE).size(14))
+                        .style(move |_theme: &Theme| {
+                            if selected {
+                                ui_theme::text_selection()
+                            } else {
+                                container::Style::default()
+                            }
+                        })
+                        .into()
                 }
-            }),
-        );
-    }
-    if agent.prompt_cursor == agent.prompt.len() {
-        prompt = prompt.push(cursor());
+            });
+        }
+        prompt = prompt.push(line);
     }
     prompt.into()
 }
@@ -5870,8 +5986,7 @@ impl AgentView {
     fn insert_prompt_text(&mut self, text: &str) {
         self.delete_prompt_selection();
         let cursor = clamped_prompt_cursor(&self.prompt, self.prompt_cursor);
-        self.prompt.insert_str(cursor, text);
-        self.prompt_cursor = cursor + text.len();
+        self.prompt_cursor = insert_normalized(&mut self.prompt, cursor, text);
     }
 
     fn clear_prompt(&mut self) {
@@ -6545,6 +6660,104 @@ mod tests {
     use super::*;
     use agency_translator_api::commands::AgentCommand;
 
+    /// The cursor has to sit on the line and column the byte offset names. Drawn
+    /// from a single row, as it was, it landed at a horizontal offset that ignored
+    /// every line break before it.
+    #[test]
+    fn the_composer_cursor_lands_on_its_own_line_and_column() {
+        assert_eq!(
+            composer_lines("abc\ndef", 5, None),
+            vec![
+                vec![PromptSpan::Text {
+                    range: 0..3,
+                    selected: false
+                }],
+                vec![
+                    PromptSpan::Text {
+                        range: 4..5,
+                        selected: false
+                    },
+                    PromptSpan::Cursor,
+                    PromptSpan::Text {
+                        range: 5..7,
+                        selected: false
+                    },
+                ],
+            ]
+        );
+    }
+
+    /// `str::lines` drops a trailing empty line, which would leave the cursor
+    /// after a final newline with nowhere to draw.
+    #[test]
+    fn a_trailing_newline_keeps_a_final_line_for_the_cursor() {
+        assert_eq!(
+            composer_lines("abc\n", 4, None),
+            vec![
+                vec![PromptSpan::Text {
+                    range: 0..3,
+                    selected: false
+                }],
+                vec![PromptSpan::Cursor],
+            ]
+        );
+    }
+
+    #[test]
+    fn a_blank_interior_line_still_occupies_a_row() {
+        let lines = composer_lines("a\n\nb", 0, None);
+
+        assert_eq!(lines.len(), 3);
+        assert_eq!(
+            lines[0],
+            vec![
+                PromptSpan::Cursor,
+                PromptSpan::Text {
+                    range: 0..1,
+                    selected: false
+                }
+            ]
+        );
+        assert!(lines[1].is_empty());
+    }
+
+    /// A selection crossing line breaks has to mark a partial first line, a whole
+    /// middle line, and a partial last line, with the newline itself drawing
+    /// nothing.
+    #[test]
+    fn a_selection_spanning_lines_marks_each_line_it_covers() {
+        assert_eq!(
+            composer_lines("one\ntwo\nthree", 9, Some((2, 9))),
+            vec![
+                vec![
+                    PromptSpan::Text {
+                        range: 0..2,
+                        selected: false
+                    },
+                    PromptSpan::Text {
+                        range: 2..3,
+                        selected: true
+                    },
+                ],
+                vec![PromptSpan::Text {
+                    range: 4..7,
+                    selected: true
+                }],
+                vec![
+                    PromptSpan::Text {
+                        range: 8..9,
+                        selected: true
+                    },
+                    PromptSpan::Cursor,
+                    PromptSpan::Text {
+                        range: 9..13,
+                        selected: false
+                    },
+                ],
+            ]
+        );
+    }
+
     #[test]
     fn event_bus_preserves_publish_order_for_follow_up_events() {
         let mut bus = EventBus::default();
@@ -6565,6 +6778,40 @@ mod tests {
         assert_eq!(clamped_prompt_cursor("", 7), 0);
         assert_eq!(clamped_prompt_cursor("héllo", 99), "héllo".len());
         assert_eq!(clamped_prompt_cursor("héllo", 2), 1);
+    }
+
+    /// Every motion helper splits lines on `'\n'`, so a `'\r'` that reaches the
+    /// model is a line break nothing can see. Normalizing at the single point
+    /// where text enters the prompt is what makes that invariant hold.
+    #[test]
+    fn text_entering_the_prompt_normalizes_every_line_break_to_a_newline() {
+        assert_eq!(normalize_newlines("a\r\nb\rc"), "a\nb\nc");
+        assert_eq!(normalize_newlines("already\nfine"), "already\nfine");
+        assert_eq!(normalize_newlines("no breaks"), "no breaks");
+    }
+
+    /// The arithmetic `insert_prompt_text` depends on: a cursor computed from
+    /// the pre-normalized length would land short by one per `\r` stripped, so
+    /// after inserting `"a\r\nb\rc"` into an empty prompt the cursor must sit
+    /// at the end of the normalized `"a\nb\nc"`, not the end of the original
+    /// six-byte string.
+    #[test]
+    fn insert_normalized_normalizes_and_advances_the_cursor_past_the_inserted_text() {
+        let mut prompt = String::new();
+        let cursor = insert_normalized(&mut prompt, 0, "a\r\nb\rc");
+        assert_eq!(prompt, "a\nb\nc");
+        assert_eq!(cursor, prompt.len());
+    }
+
+    /// A midstream insertion, so the returned cursor is not trivially the
+    /// whole string's length — it has to be the insertion point plus the
+    /// normalized text's own length.
+    #[test]
+    fn insert_normalized_advances_from_a_cursor_in_the_middle_of_existing_text() {
+        let mut prompt = "before after".to_owned();
+        let cursor = insert_normalized(&mut prompt, "before".len(), " middle");
+        assert_eq!(prompt, "before middle after");
+        assert_eq!(cursor, "before middle".len());
     }
 
     #[test]
@@ -7199,6 +7446,33 @@ mod tests {
             .find(|completion| completion.command == "/init")
             .expect("Agency's own commands are always listed");
         assert_eq!(init.provider, None);
+    }
+
+    /// Resolution and routing have to agree. The provider a resolved submission
+    /// names is the one `command_needs_agent_switch` is asked about, so if they
+    /// ever disagreed a command would either strand on the wrong agent or churn
+    /// between two. This also pins that the rewritten prompt is what gets sent.
+    #[test]
+    fn a_resolved_submission_names_the_agent_that_routing_will_switch_to() {
+        let catalog = slash_commands::merge_catalog(vec![(
+            Provider::Claude,
+            agent_command("superpowers:brainstorming"),
+        )]);
+
+        let resolved = slash_commands::resolve_submission(
+            &catalog,
+            "/brainstorming an idea",
+            Some(Provider::Codex),
+        )
+        .expect("a catalog command is not an Agency usage error");
+
+        let slash_commands::Submission::Agent { provider, prompt } = resolved else {
+            panic!("a catalog command must resolve to the agent that owns it");
+        };
+        assert_eq!(provider, Provider::Claude);
+        assert_eq!(prompt, "/superpowers:brainstorming an idea");
+        assert!(command_needs_agent_switch(Provider::Codex, provider));
+        assert!(!command_needs_agent_switch(Provider::Claude, provider));
     }
 
     /// The rows offered first must be exactly the ones that will not be
