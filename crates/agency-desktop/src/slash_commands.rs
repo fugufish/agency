@@ -143,16 +143,27 @@ fn completion_rank(completion: &SlashCommandCompletion, active: Option<Provider>
     }
 }
 
+/// The catalog entries `input` matches, in catalog order. This is the
+/// order-independent core both `slash_command_completions` and the
+/// order-independent callers (`completion_count`, `shared_completion_prefix`)
+/// build on, so counting or folding over matches never pays for a sort it
+/// discards.
+fn matching<'a>(
+    catalog: &'a [SlashCommandCompletion],
+    input: &str,
+) -> impl Iterator<Item = &'a SlashCommandCompletion> {
+    let input = input.trim_start();
+    catalog
+        .iter()
+        .filter(move |completion| matches(&completion.command, input))
+}
+
 pub fn slash_command_completions<'a>(
     catalog: &'a [SlashCommandCompletion],
-    input: &'a str,
+    input: &str,
     active: Option<Provider>,
 ) -> Vec<&'a SlashCommandCompletion> {
-    let input = input.trim_start();
-    let mut ordered = catalog
-        .iter()
-        .filter(|completion| matches(&completion.command, input))
-        .collect::<Vec<_>>();
+    let mut ordered = matching(catalog, input).collect::<Vec<_>>();
     // Stable, which is what keeps each translator's discovery order intact
     // inside a provider's block: this moves whole blocks, nothing within them.
     ordered.sort_by_key(|completion| completion_rank(completion, active));
@@ -257,7 +268,7 @@ impl SlashCompletionState {
 /// How many catalog entries `prompt` currently matches. Counting is
 /// order-independent, so this needs no focused agent to rank against.
 pub fn completion_count(catalog: &[SlashCommandCompletion], prompt: &str) -> usize {
-    slash_command_completions(catalog, prompt, None).len()
+    matching(catalog, prompt).count()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -293,8 +304,7 @@ pub fn shared_completion_prefix(catalog: &[SlashCommandCompletion], input: &str)
     let input = input.trim_start();
     // The shared prefix folds over every match, so ordering cannot change it
     // and Tab's fill behaves exactly as it did before ranking existed.
-    let ordered = slash_command_completions(catalog, input, None);
-    let mut matches = ordered.iter().map(|completion| completion.command.as_str());
+    let mut matches = matching(catalog, input).map(|completion| completion.command.as_str());
     let mut prefix = matches.next()?.to_owned();
     for command in matches {
         let shared = prefix
@@ -981,6 +991,44 @@ mod tests {
         assert!(!state.is_open());
     }
 
+    /// Regression: `completion_rank` orders by the focused agent's provider,
+    /// so an agent switch changes which command sits at a given index even
+    /// though `SlashCompletionState` itself never sees `active` — it only
+    /// clamps `selected` against the order-independent match count. If a
+    /// switch left `selected` untouched, the same raw index would silently
+    /// point at a different command. `main.rs` is what actually drives a
+    /// switch (`select_agent`/`rebind_session`/`start_agent`/
+    /// `resume_session`), and it closes the list rather than leaving this
+    /// dangling, but none of those can be exercised in a test without
+    /// spawning a real agent process (see the design doc). This pins the
+    /// hazard and the fix at the level that can be: closing before the next
+    /// refresh always drops the highlight back to the top.
+    #[test]
+    fn a_stale_selection_would_retarget_across_an_agent_switch_unless_closed() {
+        let catalog = vec![
+            provider_completion("/review-codex", Provider::Codex),
+            provider_completion("/review-claude", Provider::Claude),
+        ];
+        let mut state = SlashCompletionState::default();
+        state.refresh(&catalog, "/review", TYPING);
+        state.select_next(completion_count(&catalog, "/review"));
+        assert_eq!(state.selected(), 1);
+
+        // Under Codex focus, row 1 is the Claude row (it ranks below Codex's).
+        let codex_focused = ordered_commands(&catalog, "/review", Some(Provider::Codex));
+        assert_eq!(codex_focused[state.selected()], "/review-claude");
+
+        // The same raw index means something else entirely once Claude is
+        // focused instead: the ranking flips, so row 1 is now the Codex row.
+        let claude_focused = ordered_commands(&catalog, "/review", Some(Provider::Claude));
+        assert_eq!(claude_focused[state.selected()], "/review-codex");
+
+        // What an agent switch does: close before the prompt's next refresh.
+        state.close();
+        state.refresh(&catalog, "/review", TYPING);
+        assert_eq!(state.selected(), 0);
+    }
+
     #[test]
     fn selection_wraps_in_both_directions_and_ignores_an_empty_list() {
         let mut state = SlashCompletionState::default();
@@ -1081,26 +1129,92 @@ mod tests {
         );
     }
 
-    /// The sort is stable, so a provider's block keeps the order its
+    /// The sort is stable, so each provider's block keeps the order its
     /// translator discovered — built-ins, then personal, project, and plugin
-    /// entries. The names here are deliberately not alphabetical, so a sort
-    /// by name would fail this.
+    /// entries — rather than being reordered along with the rank. Both blocks
+    /// are checked, not just the focused one, because a real catalog has both
+    /// (`discover_agent_commands` flattens every configured provider in
+    /// sequence). The catalog interleaves the two providers across enough
+    /// rows that an unstable sort would actually reorder an equal-key run —
+    /// a 2-element run happens to survive an unstable sort by accident, via
+    /// insertion sort, which is what let a narrower version of this test pass
+    /// even after swapping `sort_by_key` for `sort_unstable_by_key`. The
+    /// names are deliberately not alphabetical within a block, so a sort by
+    /// name would fail this too.
     #[test]
-    fn commands_from_one_agent_keep_their_catalog_order() {
-        let catalog = vec![
-            provider_completion("/second", Provider::Claude),
-            provider_completion("/first", Provider::Claude),
+    fn each_agents_commands_keep_their_catalog_order_within_a_mixed_catalog() {
+        let names = [
+            "mango",
+            "kiwi",
+            "walnut",
+            "date",
+            "yam",
+            "apple",
+            "quince",
+            "fig",
+            "umbrella-fruit",
+            "banana",
+            "vine",
+            "cherry",
+            "tulip-fruit",
+            "elder",
+            "system-fruit",
+            "grape",
+            "root-fruit",
+            "honeydew",
+            "peach-fruit",
+            "ivy",
+            "orchard-fruit",
+            "lime",
+            "nectar-fruit",
+            "jackfruit",
         ];
+        let catalog = names
+            .iter()
+            .enumerate()
+            .map(|(index, name)| {
+                let provider = if index % 2 == 0 {
+                    Provider::Codex
+                } else {
+                    Provider::Claude
+                };
+                provider_completion(&format!("/{name}"), provider)
+            })
+            .collect::<Vec<_>>();
 
-        assert_eq!(
-            ordered_commands(&catalog, "/", Some(Provider::Claude)),
-            vec!["/second", "/first"]
-        );
+        let codex_order = catalog
+            .iter()
+            .filter(|completion| completion.provider == Some(Provider::Codex))
+            .map(|completion| completion.command.clone())
+            .collect::<Vec<_>>();
+        let claude_order = catalog
+            .iter()
+            .filter(|completion| completion.provider == Some(Provider::Claude))
+            .map(|completion| completion.command.clone())
+            .collect::<Vec<_>>();
+
+        // Codex focused: Codex's block (rank 1) keeps its order, then
+        // Claude's block (rank 2, the unfocused agent) keeps its order too.
+        let codex_focused = ordered_commands(&catalog, "/", Some(Provider::Codex));
+        let (focused_block, other_block) = codex_focused.split_at(codex_order.len());
+        assert_eq!(focused_block, codex_order.as_slice());
+        assert_eq!(other_block, claude_order.as_slice());
+
+        // Claude focused: the blocks swap rank, but each keeps its own order.
+        let claude_focused = ordered_commands(&catalog, "/", Some(Provider::Claude));
+        let (focused_block, other_block) = claude_focused.split_at(claude_order.len());
+        assert_eq!(focused_block, claude_order.as_slice());
+        assert_eq!(other_block, codex_order.as_slice());
     }
 
-    /// Before any session exists there is no agent to rank against. Every
-    /// agent command ties, so a stable sort leaves them where the catalog put
-    /// them, and only Agency's own rows lead.
+    /// `None` is not a state production code reaches from
+    /// `slash_command_completions` or `tab_completion` directly — every
+    /// production call site for those holds an `active_agent()` and passes
+    /// `Some`. It is what the order-independent callers, `completion_count`
+    /// and `shared_completion_prefix`, pass internally instead of threading a
+    /// parameter they would ignore. Every agent command ties under `None`, so
+    /// a stable sort leaves them where the catalog put them, and only
+    /// Agency's own rows lead.
     #[test]
     fn without_a_focused_agent_the_agents_keep_their_catalog_order() {
         let catalog = vec![

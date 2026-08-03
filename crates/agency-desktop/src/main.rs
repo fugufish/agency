@@ -2535,6 +2535,10 @@ impl Agency {
                     plugin_installs: TranscriptInstalls::default(),
                 });
                 self.active_agent = Some(self.agents.len() - 1);
+                // The completion ranking depends on the focused agent's
+                // provider, so a highlighted row that survived the switch
+                // could silently point at a different command.
+                self.overlays.slash.close();
                 self.emit(AppEvent::TerminalVisibilityChanged(false));
                 self.emit(AppEvent::EnterComposer);
                 self.notice = None;
@@ -2675,6 +2679,9 @@ impl Agency {
             self.toolbar.selected_session = index;
             self.selected_agent = self.agents[running_index].session.provider();
             self.active_agent = Some(running_index);
+            // Same reasoning as `start_agent`: the focused agent just
+            // changed, so a highlighted completion row cannot be trusted.
+            self.overlays.slash.close();
             self.emit(AppEvent::TerminalVisibilityChanged(false));
             self.notice = None;
             return;
@@ -2746,6 +2753,9 @@ impl Agency {
                     plugin_installs: TranscriptInstalls::default(),
                 });
                 self.active_agent = Some(self.agents.len() - 1);
+                // Same reasoning as `start_agent`: the focused agent just
+                // changed, so a highlighted completion row cannot be trusted.
+                self.overlays.slash.close();
                 self.emit(AppEvent::TerminalVisibilityChanged(false));
                 self.notice = None;
             }
@@ -2866,6 +2876,10 @@ impl Agency {
         agent.transcript_dirty = true;
 
         self.active_agent = Some(index);
+        // The completion ranking follows the focused agent's provider, and
+        // that provider just changed under this same index, so a highlighted
+        // row would silently point at a different command.
+        self.overlays.slash.close();
         if let Some(session) = self
             .sessions
             .records()

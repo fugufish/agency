@@ -30,7 +30,7 @@ Nothing new is needed for the order to follow the focused agent.
 ```rust
 pub fn slash_command_completions<'a>(
     catalog: &'a [SlashCommandCompletion],
-    input: &'a str,
+    input: &str,
     active: Option<Provider>,
 ) -> Vec<&'a SlashCommandCompletion>
 ```
@@ -52,11 +52,17 @@ The sort must be stable. That is what preserves each translator's discovery
 order — built-ins, then personal, project, and plugin entries — inside a block,
 so this change moves whole blocks and nothing within them.
 
-`active` is `Option<Provider>` rather than a bare `Provider` because the app
-genuinely runs without an agent: `Agency::for_testing` has no session at all,
-and the real app has none until the first one starts. `None` ranks every agent
-command equally, so a stable sort leaves the agents in their catalog order
-rather than in a special case; Agency's own rows still lead, which is already
+`active` is `Option<Provider>` rather than a bare `Provider` not because the
+app runs with no agent focused — all three production call sites for
+`slash_command_completions` and `tab_completion` sit inside an
+`active_agent()` guard and pass `Some(...)` unconditionally, so that case
+never reaches this function. `None` is reachable in production only from
+`completion_count` and `shared_completion_prefix`, the order-independent
+callers that fold over every match rather than one row and deliberately do
+not take an `active` of their own; they pass `None` internally rather than
+thread a parameter they would ignore. `None` ranks every agent command
+equally, so a stable sort leaves the agents in their catalog order rather
+than needing a special case; Agency's own rows still lead, which is already
 where `merge_catalog` puts them.
 
 The return type becomes `Vec<&SlashCommandCompletion>` because sorting cannot be
