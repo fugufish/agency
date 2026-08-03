@@ -33,7 +33,7 @@
 | `crates/agency-desktop/src/worktrees.rs` | The only git-worktree shell-out | Modify — `create` re-homed and loses `path_hint`, `remove` added |
 | `crates/agency-desktop/src/main.rs` | App state, reducer, RPC effects, explorer walk | Modify — three `AppEvent` variants, one reducer, RPC handlers become effects, explorer skip |
 | `crates/agency-mcp/src/lib.rs` | MCP tool schemas and RPC forwarding | Modify — `remove_worktree` added, `path_hint` dropped |
-| `.gitignore` | Keeps worktree and session data out of git | Modify — `.agency/sessions/` added |
+| `.gitignore` | Keeps worktree and session data out of git | Modify — `.agency/sessions/` added (this repo only; Task 7 supplies the same guarantee for user repositories) |
 | `README.md` | Documents the agent tool surface | Modify — `remove_worktree` listed |
 
 ---
@@ -1482,9 +1482,252 @@ git commit -m "fix(desktop): keep the explorer out of the worktrees directory"
 
 ---
 
+### Task 7: Guarantee session data is ignored in every repository
+
+Added after the Task 5 review. Agency stores a worktree's session history inside the worktree at `.agency/sessions/`, and `git worktree remove` refuses a worktree reporting untracked files — with no force option by design. In a repository whose `.gitignore` does not cover `.agency/`, that makes every worktree Agency creates **permanently unremovable** the moment it records one session.
+
+This works in Agency's own repository only because Task 1 added the rule to *this* project's `.gitignore`. Nothing in the product writes it for a user's repository; only the test fixture does, which is why every test passes against ignore rules production never creates. The spec calls that line load-bearing but assigns no code to it.
+
+The rule goes in the repository's `info/exclude`, not its `.gitignore`: `info/exclude` lives in the git common directory, so one write covers the primary and every linked worktree, and it is not a tracked file, so Agency never edits something the user committed.
+
+Verified mechanism: `git rev-parse --path-format=absolute --git-common-dir` returns the same absolute path whether run from the primary or from a linked worktree, and a rule written to `info/exclude` there is honoured inside linked worktrees.
+
+**Files:**
+- Modify: `crates/agency-desktop/src/worktrees.rs` — add `ensure_agency_ignored`, call it from `create`; add a fixture variant
+- Modify: `crates/agency-desktop/src/main.rs` — best-effort call in `Agency::build`
+- Test: `crates/agency-desktop/src/worktrees.rs`
+
+**Interfaces:**
+- Consumes: `worktrees::discover`, `worktrees::create`, `worktrees::remove`, `worktrees::tests_support::repository`
+- Produces:
+  - `worktrees::ensure_agency_ignored(workspace: &Path) -> Result<(), String>`
+  - `worktrees::tests_support::repository_without_ignore_rules(name: &str) -> PathBuf`
+
+- [ ] **Step 1: Add a fixture with no ignore rules**
+
+Every existing fixture writes a production-matching `.gitignore`, which is exactly why this bug survived. Add a variant that does not, in `worktrees.rs`'s `tests_support` module:
+
+```rust
+    /// A repository with no ignore rules at all — the state a user's project
+    /// is in before Agency touches it. The rule-bearing `repository` fixture
+    /// cannot catch a missing product-side guarantee, because it supplies the
+    /// guarantee itself.
+    pub fn repository_without_ignore_rules(name: &str) -> PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "agency-worktree-{name}-{}-{unique}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        git(&root, &["init", "-q", "--initial-branch", "main"]);
+        git(&root, &["config", "user.email", "test@example.com"]);
+        git(&root, &["config", "user.name", "Agency Test"]);
+        std::fs::write(root.join("README.md"), "test\n").unwrap();
+        git(&root, &["add", "-A"]);
+        git(&root, &["commit", "-qm", "init"]);
+        root
+    }
+```
+
+- [ ] **Step 2: Write the failing end-to-end test**
+
+This is the test that matters — it reproduces the reported failure. Add to `worktrees.rs`'s `mod tests`:
+
+```rust
+    use super::tests_support::repository_without_ignore_rules;
+
+    /// The bug this task fixes. A user's repository does not ignore
+    /// `.agency/`, so the session history Agency writes inside a worktree
+    /// reads as untracked, and `git worktree remove` refuses it — forever,
+    /// since there is no force option. Agency has to supply the rule itself.
+    #[test]
+    fn a_worktree_stays_removable_in_a_repository_with_no_ignore_rules() {
+        let root = repository_without_ignore_rules("no-ignore-rules");
+        let worktree = create(&root, "feature", None).unwrap();
+        let sessions = worktree.path.join(".agency").join("sessions").join("one");
+        std::fs::create_dir_all(&sessions).unwrap();
+        std::fs::write(sessions.join("session.json"), r#"{"conversation_id":"one"}"#).unwrap();
+
+        let removed = remove(&root, "feature").unwrap();
+
+        assert_eq!(removed.path, worktree.path);
+        assert!(!worktree.path.exists());
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+```
+
+- [ ] **Step 3: Write the failing unit tests for the rule writer**
+
+```rust
+    #[test]
+    fn ignore_rules_are_written_once_and_survive_existing_content() {
+        let root = repository_without_ignore_rules("exclude-idempotent");
+        let exclude = root.join(".git").join("info").join("exclude");
+        std::fs::create_dir_all(exclude.parent().unwrap()).unwrap();
+        std::fs::write(&exclude, "# a user's own rule\nbuild/\n").unwrap();
+
+        ensure_agency_ignored(&root).unwrap();
+        let after_first = std::fs::read_to_string(&exclude).unwrap();
+        ensure_agency_ignored(&root).unwrap();
+        let after_second = std::fs::read_to_string(&exclude).unwrap();
+
+        assert_eq!(after_first, after_second, "the writer must be idempotent");
+        assert!(after_first.contains("build/"), "existing rules must survive");
+        assert_eq!(
+            after_first
+                .lines()
+                .filter(|line| line.trim() == ".agency/sessions/")
+                .count(),
+            1
+        );
+        assert!(
+            after_first
+                .lines()
+                .any(|line| line.trim() == ".agency/worktrees/")
+        );
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// One write has to cover every worktree, which is why the rule goes in
+    /// the common directory rather than in each checkout.
+    #[test]
+    fn ignore_rules_apply_inside_a_linked_worktree() {
+        let root = repository_without_ignore_rules("exclude-linked");
+        let worktree = create(&root, "feature", None).unwrap();
+        let sessions = worktree.path.join(".agency").join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        std::fs::write(sessions.join("session.json"), "{}").unwrap();
+
+        let output = Command::new("git")
+            .args(["status", "--porcelain"])
+            .current_dir(&worktree.path)
+            .output()
+            .unwrap();
+
+        assert!(
+            String::from_utf8_lossy(&output.stdout).trim().is_empty(),
+            "session data must not read as untracked inside the worktree"
+        );
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+```
+
+- [ ] **Step 4: Run the tests to verify they fail**
+
+Run: `cargo test --package agency-desktop --bin agency -- a_worktree_stays_removable ignore_rules_are_written ignore_rules_apply`
+
+Expected: FAIL to compile on `ensure_agency_ignored` and `repository_without_ignore_rules` until Steps 1 and 5 land. With Step 1 in place but not Step 5, `a_worktree_stays_removable_in_a_repository_with_no_ignore_rules` fails at `remove(...).unwrap()` with `contains modified or untracked files` — the reported bug, reproduced.
+
+- [ ] **Step 5: Write the rule writer**
+
+Add to `crates/agency-desktop/src/worktrees.rs`:
+
+```rust
+/// The ignore rules Agency needs in every repository it operates on.
+const AGENCY_EXCLUDE_RULES: [&str; 2] = [".agency/sessions/", ".agency/worktrees/"];
+
+/// Teaches the repository to ignore what Agency stores in it.
+///
+/// Git refuses to remove a worktree that reports untracked files, and a
+/// worktree's session history lives inside it — so without these rules, every
+/// worktree Agency creates becomes unremovable the moment it records a
+/// session, and there is deliberately no force option to escape with.
+///
+/// The rules go in `info/exclude` rather than `.gitignore`: it lives in the
+/// common directory, so one write covers the primary and every linked
+/// worktree, and it is not a tracked file, so Agency never edits something the
+/// user committed.
+pub fn ensure_agency_ignored(workspace: &Path) -> Result<(), String> {
+    let output = Command::new("git")
+        .args(["rev-parse", "--path-format=absolute", "--git-common-dir"])
+        .current_dir(workspace)
+        .output()
+        .map_err(|error| format!("Could not locate the Git directory: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "Could not locate the Git directory: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    let common = PathBuf::from(String::from_utf8_lossy(&output.stdout).trim().to_owned());
+    let exclude = common.join("info").join("exclude");
+    let existing = fs::read_to_string(&exclude).unwrap_or_default();
+    let missing = AGENCY_EXCLUDE_RULES
+        .iter()
+        .filter(|rule| !existing.lines().any(|line| line.trim() == **rule))
+        .copied()
+        .collect::<Vec<_>>();
+    if missing.is_empty() {
+        return Ok(());
+    }
+
+    let mut updated = existing;
+    if !updated.is_empty() && !updated.ends_with('\n') {
+        updated.push('\n');
+    }
+    for rule in missing {
+        updated.push_str(rule);
+        updated.push('\n');
+    }
+    if let Some(parent) = exclude.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|error| format!("Could not create {}: {error}", parent.display()))?;
+    }
+    fs::write(&exclude, updated)
+        .map_err(|error| format!("Could not write {}: {error}", exclude.display()))
+}
+```
+
+Add `use std::fs;` to the top of `worktrees.rs` if it is not already imported.
+
+- [ ] **Step 6: Call it from `create`**
+
+In `worktrees::create`, after `primary` is resolved and **before** `git worktree add` runs, insert:
+
+```rust
+    ensure_agency_ignored(&primary.path)?;
+```
+
+The error propagates rather than being swallowed. Creating a worktree that cannot be protected means creating one that can never be removed, so refusing up front is better than leaving a trap — and nothing has been created at that point, so the failure is clean.
+
+- [ ] **Step 7: Call it at startup, best-effort**
+
+A user who never creates a worktree still accumulates `.agency/sessions/` in the primary, which would clutter `git status`. In `Agency::build`, next to the existing `sessions::migrate_legacy_root_sessions(&cwd);` call, add:
+
+```rust
+        let _ = worktrees::ensure_agency_ignored(&cwd);
+```
+
+Best-effort here, unlike in `create`: a repository Agency cannot write to should still open.
+
+- [ ] **Step 8: Run the tests to verify they pass**
+
+Run: `cargo test --package agency-desktop --bin agency -- a_worktree_stays_removable ignore_rules_are_written ignore_rules_apply`
+
+Expected: PASS, all three.
+
+- [ ] **Step 9: Run the full suite and commit**
+
+Run: `cargo fmt --all && cargo build --workspace --locked && cargo test --workspace --all-targets --locked`
+
+Expected: PASS.
+
+```bash
+git add crates/agency-desktop/src/worktrees.rs crates/agency-desktop/src/main.rs
+git commit -m "fix(desktop): teach every repository to ignore what Agency stores in it"
+```
+
+---
+
 ## Verification
 
-After Task 6, confirm the whole feature by hand — the automated tests cover the units, but the loop through a running app is what proves the wiring.
+After Task 7, confirm the whole feature by hand — the automated tests cover the units, but the loop through a running app is what proves the wiring.
 
 - [ ] Run `cargo build --workspace --locked && cargo test --workspace --all-targets --locked`
 - [ ] Launch the app in this repository, start an agent, and ask it to call `create_worktree` with branch `scratch/verify`
