@@ -862,6 +862,14 @@ enum AppEvent {
     ToggleActivity(SidebarTool),
     ToggleExplorerEntry(usize),
     SelectWorktree(usize),
+    /// The tab strip as git reports it. Published at startup and after any
+    /// change to the worktree set, so all three paths land in one reducer.
+    WorktreesDiscovered {
+        worktrees: Vec<Worktree>,
+    },
+    WorktreeCreated {
+        worktree: Worktree,
+    },
     StartAgent(Provider),
     ResumeSession(usize),
     RequestSessionTrash(usize),
@@ -998,6 +1006,10 @@ impl Agency {
             plugin_installs: PluginInstalls::default(),
         };
         let startup_notice = agency.notice.take();
+        let discovered = agency.worktrees.clone();
+        agency.emit(AppEvent::WorktreesDiscovered {
+            worktrees: discovered,
+        });
         if spawn_agent_and_rpc {
             agency.start_agent(default_agent);
         }
@@ -1279,6 +1291,8 @@ impl Agency {
             }
             AppEvent::ToggleExplorerEntry(index) => self.toggle_explorer_entry(index),
             AppEvent::SelectWorktree(index) => self.select_worktree(index),
+            AppEvent::WorktreesDiscovered { worktrees } => self.worktrees_discovered(worktrees),
+            AppEvent::WorktreeCreated { worktree } => self.worktree_created(worktree),
             AppEvent::StartAgent(provider) => {
                 self.selected_agent = provider;
                 self.start_agent(provider);
@@ -2409,11 +2423,40 @@ impl Agency {
         });
     }
 
+    /// The one place `worktrees` and `active_worktree` are written. An empty
+    /// list is refused rather than rendered: git always reports at least the
+    /// primary, so an empty result means the query failed, and dropping every
+    /// tab would leave nothing to switch back to.
+    fn worktrees_discovered(&mut self, worktrees: Vec<Worktree>) {
+        if worktrees.is_empty() {
+            return;
+        }
+        self.active_worktree = worktrees
+            .iter()
+            .position(|worktree| worktree.path == self.cwd)
+            .unwrap_or(0);
+        self.worktrees = worktrees;
+    }
+
+    /// Re-discovers rather than pushing the new worktree onto the list, so the
+    /// tab strip stays exactly what git reports. A worktree created in some
+    /// other repository simply will not appear, which is the correct outcome
+    /// and needs no workspace comparison to arrange.
+    fn worktree_created(&mut self, worktree: Worktree) {
+        match worktrees::discover(&self.cwd) {
+            Ok(discovered) => {
+                self.worktrees_discovered(discovered);
+                self.notice = Some(format!("Created worktree {}", worktree.label));
+            }
+            Err(error) => self.notice = Some(error),
+        }
+    }
+
     fn select_worktree(&mut self, index: usize) {
         let Some(worktree) = self.worktrees.get(index) else {
             return;
         };
-        if index == self.active_worktree {
+        if worktree.path == self.cwd {
             return;
         }
 
@@ -2642,17 +2685,8 @@ impl Agency {
                     branch.and_then(|branch| {
                         let base = call.params.get("base").and_then(serde_json::Value::as_str);
                         worktrees::create(&call.context.workspace, branch, base).map(|worktree| {
-                            let value = worktree_json(worktree);
-                            if call.context.workspace == self.cwd
-                                && let Ok(discovered) = worktrees::discover(&self.cwd)
-                            {
-                                self.worktrees = discovered;
-                                self.active_worktree = self
-                                    .worktrees
-                                    .iter()
-                                    .position(|candidate| candidate.path == self.cwd)
-                                    .unwrap_or(0);
-                            }
+                            let value = worktree_json(worktree.clone());
+                            self.emit(AppEvent::WorktreeCreated { worktree });
                             serde_json::json!({
                                 "caller": rpc_caller(&call.context),
                                 "worktree": value
@@ -7580,6 +7614,10 @@ mod tests {
         // Both handlers only assign a field; if either started publishing
         // events, a loaded/failed catalog could re-trigger its own reload.
         let mut agency = Agency::for_testing();
+        // `build` always publishes the initial `WorktreesDiscovered`, which is
+        // unrelated to what this test checks; drain it before asserting on
+        // events raised by the handlers under test.
+        agency.drain_events();
 
         let _ = agency.reduce_event(AppEvent::SlashCatalogLoaded(Vec::new()));
         assert!(agency.drain_events().is_empty());
@@ -7621,6 +7659,77 @@ mod tests {
         );
 
         std::fs::remove_dir_all(&other_root).unwrap();
+    }
+
+    fn worktree_at(path: &std::path::Path, branch: &str) -> Worktree {
+        Worktree {
+            path: path.to_path_buf(),
+            label: branch.to_owned(),
+            branch: Some(branch.to_owned()),
+        }
+    }
+
+    /// Discovery is the single source of truth for the tab strip, so the active
+    /// tab is re-derived from cwd rather than carried across. Git reports the
+    /// primary first, which is why index 0 is the fallback.
+    #[test]
+    fn discovering_worktrees_reresolves_the_active_tab_from_cwd() {
+        let mut agency = Agency::for_testing();
+        let primary = std::path::PathBuf::from("/repo");
+        let feature = std::path::PathBuf::from("/repo/.agency/worktrees/feature");
+        agency.cwd = feature.clone();
+
+        let _ = agency.reduce_event(AppEvent::WorktreesDiscovered {
+            worktrees: vec![
+                worktree_at(&primary, "main"),
+                worktree_at(&feature, "feature"),
+            ],
+        });
+
+        assert_eq!(agency.worktrees.len(), 2);
+        assert_eq!(agency.active_worktree, 1);
+    }
+
+    #[test]
+    fn discovering_worktrees_falls_back_to_the_primary_when_cwd_is_gone() {
+        let mut agency = Agency::for_testing();
+        agency.cwd = std::path::PathBuf::from("/repo/.agency/worktrees/deleted");
+
+        let _ = agency.reduce_event(AppEvent::WorktreesDiscovered {
+            worktrees: vec![worktree_at(std::path::Path::new("/repo"), "main")],
+        });
+
+        assert_eq!(agency.active_worktree, 0);
+    }
+
+    /// An agent creating a worktree in the background must not move the user's
+    /// view. The tab appears; focus stays put.
+    ///
+    /// This one needs a real repository: the reducer re-discovers rather than
+    /// pushing the payload onto the list, so a fabricated path would never show
+    /// up in the result.
+    #[test]
+    fn a_created_worktree_appends_a_tab_without_moving_focus() {
+        let root = worktrees::tests_support::repository("created-tab");
+        let mut agency = Agency::for_testing();
+        agency.cwd = root.clone();
+        agency.worktrees = vec![worktree_at(&root, "main")];
+        agency.active_worktree = 0;
+        let created = worktrees::create(&root, "feature", None).unwrap();
+
+        let _ = agency.reduce_event(AppEvent::WorktreeCreated { worktree: created });
+
+        assert_eq!(agency.worktrees.len(), 2);
+        assert!(
+            agency
+                .worktrees
+                .iter()
+                .any(|worktree| worktree.branch.as_deref() == Some("feature"))
+        );
+        assert_eq!(agency.active_worktree, 0);
+        assert_eq!(agency.cwd, root);
+
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
