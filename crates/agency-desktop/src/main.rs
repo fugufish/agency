@@ -1299,13 +1299,17 @@ impl Agency {
             }
             AppEvent::ComposerPromptChanged => self.refresh_slash_completions(),
             AppEvent::TabCompleteSlashCommand => {
-                let Some(prompt) = self.active_agent().map(|agent| agent.prompt.clone()) else {
+                let Some((prompt, active)) = self
+                    .active_agent()
+                    .map(|agent| (agent.prompt.clone(), agent.session.provider()))
+                else {
                     return Task::none();
                 };
                 match tab_completion(
                     &self.slash_command_catalog,
                     &prompt,
                     self.overlays.slash.selected(),
+                    Some(active),
                 ) {
                     Some(TabCompletion::Fill(prefix)) => {
                         if let Some(agent) = self.active_agent_mut() {
@@ -1584,10 +1588,15 @@ impl Agency {
                         keyboard::Key::Named(keyboard::key::Named::Enter)
                     ) {
                         let completion = self.active_agent().and_then(|agent| {
-                            slash_command_completions(&self.slash_command_catalog, &agent.prompt)
-                                .nth(self.overlays.slash.selected())
-                                .filter(|completion| completion.insertion != agent.prompt)
-                                .cloned()
+                            slash_command_completions(
+                                &self.slash_command_catalog,
+                                &agent.prompt,
+                                Some(agent.session.provider()),
+                            )
+                            .into_iter()
+                            .nth(self.overlays.slash.selected())
+                            .filter(|completion| completion.insertion != agent.prompt)
+                            .cloned()
                         });
                         match completion {
                             Some(completion) => {
@@ -3696,53 +3705,58 @@ impl Agency {
             if let Some(question) = question {
                 content = content.push(question).push(rule::horizontal(1));
             }
-            let completions = slash_command_completions(&self.slash_command_catalog, &agent.prompt)
-                .enumerate()
-                .fold(column![].spacing(4), |completions, (index, completion)| {
-                    let provider_tag: Element<'_, AppEvent> = completion.provider.map_or_else(
-                        || {
-                            container(text("AGENCY").size(10))
-                                .padding([2, 6])
-                                .style(|_theme: &Theme| ui_theme::agent_type_badge(true))
-                                .into()
-                        },
-                        |provider| {
-                            let label = if completion.built_in {
-                                format!("BUILT-IN · {}", provider.label().to_uppercase())
-                            } else {
-                                provider.label().to_uppercase()
-                            };
-                            container(text(label).size(10))
-                                .padding([2, 6])
-                                .style(move |_theme: &Theme| {
-                                    ui_theme::agent_type_badge(provider == Provider::Codex)
-                                })
-                                .into()
-                        },
-                    );
-                    completions.push(
-                        button(
-                            row![
-                                provider_tag,
-                                text(&completion.command).font(Font::MONOSPACE).size(14),
-                                text(&completion.description).size(12),
-                            ]
-                            .spacing(16)
-                            .align_y(iced::Alignment::Center),
-                        )
-                        .on_press(AppEvent::CompleteSlashCommand(
-                            completion.insertion.clone(),
-                            completion.provider,
-                        ))
-                        .width(Fill)
-                        .style(move |_theme: &Theme, status| {
-                            ui_theme::slash_command_button(
-                                index == self.overlays.slash.selected(),
-                                status,
-                            )
-                        }),
+            let completions = slash_command_completions(
+                &self.slash_command_catalog,
+                &agent.prompt,
+                Some(agent.session.provider()),
+            )
+            .into_iter()
+            .enumerate()
+            .fold(column![].spacing(4), |completions, (index, completion)| {
+                let provider_tag: Element<'_, AppEvent> = completion.provider.map_or_else(
+                    || {
+                        container(text("AGENCY").size(10))
+                            .padding([2, 6])
+                            .style(|_theme: &Theme| ui_theme::agent_type_badge(true))
+                            .into()
+                    },
+                    |provider| {
+                        let label = if completion.built_in {
+                            format!("BUILT-IN · {}", provider.label().to_uppercase())
+                        } else {
+                            provider.label().to_uppercase()
+                        };
+                        container(text(label).size(10))
+                            .padding([2, 6])
+                            .style(move |_theme: &Theme| {
+                                ui_theme::agent_type_badge(provider == Provider::Codex)
+                            })
+                            .into()
+                    },
+                );
+                completions.push(
+                    button(
+                        row![
+                            provider_tag,
+                            text(&completion.command).font(Font::MONOSPACE).size(14),
+                            text(&completion.description).size(12),
+                        ]
+                        .spacing(16)
+                        .align_y(iced::Alignment::Center),
                     )
-                });
+                    .on_press(AppEvent::CompleteSlashCommand(
+                        completion.insertion.clone(),
+                        completion.provider,
+                    ))
+                    .width(Fill)
+                    .style(move |_theme: &Theme, status| {
+                        ui_theme::slash_command_button(
+                            index == self.overlays.slash.selected(),
+                            status,
+                        )
+                    }),
+                )
+            });
             if self.overlays.slash.is_open()
                 && completion_count(&self.slash_command_catalog, &agent.prompt) > 0
             {

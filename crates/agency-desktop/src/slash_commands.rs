@@ -127,14 +127,36 @@ fn client_id(provider: Provider) -> ClientId {
     }
 }
 
+/// Where a completion sits relative to the agent the composer is pointed at.
+///
+/// Agency's own commands lead: they are a small fixed set, are present before
+/// any catalog has loaded, and never route to an agent, so a stable position
+/// means their rows do not jump when an agent switch or a load lands. The
+/// focused agent's come next. The other agent's stay listed, because picking
+/// one still routes it to its owner, but they sink below the ones that need no
+/// switch.
+fn completion_rank(completion: &SlashCommandCompletion, active: Option<Provider>) -> u8 {
+    match completion.provider {
+        None => 0,
+        Some(provider) if Some(provider) == active => 1,
+        Some(_) => 2,
+    }
+}
+
 pub fn slash_command_completions<'a>(
     catalog: &'a [SlashCommandCompletion],
     input: &'a str,
-) -> impl Iterator<Item = &'a SlashCommandCompletion> {
+    active: Option<Provider>,
+) -> Vec<&'a SlashCommandCompletion> {
     let input = input.trim_start();
-    catalog
+    let mut ordered = catalog
         .iter()
-        .filter(move |completion| matches(&completion.command, input))
+        .filter(|completion| matches(&completion.command, input))
+        .collect::<Vec<_>>();
+    // Stable, which is what keeps each translator's discovery order intact
+    // inside a provider's block: this moves whole blocks, nothing within them.
+    ordered.sort_by_key(|completion| completion_rank(completion, active));
+    ordered
 }
 
 /// Whether `input` finds `command`.
@@ -206,7 +228,7 @@ impl SlashCompletionState {
         prompt: &str,
         composer: ComposerState,
     ) {
-        let matches = slash_command_completions(catalog, prompt).count();
+        let matches = completion_count(catalog, prompt);
         if matches == 0 || !composer.focused {
             self.close();
             return;
@@ -232,9 +254,10 @@ impl SlashCompletionState {
     }
 }
 
-/// How many catalog entries `prompt` currently matches.
+/// How many catalog entries `prompt` currently matches. Counting is
+/// order-independent, so this needs no focused agent to rank against.
 pub fn completion_count(catalog: &[SlashCommandCompletion], prompt: &str) -> usize {
-    slash_command_completions(catalog, prompt).count()
+    slash_command_completions(catalog, prompt, None).len()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -251,10 +274,12 @@ pub fn tab_completion(
     catalog: &[SlashCommandCompletion],
     input: &str,
     selected: usize,
+    active: Option<Provider>,
 ) -> Option<TabCompletion> {
     match shared_completion_prefix(catalog, input) {
         Some(prefix) => Some(TabCompletion::Fill(prefix)),
-        None => slash_command_completions(catalog, input)
+        None => slash_command_completions(catalog, input, active)
+            .into_iter()
             .nth(selected)
             .cloned()
             .map(TabCompletion::Accept),
@@ -266,8 +291,10 @@ pub fn tab_completion(
 /// press and an ambiguous one narrows to the point where the choices differ.
 pub fn shared_completion_prefix(catalog: &[SlashCommandCompletion], input: &str) -> Option<String> {
     let input = input.trim_start();
-    let mut matches =
-        slash_command_completions(catalog, input).map(|completion| completion.command.as_str());
+    // The shared prefix folds over every match, so ordering cannot change it
+    // and Tab's fill behaves exactly as it did before ranking existed.
+    let ordered = slash_command_completions(catalog, input, None);
+    let mut matches = ordered.iter().map(|completion| completion.command.as_str());
     let mut prefix = matches.next()?.to_owned();
     for command in matches {
         let shared = prefix
@@ -736,23 +763,15 @@ mod tests {
             built_in: false,
         }];
         assert_eq!(
-            slash_command_completions(&completions, "/").collect::<Vec<_>>(),
+            slash_command_completions(&completions, "/", None),
             completions.iter().collect::<Vec<_>>()
         );
         assert_eq!(
-            slash_command_completions(&completions, "/mcp a").collect::<Vec<_>>(),
+            slash_command_completions(&completions, "/mcp a", None),
             completions.iter().collect::<Vec<_>>()
         );
-        assert!(
-            slash_command_completions(&completions, "hello")
-                .next()
-                .is_none()
-        );
-        assert!(
-            slash_command_completions(&completions, "/wat")
-                .next()
-                .is_none()
-        );
+        assert!(slash_command_completions(&completions, "hello", None).is_empty());
+        assert!(slash_command_completions(&completions, "/wat", None).is_empty());
     }
 
     fn completion(command: &str) -> SlashCommandCompletion {
@@ -763,6 +782,29 @@ mod tests {
             provider: None,
             built_in: false,
         }
+    }
+
+    /// The existing `completion` helper builds Agency-owned rows
+    /// (`provider: None`). Ordering needs rows that belong to an agent.
+    fn provider_completion(command: &str, provider: Provider) -> SlashCommandCompletion {
+        SlashCommandCompletion {
+            command: command.to_owned(),
+            description: String::new(),
+            insertion: format!("{command} "),
+            provider: Some(provider),
+            built_in: false,
+        }
+    }
+
+    fn ordered_commands(
+        catalog: &[SlashCommandCompletion],
+        input: &str,
+        active: Option<Provider>,
+    ) -> Vec<String> {
+        slash_command_completions(catalog, input, active)
+            .into_iter()
+            .map(|completion| completion.command.clone())
+            .collect()
     }
 
     #[test]
@@ -817,15 +859,15 @@ mod tests {
         let catalog = vec![completion("/plugin install"), completion("/plugin remove")];
 
         assert_eq!(
-            tab_completion(&catalog, "/p", 1),
+            tab_completion(&catalog, "/p", 1, None),
             Some(TabCompletion::Fill("/plugin ".to_owned()))
         );
         // A second press has no prefix left to fill, so it takes the selection.
         assert_eq!(
-            tab_completion(&catalog, "/plugin ", 1),
+            tab_completion(&catalog, "/plugin ", 1, None),
             Some(TabCompletion::Accept(completion("/plugin remove")))
         );
-        assert_eq!(tab_completion(&catalog, "/wat", 0), None);
+        assert_eq!(tab_completion(&catalog, "/wat", 0, None), None);
     }
 
     #[test]
@@ -838,7 +880,8 @@ mod tests {
             built_in: false,
         }];
 
-        let Some(TabCompletion::Accept(accepted)) = tab_completion(&catalog, "/review", 0) else {
+        let Some(TabCompletion::Accept(accepted)) = tab_completion(&catalog, "/review", 0, None)
+        else {
             panic!("a fully typed command should be accepted");
         };
         assert_eq!(accepted.insertion, "$review ");
@@ -849,7 +892,7 @@ mod tests {
     fn tab_ignores_a_selection_past_the_narrowed_matches() {
         let catalog = vec![completion("/init"), completion("/mcp add")];
 
-        assert_eq!(tab_completion(&catalog, "/init", 7), None);
+        assert_eq!(tab_completion(&catalog, "/init", 7, None), None);
     }
 
     const TYPING: ComposerState = ComposerState {
@@ -996,11 +1039,11 @@ mod tests {
         ];
 
         assert_eq!(
-            tab_completion(&catalog, "/superpowers:b", 0),
+            tab_completion(&catalog, "/superpowers:b", 0, None),
             Some(TabCompletion::Fill("/superpowers:brainstorming".to_owned()))
         );
         assert_eq!(
-            tab_completion(&catalog, "/brain", 1),
+            tab_completion(&catalog, "/brain", 1, None),
             Some(TabCompletion::Accept(completion(
                 "/hookify:brainstorming-lite"
             )))
@@ -1014,5 +1057,79 @@ mod tests {
         // "storming" starts mid-segment, so it does not match.
         assert!(!matches("/superpowers:brainstorming", "/storming"));
         assert!(!matches("/superpowers:brainstorming", "brain"));
+    }
+
+    /// Picking a command routes it to the agent that owns it, so the other
+    /// agent's commands stay listed — they just sink below the ones the
+    /// composer is already pointed at.
+    #[test]
+    fn the_focused_agents_commands_are_offered_before_the_other_agents() {
+        let catalog = vec![
+            provider_completion("/review-codex", Provider::Codex),
+            completion("/init"),
+            provider_completion("/review-claude", Provider::Claude),
+        ];
+
+        // Asserted both ways, so a ranking that hardcodes one provider fails.
+        assert_eq!(
+            ordered_commands(&catalog, "/", Some(Provider::Claude)),
+            vec!["/init", "/review-claude", "/review-codex"]
+        );
+        assert_eq!(
+            ordered_commands(&catalog, "/", Some(Provider::Codex)),
+            vec!["/init", "/review-codex", "/review-claude"]
+        );
+    }
+
+    /// The sort is stable, so a provider's block keeps the order its
+    /// translator discovered — built-ins, then personal, project, and plugin
+    /// entries. The names here are deliberately not alphabetical, so a sort
+    /// by name would fail this.
+    #[test]
+    fn commands_from_one_agent_keep_their_catalog_order() {
+        let catalog = vec![
+            provider_completion("/second", Provider::Claude),
+            provider_completion("/first", Provider::Claude),
+        ];
+
+        assert_eq!(
+            ordered_commands(&catalog, "/", Some(Provider::Claude)),
+            vec!["/second", "/first"]
+        );
+    }
+
+    /// Before any session exists there is no agent to rank against. Every
+    /// agent command ties, so a stable sort leaves them where the catalog put
+    /// them, and only Agency's own rows lead.
+    #[test]
+    fn without_a_focused_agent_the_agents_keep_their_catalog_order() {
+        let catalog = vec![
+            provider_completion("/review-codex", Provider::Codex),
+            completion("/init"),
+            provider_completion("/review-claude", Provider::Claude),
+        ];
+
+        assert_eq!(
+            ordered_commands(&catalog, "/", None),
+            vec!["/init", "/review-codex", "/review-claude"]
+        );
+    }
+
+    /// Tab commits the highlighted row, and the highlighted row is now the
+    /// focused agent's. Both agents offer `/review`, so an ordering that
+    /// ignored the focused agent would hand Tab the wrong one.
+    #[test]
+    fn tab_accepts_the_focused_agents_row() {
+        let catalog = vec![
+            provider_completion("/review", Provider::Codex),
+            provider_completion("/review", Provider::Claude),
+        ];
+
+        let Some(TabCompletion::Accept(accepted)) =
+            tab_completion(&catalog, "/review", 0, Some(Provider::Claude))
+        else {
+            panic!("a fully typed command should be accepted");
+        };
+        assert_eq!(accepted.provider, Some(Provider::Claude));
     }
 }
