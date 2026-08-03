@@ -132,8 +132,18 @@ pub fn remove(workspace: &Path, branch: &str) -> Result<Worktree, String> {
     Ok(target)
 }
 
-/// The ignore rules Agency needs in every repository it operates on.
-const AGENCY_EXCLUDE_RULES: [&str; 2] = [".agency/sessions/", ".agency/worktrees/"];
+/// The ignore rules Agency needs in every repository it operates on: one line
+/// per thing Agency writes into a repository. `config.local.toml` arrives from
+/// `/init` and must never be committed, so without a rule it sits untracked —
+/// and one untracked file is all it takes for `git worktree remove` to refuse.
+/// `legacy-sessions/` is where the startup migration parks history it cannot
+/// attribute to a live worktree.
+const AGENCY_EXCLUDE_RULES: [&str; 4] = [
+    ".agency/sessions/",
+    ".agency/worktrees/",
+    ".agency/legacy-sessions/",
+    ".agency/config.local.toml",
+];
 
 /// Teaches the repository to ignore what Agency stores in it.
 ///
@@ -264,6 +274,10 @@ pub mod tests_support {
         git(&root, &["init", "-q", "--initial-branch", "main"]);
         git(&root, &["config", "user.email", "test@example.com"]);
         git(&root, &["config", "user.name", "Agency Test"]);
+        // Never inherit the developer's own ~/.config/git/ignore: a global
+        // `.agency/` rule would supply the guarantee the product is supposed to
+        // supply, and these tests would pass against a no-op writer.
+        git(&root, &["config", "core.excludesFile", "/dev/null"]);
         std::fs::write(root.join("README.md"), "test\n").unwrap();
         std::fs::write(
             root.join(".gitignore"),
@@ -292,6 +306,10 @@ pub mod tests_support {
         git(&root, &["init", "-q", "--initial-branch", "main"]);
         git(&root, &["config", "user.email", "test@example.com"]);
         git(&root, &["config", "user.name", "Agency Test"]);
+        // See `repository`: without this the fixture inherits whatever the
+        // developer running the suite happens to ignore globally, which is the
+        // one thing a fixture proving a missing ignore rule must not do.
+        git(&root, &["config", "core.excludesFile", "/dev/null"]);
         std::fs::write(root.join("README.md"), "test\n").unwrap();
         git(&root, &["add", "-A"]);
         git(&root, &["commit", "-qm", "init"]);
@@ -582,7 +600,11 @@ mod tests {
     }
 
     /// One write has to cover every worktree, which is why the rule goes in
-    /// the common directory rather than in each checkout.
+    /// the common directory rather than in each checkout — and it has to cover
+    /// everything Agency writes, since one untracked file is enough for
+    /// `git worktree remove` to refuse forever. The primary is asserted too:
+    /// without the `.agency/worktrees/` rule it reports `?? .agency/`, and
+    /// `git add -A` stages the checkout as an embedded repository.
     #[test]
     fn ignore_rules_apply_inside_a_linked_worktree() {
         let root = repository_without_ignore_rules("exclude-linked");
@@ -590,6 +612,13 @@ mod tests {
         let sessions = worktree.path.join(".agency").join("sessions");
         std::fs::create_dir_all(&sessions).unwrap();
         std::fs::write(sessions.join("session.json"), "{}").unwrap();
+        // What `/init` writes into the worktree it runs in. `config.toml` is
+        // tracked; this one must never be committed, so it can only be ignored.
+        std::fs::write(
+            worktree.path.join(".agency").join("config.local.toml"),
+            "[workspace]\n",
+        )
+        .unwrap();
 
         let output = Command::new("git")
             .args(["status", "--porcelain"])
@@ -599,7 +628,18 @@ mod tests {
 
         assert!(
             String::from_utf8_lossy(&output.stdout).trim().is_empty(),
-            "session data must not read as untracked inside the worktree"
+            "nothing Agency writes may read as untracked inside the worktree: {}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+
+        let primary = Command::new("git")
+            .args(["status", "--porcelain"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        assert!(
+            String::from_utf8_lossy(&primary.stdout).trim().is_empty(),
+            "the checkout must not read as untracked in the primary"
         );
 
         std::fs::remove_dir_all(root).unwrap();

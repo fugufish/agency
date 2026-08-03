@@ -5,4 +5,5 @@
 .agency/sessions.json
 .agency/sessions/
 .agency/worktrees/**
+.agency/legacy-sessions/
 .agency/config.local.toml

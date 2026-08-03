@@ -115,4 +115,14 @@ The caller does not provide a session ID. Agency resolves the capability to the
 conversation ID and records the active Codex or Claude session ID as attribution
 metadata. Capabilities are revoked when Agency leaves the owning worktree.
 
+`create_worktree` checks the branch out at
+`<repository>/.agency/worktrees/<encoded-branch>`, inside the repository rather
+than beside it, so the checkout and the session history it accumulates live
+together and `remove_worktree` collects both. To keep that from showing up as
+untracked work, Agency adds its own paths — `.agency/sessions/`,
+`.agency/worktrees/`, `.agency/legacy-sessions/`, and `.agency/config.local.toml`
+— to the repository's `.git/info/exclude` at startup and when it creates a
+worktree. `info/exclude` is not a tracked file, so nothing you committed is
+edited, and one write covers every worktree.
+
 Product direction and architecture decisions live in [`docs`](docs/).
