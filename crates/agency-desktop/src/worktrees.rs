@@ -86,6 +86,50 @@ pub fn create(workspace: &Path, branch: &str, base: Option<&str>) -> Result<Work
     })
 }
 
+/// Removes the worktree checked out on `branch`, and with it everything the
+/// worktree directory holds — session history included, since git deletes the
+/// directory wholesale and Agency's session data is ignored rather than
+/// untracked.
+///
+/// The branch is left in place: removing a checkout is not abandoning the work.
+/// There is no force option. Git refuses a worktree with modified or untracked
+/// files, and that refusal is deliberate here — the checkout is recoverable
+/// from git, but the history removal destroys is not.
+pub fn remove(workspace: &Path, branch: &str) -> Result<Worktree, String> {
+    let branch = branch.trim();
+    let existing = discover(workspace)?;
+    let primary = existing
+        .first()
+        .ok_or_else(|| "Git did not report a primary worktree".to_owned())?
+        .clone();
+    let target = existing
+        .into_iter()
+        .find(|worktree| worktree.branch.as_deref() == Some(branch))
+        .ok_or_else(|| format!("No worktree is checked out on {branch}"))?;
+    if target.path == primary.path {
+        return Err(format!(
+            "{branch} is the primary worktree and cannot be removed"
+        ));
+    }
+
+    // Run from the primary, never from `workspace`: an agent inside the
+    // worktree it is removing would otherwise have git working from a
+    // directory that is being deleted underneath it.
+    let output = Command::new("git")
+        .args(["worktree", "remove"])
+        .arg(&target.path)
+        .current_dir(&primary.path)
+        .output()
+        .map_err(|error| format!("Could not remove Git worktree: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "Could not remove Git worktree: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    Ok(target)
+}
+
 fn parse_porcelain(output: &str) -> Vec<Worktree> {
     output
         .split("\n\n")
@@ -277,6 +321,120 @@ mod tests {
             error.contains("already exists"),
             "unexpected error: {error}"
         );
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// The behaviour the whole layout rests on: ignored files neither block the
+    /// removal nor survive it, so a worktree's session history is collected
+    /// with its checkout and no sweep is needed. Pinned here so a git upgrade
+    /// that changes it fails in this test rather than in production.
+    #[test]
+    fn removing_a_worktree_takes_its_session_history_with_it() {
+        let root = repository("remove-sessions");
+        let worktree = create(&root, "feature", None).unwrap();
+        let sessions = worktree.path.join(".agency").join("sessions").join("one");
+        std::fs::create_dir_all(&sessions).unwrap();
+        std::fs::write(
+            sessions.join("session.json"),
+            r#"{"conversation_id":"one"}"#,
+        )
+        .unwrap();
+        std::fs::write(sessions.join("image.bin"), vec![0u8; 200_000]).unwrap();
+
+        let removed = remove(&root, "feature").unwrap();
+
+        assert_eq!(removed.path, worktree.path);
+        assert!(!worktree.path.exists());
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// Removing a checkout is not abandoning the work.
+    #[test]
+    fn removing_a_worktree_leaves_the_branch_in_place() {
+        let root = repository("remove-branch");
+        create(&root, "feature", None).unwrap();
+
+        remove(&root, "feature").unwrap();
+
+        let output = Command::new("git")
+            .args(["branch", "--list", "feature"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("feature"),
+            "the branch should survive removal"
+        );
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// There is no force flag. Session history is not recoverable from git the
+    /// way a checkout is, so refusing here is what keeps removal from being a
+    /// surprise.
+    #[test]
+    fn refuses_to_remove_a_dirty_worktree() {
+        let root = repository("remove-dirty");
+        let worktree = create(&root, "feature", None).unwrap();
+        std::fs::write(worktree.path.join("README.md"), "edited\n").unwrap();
+
+        let error = remove(&root, "feature").unwrap_err();
+
+        assert!(
+            error.contains("Could not remove Git worktree"),
+            "unexpected error: {error}"
+        );
+        assert!(
+            worktree.path.exists(),
+            "the worktree must survive a refusal"
+        );
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn refuses_to_remove_the_primary_worktree() {
+        let root = repository("remove-primary");
+
+        let error = remove(&root, "main").unwrap_err();
+
+        assert!(
+            error.contains("primary worktree"),
+            "unexpected error: {error}"
+        );
+        assert!(root.join("README.md").is_file());
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn refuses_to_remove_a_branch_with_no_worktree() {
+        let root = repository("remove-unknown");
+
+        let error = remove(&root, "nonexistent").unwrap_err();
+
+        assert!(
+            error.contains("nonexistent"),
+            "the error should name the branch: {error}"
+        );
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// An agent inside a worktree may remove it. Running git from the primary
+    /// rather than from the caller's workspace means the command is not
+    /// executing inside the directory it is deleting.
+    #[test]
+    fn removes_a_worktree_from_inside_that_worktree() {
+        let root = repository("remove-self");
+        let worktree = create(&root, "feature", None).unwrap();
+
+        let removed = remove(&worktree.path, "feature").unwrap();
+
+        assert_eq!(removed.path, worktree.path);
+        assert!(!worktree.path.exists());
 
         std::fs::remove_dir_all(root).unwrap();
     }

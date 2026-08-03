@@ -109,6 +109,7 @@ The initial tools are:
 
 - `list_worktrees`
 - `create_worktree`
+- `remove_worktree`
 
 The caller does not provide a session ID. Agency resolves the capability to the
 conversation ID and records the active Codex or Claude session ID as attribution

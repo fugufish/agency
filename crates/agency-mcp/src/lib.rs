@@ -99,6 +99,21 @@ fn tools() -> Value {
                 "required": ["branch"],
                 "additionalProperties": false
             }
+        },
+        {
+            "name": "remove_worktree",
+            "description": "Remove a Git worktree from the caller's Agency workspace. The branch is kept; the worktree's session history is deleted with it. Refuses a worktree with uncommitted changes.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "branch": {
+                        "type": "string",
+                        "description": "Branch whose worktree should be removed."
+                    }
+                },
+                "required": ["branch"],
+                "additionalProperties": false
+            }
         }
     ])
 }
@@ -110,6 +125,7 @@ fn call_tool(id: Value, message: &Value, socket: &std::path::Path, token: &str) 
     let method = match name {
         "list_worktrees" => "worktree.list",
         "create_worktree" => "worktree.create",
+        "remove_worktree" => "worktree.remove",
         _ => return rpc_error(id, -32602, format!("Unknown Agency tool: {name}")),
     };
     let params = message

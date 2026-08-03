@@ -870,6 +870,9 @@ enum AppEvent {
     WorktreeCreated {
         worktree: Worktree,
     },
+    WorktreeRemoved {
+        branch: String,
+    },
     StartAgent(Provider),
     ResumeSession(usize),
     RequestSessionTrash(usize),
@@ -1293,6 +1296,7 @@ impl Agency {
             AppEvent::SelectWorktree(index) => self.select_worktree(index),
             AppEvent::WorktreesDiscovered { worktrees } => self.worktrees_discovered(worktrees),
             AppEvent::WorktreeCreated { worktree } => self.worktree_created(worktree),
+            AppEvent::WorktreeRemoved { branch } => self.worktree_removed(&branch),
             AppEvent::StartAgent(provider) => {
                 self.selected_agent = provider;
                 self.start_agent(provider);
@@ -2455,6 +2459,31 @@ impl Agency {
         }
     }
 
+    /// Drops the tab. If the user was looking at it, the move to the primary is
+    /// published as a follow-up event rather than called directly, so ordering
+    /// stays deterministic and `select_worktree`'s teardown — revoking RPC
+    /// capabilities, clearing agents, reloading sessions — runs exactly once.
+    fn worktree_removed(&mut self, branch: &str) {
+        let was_active = self
+            .worktrees
+            .get(self.active_worktree)
+            .is_some_and(|worktree| worktree.branch.as_deref() == Some(branch));
+        self.worktrees
+            .retain(|worktree| worktree.branch.as_deref() != Some(branch));
+        if self.worktrees.is_empty() {
+            return;
+        }
+        self.active_worktree = self
+            .worktrees
+            .iter()
+            .position(|worktree| worktree.path == self.cwd)
+            .unwrap_or(0);
+        if was_active {
+            self.emit(AppEvent::SelectWorktree(0));
+        }
+        self.notice = Some(format!("Removed worktree {branch}"));
+    }
+
     fn select_worktree(&mut self, index: usize) {
         let Some(worktree) = self.worktrees.get(index) else {
             return;
@@ -2690,6 +2719,25 @@ impl Agency {
                         worktrees::create(&call.context.workspace, branch, base).map(|worktree| {
                             let value = worktree_json(worktree.clone());
                             self.emit(AppEvent::WorktreeCreated { worktree });
+                            serde_json::json!({
+                                "caller": rpc_caller(&call.context),
+                                "worktree": value
+                            })
+                        })
+                    })
+                }
+                "worktree.remove" => {
+                    let branch = call
+                        .params
+                        .get("branch")
+                        .and_then(serde_json::Value::as_str)
+                        .ok_or_else(|| "remove_worktree requires a branch".to_owned());
+                    branch.and_then(|branch| {
+                        worktrees::remove(&call.context.workspace, branch).map(|worktree| {
+                            let value = worktree_json(worktree);
+                            self.emit(AppEvent::WorktreeRemoved {
+                                branch: branch.to_owned(),
+                            });
                             serde_json::json!({
                                 "caller": rpc_caller(&call.context),
                                 "worktree": value
@@ -7766,6 +7814,88 @@ mod tests {
         assert_eq!(agency.cwd, root);
 
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn removing_an_inactive_worktree_drops_its_tab_and_keeps_focus() {
+        let mut agency = Agency::for_testing();
+        let primary = std::path::PathBuf::from("/repo");
+        agency.cwd = primary.clone();
+        agency.worktrees = vec![
+            worktree_at(&primary, "main"),
+            worktree_at(
+                std::path::Path::new("/repo/.agency/worktrees/feature"),
+                "feature",
+            ),
+        ];
+        agency.active_worktree = 0;
+        // `Agency::for_testing` leaves the startup `WorktreesDiscovered` on the
+        // bus; drain it so the assertion below reflects only this reducer.
+        let _ = agency.drain_events();
+
+        let _ = agency.reduce_event(AppEvent::WorktreeRemoved {
+            branch: "feature".to_owned(),
+        });
+
+        assert_eq!(agency.worktrees.len(), 1);
+        assert_eq!(agency.active_worktree, 0);
+        assert_eq!(agency.cwd, primary);
+        assert!(agency.drain_events().is_empty());
+    }
+
+    /// Removing the worktree the user is looking at cannot fail the caller —
+    /// the tool would then succeed or fail based on which tab happens to be
+    /// focused. The app moves to the primary instead, as a follow-up event so
+    /// ordering stays deterministic rather than recursing into the handler.
+    #[test]
+    fn removing_the_active_worktree_falls_back_to_the_primary_tab() {
+        let mut agency = Agency::for_testing();
+        let primary = std::path::PathBuf::from("/repo");
+        let feature = std::path::PathBuf::from("/repo/.agency/worktrees/feature");
+        agency.cwd = feature.clone();
+        agency.worktrees = vec![
+            worktree_at(&primary, "main"),
+            worktree_at(&feature, "feature"),
+        ];
+        agency.active_worktree = 1;
+
+        let _ = agency.reduce_event(AppEvent::WorktreeRemoved {
+            branch: "feature".to_owned(),
+        });
+
+        assert_eq!(agency.worktrees.len(), 1);
+        assert!(
+            agency
+                .drain_events()
+                .iter()
+                .any(|event| matches!(event, AppEvent::SelectWorktree(0))),
+            "the app must move off the worktree it just deleted"
+        );
+    }
+
+    /// Worktree resolution must not care who is calling. `blueprint` is not a
+    /// provider Agency ships, and the caller block has to carry it through
+    /// unchanged — a `match` on provider anywhere in this path fails here
+    /// rather than at the next integration.
+    #[test]
+    fn worktree_calls_resolve_for_a_provider_agency_does_not_ship() {
+        let context = SessionContext {
+            conversation_id: "conversation-1".to_owned(),
+            workspace: std::path::PathBuf::from("/repo"),
+            provider: "blueprint".to_owned(),
+            provider_session_id: Some("blueprint-9".to_owned()),
+            generation: 3,
+        };
+
+        assert_eq!(
+            rpc_caller(&context),
+            serde_json::json!({
+                "agency_session_id": "conversation-1",
+                "provider": "blueprint",
+                "provider_session_id": "blueprint-9",
+                "generation": 3
+            })
+        );
     }
 
     #[test]
