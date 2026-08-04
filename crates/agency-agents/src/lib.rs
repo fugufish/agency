@@ -852,7 +852,13 @@ fn agency_harness_context(environment: &[(String, String)]) -> Option<String> {
         "You are running inside the Agency agentic coding harness. \
 Your Agency session ID is `{conversation_id}`. Agency's MCP tools are \
 session-scoped and automatically act on this session and its workspace; \
-do not ask the user for a session ID when calling them."
+do not ask the user for a session ID when calling them. \
+Your session is bound to the worktree it was started in, and that worktree is \
+its working directory. Do not move to another worktree: never `cd` into one and \
+never use a provider-native worktree-entry or worktree-switch tool. To get work \
+done in a different worktree, call `start_worktree_session` with that \
+worktree's branch, a prompt, and an agent — it starts a separate session there \
+that runs in parallel with yours."
     ))
 }
 
@@ -1125,6 +1131,22 @@ mod tests {
         assert!(context.contains("Agency agentic coding harness"));
         assert!(context.contains("`conversation-123`"));
         assert!(context.contains("do not ask the user for a session ID"));
+    }
+
+    /// The directive is the only thing stopping an agent from wandering into
+    /// another worktree, and both providers read it from this one string.
+    #[test]
+    fn harness_context_sends_cross_worktree_work_through_the_tool() {
+        let environment = vec![(
+            ENV_CONVERSATION_ID.to_owned(),
+            "conversation-123".to_owned(),
+        )];
+
+        let context = agency_harness_context(&environment).unwrap();
+
+        assert!(context.contains("start_worktree_session"));
+        assert!(context.contains("bound to the worktree"));
+        assert!(context.contains("never `cd` into one"));
     }
 
     #[test]
