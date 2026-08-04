@@ -2544,11 +2544,7 @@ impl Agency {
         self.slash_command_catalog = agency_commands();
         self.emit(AppEvent::SlashCatalogRequested);
         self.overlays.slash.close();
-        let agent_workspaces = self
-            .agents
-            .iter()
-            .map(|agent| agent.workspace.clone())
-            .collect::<Vec<_>>();
+        let agent_workspaces = self.agent_workspaces();
         self.active_agent =
             workspaces::active_after_switch(&agent_workspaces, &self.cwd, self.active_agent);
         self.emit(AppEvent::TerminalVisibilityChanged(false));
@@ -2812,11 +2808,7 @@ impl Agency {
                             .into_iter()
                             .find(|worktree| worktree.branch.as_deref() == Some(branch))
                             .ok_or_else(|| format!("No worktree is checked out on {branch}"))?;
-                        let agent_workspaces = self
-                            .agents
-                            .iter()
-                            .map(|agent| agent.workspace.clone())
-                            .collect::<Vec<_>>();
+                        let agent_workspaces = self.agent_workspaces();
                         if !workspaces::may_remove(&target.path, &primary.path, &agent_workspaces) {
                             return Err(format!(
                                 "{branch} is running an Agency session and cannot be removed"
@@ -3145,14 +3137,19 @@ impl Agency {
                     .iter()
                     .position(|agent| agent.conversation_id == record.conversation_id)
                 {
+                    // Focus is re-decided over the survivors rather than
+                    // clamped: the roster spans every worktree, so an index
+                    // that merely stays in range can focus a session in
+                    // another worktree while the rest of the UI still names
+                    // `cwd` — and the next keystroke would go there.
+                    let agent_workspaces = self.agent_workspaces();
+                    self.active_agent = workspaces::active_after_removal(
+                        &agent_workspaces,
+                        &[running_index],
+                        &self.cwd,
+                        self.active_agent,
+                    );
                     self.agents.remove(running_index);
-                    self.active_agent = match self.active_agent {
-                        Some(active) if active == running_index => {
-                            (!self.agents.is_empty()).then_some(active.min(self.agents.len() - 1))
-                        }
-                        Some(active) if active > running_index => Some(active - 1),
-                        active => active,
-                    };
                 }
                 self.toolbar.selected_session =
                     index.min(self.sessions().records().len().saturating_sub(1));
@@ -3223,11 +3220,24 @@ impl Agency {
     /// `self.agents` now holds sessions from every worktree at once (Task 4
     /// stopped clearing it on a worktree switch), so anything that means "the
     /// sessions on screen right now" — busy gates, MCP status badges — must
-    /// filter through this rather than scanning the whole vector.
+    /// filter through this rather than scanning the whole vector. The rule
+    /// itself lives in `workspaces::sessions_in_worktree`, so the one place
+    /// that decides which sessions belong to a worktree is also the one place
+    /// that is tested.
     fn agents_in_active_worktree(&self) -> impl Iterator<Item = &AgentView> {
+        let agent_workspaces = self.agent_workspaces();
+        workspaces::sessions_in_worktree(&agent_workspaces, &self.cwd)
+            .into_iter()
+            .filter_map(|index| self.agents.get(index))
+    }
+
+    /// The worktree each running session belongs to, in roster order, for the
+    /// pure decisions in `workspaces`.
+    fn agent_workspaces(&self) -> Vec<PathBuf> {
         self.agents
             .iter()
-            .filter(|agent| agent.workspace == self.cwd)
+            .map(|agent| agent.workspace.clone())
+            .collect()
     }
 
     fn ordered_session_indices(&self) -> Vec<usize> {

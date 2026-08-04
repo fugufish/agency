@@ -163,6 +163,51 @@ pub fn active_after_switch(
         .position(|workspace| workspace == cwd)
 }
 
+/// Which sessions in the roster belong to `target`.
+///
+/// `self.agents` holds every worktree's sessions at once now, so every scan
+/// that means "the sessions in this worktree" — the busy gate and MCP badges
+/// for the worktree on screen, the eviction a removal performs — has to go
+/// through this one rule rather than scanning the whole vector. Indices come
+/// back ascending, so a caller removing them can walk the result in reverse.
+pub fn sessions_in_worktree(agent_workspaces: &[PathBuf], target: &Path) -> Vec<usize> {
+    agent_workspaces
+        .iter()
+        .enumerate()
+        .filter(|(_, workspace)| workspace.as_path() == target)
+        .map(|(index, _)| index)
+        .collect()
+}
+
+/// The focused session after the sessions at `removed` leave the roster.
+///
+/// `agent_workspaces` is the roster *before* removal and the answer indexes the
+/// roster *after* it, because every surviving index at or past a removal
+/// shifts. Shifting alone is not enough: the roster spans every worktree, so an
+/// index that merely stays in range can land on a session in a worktree the
+/// user is not looking at, while the rest of the UI still names `cwd`. Focus is
+/// therefore re-decided with `active_after_switch` over the survivors, which
+/// keeps the previously focused session when it survived and belongs to `cwd`.
+pub fn active_after_removal(
+    agent_workspaces: &[PathBuf],
+    removed: &[usize],
+    cwd: &Path,
+    current: Option<usize>,
+) -> Option<usize> {
+    let survivors = agent_workspaces
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| !removed.contains(index))
+        .collect::<Vec<_>>();
+    let shifted =
+        current.and_then(|current| survivors.iter().position(|(index, _)| *index == current));
+    let surviving_workspaces = survivors
+        .into_iter()
+        .map(|(_, workspace)| workspace.clone())
+        .collect::<Vec<_>>();
+    active_after_switch(&surviving_workspaces, cwd, shifted)
+}
+
 /// Whether any running session belongs to `target`.
 pub fn has_live_session(agent_workspaces: &[PathBuf], target: &Path) -> bool {
     agent_workspaces.iter().any(|workspace| workspace == target)
@@ -379,6 +424,105 @@ mod tests {
         assert_eq!(
             active_after_switch(&workspaces, Path::new("/c"), Some(1)),
             None
+        );
+    }
+
+    /// The filtering rule every "sessions in this worktree" scan shares.
+    /// `self.agents` spans every worktree now, so a scan that forgets to filter
+    /// reports another worktree's sessions as if they were on screen.
+    #[test]
+    fn only_the_sessions_of_one_worktree_are_selected() {
+        let workspaces = vec![
+            PathBuf::from("/a"),
+            PathBuf::from("/b"),
+            PathBuf::from("/a"),
+        ];
+
+        assert_eq!(
+            sessions_in_worktree(&workspaces, Path::new("/a")),
+            vec![0, 2]
+        );
+        assert_eq!(sessions_in_worktree(&workspaces, Path::new("/b")), vec![1]);
+        assert!(sessions_in_worktree(&workspaces, Path::new("/c")).is_empty());
+    }
+
+    /// A prefix is not a match: a worktree nested under another must not drag
+    /// the parent's sessions into its own scans.
+    #[test]
+    fn a_nested_worktree_does_not_claim_its_parents_sessions() {
+        let workspaces = vec![PathBuf::from("/repo"), PathBuf::from("/repo/wt")];
+
+        assert_eq!(
+            sessions_in_worktree(&workspaces, Path::new("/repo")),
+            vec![0]
+        );
+    }
+
+    /// The regression test for focus after trashing a session: plain index
+    /// arithmetic over a roster that spans worktrees could focus a session in
+    /// another worktree while every other element still named `cwd`, so typing
+    /// would go to an agent the user cannot see.
+    #[test]
+    fn trashing_the_focused_session_keeps_focus_inside_the_worktree() {
+        let workspaces = vec![PathBuf::from("/a"), PathBuf::from("/b")];
+
+        // The user is in /b, focused on the only session there, and trashes it.
+        assert_eq!(
+            active_after_removal(&workspaces, &[1], Path::new("/b"), Some(1)),
+            None,
+            "no session is left in the worktree on screen, so nothing is focused"
+        );
+    }
+
+    /// Trashing one of several sessions in the worktree on screen falls back to
+    /// a sibling in that same worktree, not to whichever index survives.
+    #[test]
+    fn trashing_a_session_falls_back_to_a_sibling_in_the_same_worktree() {
+        let workspaces = vec![
+            PathBuf::from("/a"),
+            PathBuf::from("/b"),
+            PathBuf::from("/b"),
+        ];
+
+        assert_eq!(
+            active_after_removal(&workspaces, &[2], Path::new("/b"), Some(2)),
+            Some(1)
+        );
+    }
+
+    /// Removing a session ahead of the focused one shifts its index down; the
+    /// same session must stay focused rather than the roster sliding under it.
+    #[test]
+    fn removing_an_earlier_session_shifts_the_focused_index_down() {
+        let workspaces = vec![
+            PathBuf::from("/b"),
+            PathBuf::from("/a"),
+            PathBuf::from("/b"),
+        ];
+
+        assert_eq!(
+            active_after_removal(&workspaces, &[0], Path::new("/b"), Some(2)),
+            Some(1)
+        );
+    }
+
+    /// Several sessions can leave the roster at once — a worktree removal
+    /// evicts every session that belonged to it. Focus has to survive that as a
+    /// group, not one removal at a time.
+    #[test]
+    fn removing_a_group_of_sessions_leaves_focus_on_the_worktree_on_screen() {
+        let workspaces = vec![
+            PathBuf::from("/a"),
+            PathBuf::from("/wt"),
+            PathBuf::from("/wt"),
+            PathBuf::from("/a"),
+        ];
+        let removed = sessions_in_worktree(&workspaces, Path::new("/wt"));
+
+        assert_eq!(
+            active_after_removal(&workspaces, &removed, Path::new("/a"), Some(3)),
+            Some(1),
+            "the focused session survives, re-indexed after the removals ahead of it"
         );
     }
 
