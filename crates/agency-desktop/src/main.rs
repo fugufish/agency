@@ -726,11 +726,14 @@ impl TranscriptImage {
     }
 }
 
-fn mcp_server_state(server: &McpServer, agents: &[AgentView]) -> McpServerState {
+fn mcp_server_state<'a>(
+    server: &McpServer,
+    agents: impl IntoIterator<Item = &'a AgentView>,
+) -> McpServerState {
     if mcp_server_requires_auth(server) {
         McpServerState::RequiresAuthentication
     } else if agents
-        .iter()
+        .into_iter()
         .any(|agent| agent.mcp_status == McpStatus::Disconnected)
     {
         McpServerState::Error
@@ -2263,19 +2266,17 @@ impl Agency {
             return Err(format!("MCP server {name:?} is disabled in Codex"));
         }
         if self
-            .agents
-            .iter()
+            .agents_in_active_worktree()
             .any(|agent| agent.activity.is_busy() || !agent.queued_messages.is_empty())
         {
             return Err(
                 "Wait for every agent to become idle before changing MCP servers".to_owned(),
             );
         }
-        if self.agents.iter().any(|agent| {
-            agent.workspace == self.cwd
-                && agent.session.provider() == Provider::Claude
-                && agent.session_id.is_none()
-        }) {
+        if self
+            .agents_in_active_worktree()
+            .any(|agent| agent.session.provider() == Provider::Claude && agent.session_id.is_none())
+        {
             return Err(
                 "Wait for every Claude Code agent to finish connecting before changing MCP servers"
                     .to_owned(),
@@ -2480,8 +2481,10 @@ impl Agency {
 
     /// Drops the tab. If the user was looking at it, the move to the primary is
     /// published as a follow-up event rather than called directly, so ordering
-    /// stays deterministic and `select_worktree`'s teardown — revoking RPC
-    /// capabilities, clearing agents, reloading sessions — runs exactly once.
+    /// stays deterministic and `select_worktree`'s refocus — loading the new
+    /// worktree's state and re-picking the active agent and terminal for it —
+    /// runs exactly once. Sessions belonging to the removed worktree are left
+    /// running; nothing here tears them down.
     fn worktree_removed(&mut self, removed: &Worktree) {
         let was_active = self
             .worktrees
@@ -3152,6 +3155,16 @@ impl Agency {
             .and_then(|index| self.agents.get_mut(index))
     }
 
+    /// `self.agents` now holds sessions from every worktree at once (Task 4
+    /// stopped clearing it on a worktree switch), so anything that means "the
+    /// sessions on screen right now" — busy gates, MCP status badges — must
+    /// filter through this rather than scanning the whole vector.
+    fn agents_in_active_worktree(&self) -> impl Iterator<Item = &AgentView> {
+        self.agents
+            .iter()
+            .filter(|agent| agent.workspace == self.cwd)
+    }
+
     fn ordered_session_indices(&self) -> Vec<usize> {
         let active_conversation_id = self
             .active_agent()
@@ -3549,8 +3562,10 @@ impl Agency {
                     .into()
                 }
                 (true, SidebarTool::Mcp) => {
-                    let agency_state =
-                        agency_mcp_server_state(self.agents.iter().map(|agent| agent.mcp_status));
+                    let agency_state = agency_mcp_server_state(
+                        self.agents_in_active_worktree()
+                            .map(|agent| agent.mcp_status),
+                    );
                     let agency_access_tags =
                         self.configured_agents
                             .iter()
@@ -3590,7 +3605,7 @@ impl Agency {
                     let servers = self.mcp_servers().iter().fold(
                         column![agency_server].spacing(8),
                         |servers, server| {
-                            let state = mcp_server_state(server, &self.agents);
+                            let state = mcp_server_state(server, self.agents_in_active_worktree());
                             let access_tags = self.configured_agents.iter().fold(
                                 row![].spacing(5),
                                 |tags, provider| {
