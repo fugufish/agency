@@ -158,10 +158,13 @@ notice.
 - A spawn failure pushes no `AgentView`, revokes the RPC capability that was
   issued, and returns the spawn error.
 - `worktree.remove` gains a guard: it already refuses a worktree with
-  uncommitted changes, and must also refuse one that has a live session, naming
-  it. Without that, removing a worktree leaves a delegated agent working in a
-  deleted directory. This is a direct consequence of sessions outliving worktree
-  switches.
+  uncommitted changes and the primary worktree, and now refuses one whose
+  session is currently working (busy or with queued messages), naming the branch
+  and telling the caller to retry once idle. Idle sessions in the worktree are
+  ended when removal succeeds. Without this scope, a remove that abandoned a
+  busy delegated agent would leave it working in a deleted directory, but
+  refusing all sessions regardless of state would prevent delegating tasks
+  via worktrees since nothing ever removes a finished session from the roster.
 
 ## Testing
 

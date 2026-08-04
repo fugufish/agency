@@ -626,7 +626,7 @@ mod tests {
 
     /// A worktree nobody is running a session in may be removed.
     #[test]
-    fn a_worktree_with_no_session_may_be_removed() {
+    fn idle_worktrees_may_be_removed_despite_sessions_elsewhere() {
         let sessions = vec![session("/repo", true)];
 
         assert!(may_remove(
