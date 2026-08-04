@@ -17,20 +17,24 @@ report blockers clearly, and do not overwrite unrelated work.
 
 ## Work in a worktree
 
-- Start every new feature, task, or bugfix by creating a worktree for it and
-  doing the work there. Do not commit new work directly in the primary
-  checkout.
+- Start every new feature, task, or bugfix by creating a worktree for it, then
+  hand the work to it with `start_worktree_session`. Do not commit new work
+  directly in the primary checkout.
 - Creating the worktree is a pre-condition of the `superpowers:brainstorming`
   skill. When that skill is invoked, create the feature's worktree and its
-  branch first, enter it, and only then begin the brainstorming dialogue, so
-  the design conversation, any notes or specs it produces, and the
-  implementation that follows all live on the same branch.
+  branch first, then hand the work to it with `start_worktree_session`, so the
+  design conversation, any notes or specs it produces, and the implementation
+  that follows all live on the same branch.
 - Derive the worktree and branch name from the idea the user brought, before
   the design is settled; rename the branch later if the brainstorm reshapes
   the work. Do not delay the worktree until the design is agreed.
 - Create and manage worktrees with Agency's worktree tools, which are
   session-scoped; never ask the user for an Agency session ID and never fall
   back to raw `git worktree` commands when a tool covers the operation.
+- A session is bound to the worktree it was started in. `start_worktree_session`
+  is the only way into another worktree: never `cd` into one and never use a
+  provider-native worktree-entry tool. The session it starts runs in parallel,
+  and the user reaches it from that worktree's tab.
 - Name the worktree and its branch after the work it holds, so concurrent
   agents can tell one task's worktree from another's.
 - One task per worktree. If a request turns out to cover unrelated work, split
