@@ -7,6 +7,7 @@ mod sessions;
 mod slash_commands;
 mod terminal;
 mod ui_theme;
+mod workspaces;
 mod worktrees;
 
 use std::borrow::Cow;
