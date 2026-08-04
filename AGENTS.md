@@ -17,9 +17,9 @@ report blockers clearly, and do not overwrite unrelated work.
 
 ## Work in a worktree
 
-- Start every new feature, task, or bugfix by creating a worktree for it and
-  doing the work there. Do not commit new work directly in the primary
-  checkout.
+- Start every new feature, task, or bugfix by creating a worktree for it, then
+  hand the work to it with `start_worktree_session`. Do not commit new work
+  directly in the primary checkout.
 - Creating the worktree is a pre-condition of the `superpowers:brainstorming`
   skill. When that skill is invoked, create the feature's worktree and its
   branch first, then hand the work to it with `start_worktree_session`, so the
