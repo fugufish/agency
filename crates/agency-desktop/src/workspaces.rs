@@ -163,6 +163,11 @@ pub fn active_after_switch(
         .position(|workspace| workspace == cwd)
 }
 
+/// Whether any running session belongs to `target`.
+pub fn has_live_session(agent_workspaces: &[PathBuf], target: &Path) -> bool {
+    agent_workspaces.iter().any(|workspace| workspace == target)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -362,6 +367,16 @@ mod tests {
             active_after_switch(&workspaces, Path::new("/c"), Some(1)),
             None
         );
+    }
+
+    /// Sessions outlive a worktree switch now, so removing a worktree could
+    /// otherwise delete the directory a running agent is working in.
+    #[test]
+    fn a_worktree_running_a_session_is_detected() {
+        let workspaces = vec![PathBuf::from("/repo"), PathBuf::from("/repo/wt")];
+
+        assert!(has_live_session(&workspaces, Path::new("/repo/wt")));
+        assert!(!has_live_session(&workspaces, Path::new("/repo/other")));
     }
 
     /// A load failure (I/O error, corrupt session file) must not leave the

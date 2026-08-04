@@ -102,7 +102,7 @@ fn tools() -> Value {
         },
         {
             "name": "remove_worktree",
-            "description": "Remove a Git worktree from the caller's Agency workspace. The branch is kept; the worktree's session history is deleted with it. Refuses a worktree with uncommitted changes.",
+            "description": "Remove a Git worktree from the caller's Agency workspace. The branch is kept; the worktree's session history is deleted with it. Refuses a worktree with uncommitted changes or a running session.",
             "inputSchema": {
                 "type": "object",
                 "properties": {

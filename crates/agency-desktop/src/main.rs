@@ -2802,6 +2802,20 @@ impl Agency {
                         .and_then(serde_json::Value::as_str)
                         .ok_or_else(|| "remove_worktree requires a branch".to_owned());
                     branch.and_then(|branch| {
+                        let target = worktrees::discover(&call.context.workspace)?
+                            .into_iter()
+                            .find(|worktree| worktree.branch.as_deref() == Some(branch))
+                            .ok_or_else(|| format!("No worktree is checked out on {branch}"))?;
+                        let agent_workspaces = self
+                            .agents
+                            .iter()
+                            .map(|agent| agent.workspace.clone())
+                            .collect::<Vec<_>>();
+                        if workspaces::has_live_session(&agent_workspaces, &target.path) {
+                            return Err(format!(
+                                "{branch} is running an Agency session and cannot be removed"
+                            ));
+                        }
                         worktrees::remove(&call.context.workspace, branch).map(|worktree| {
                             self.emit(AppEvent::WorktreeRemoved {
                                 worktree: worktree.clone(),
