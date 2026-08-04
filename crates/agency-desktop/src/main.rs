@@ -2502,9 +2502,14 @@ impl Agency {
     /// published as a follow-up event rather than called directly, so ordering
     /// stays deterministic and `select_worktree`'s refocus — loading the new
     /// worktree's state and re-picking the active agent and terminal for it —
-    /// runs exactly once. Sessions belonging to the removed worktree are left
-    /// running; nothing here tears them down.
+    /// runs exactly once.
+    ///
+    /// The removed worktree's sessions end here. Removal is deliberate and
+    /// `worktrees::remove` already refuses a worktree with uncommitted changes,
+    /// so an agent left pointed at a deleted checkout — still holding an RPC
+    /// capability scoped to it — is worse than an ended session.
     fn worktree_removed(&mut self, removed: &Worktree) {
+        self.evict_sessions_in(&removed.path);
         let was_active = self
             .worktrees
             .get(self.active_worktree)
@@ -2523,6 +2528,30 @@ impl Agency {
             self.emit(AppEvent::SelectWorktree(0));
         }
         self.notice = Some(format!("Removed worktree {}", removed.label));
+    }
+
+    /// Ends the sessions that belonged to a worktree Agency just removed. Their
+    /// working directory no longer exists, so the views are dropped and each
+    /// one's RPC capability is revoked — leaving them in the roster would let a
+    /// deleted checkout keep answering worktree tools. Focus is re-decided over
+    /// the survivors rather than shifted, so it cannot land in a worktree the
+    /// user is not looking at.
+    fn evict_sessions_in(&mut self, workspace: &Path) {
+        let agent_workspaces = self.agent_workspaces();
+        let evicted = workspaces::sessions_in_worktree(&agent_workspaces, workspace);
+        if evicted.is_empty() {
+            return;
+        }
+        self.active_agent = workspaces::active_after_removal(
+            &agent_workspaces,
+            &evicted,
+            &self.cwd,
+            self.active_agent,
+        );
+        for index in evicted.into_iter().rev() {
+            let agent = self.agents.remove(index);
+            self.rpc_capabilities.revoke(&agent.rpc_token);
+        }
     }
 
     fn select_worktree(&mut self, index: usize) {
@@ -2808,11 +2837,9 @@ impl Agency {
                             .into_iter()
                             .find(|worktree| worktree.branch.as_deref() == Some(branch))
                             .ok_or_else(|| format!("No worktree is checked out on {branch}"))?;
-                        let agent_workspaces = self.agent_workspaces();
-                        if !workspaces::may_remove(&target.path, &primary.path, &agent_workspaces) {
-                            return Err(format!(
-                                "{branch} is running an Agency session and cannot be removed"
-                            ));
+                        let sessions = self.running_sessions();
+                        if !workspaces::may_remove(&target.path, &primary.path, &sessions) {
+                            return Err(workspaces::working_session_refusal(branch));
                         }
                         worktrees::remove(&call.context.workspace, branch).map(|worktree| {
                             self.emit(AppEvent::WorktreeRemoved {
@@ -3237,6 +3264,20 @@ impl Agency {
         self.agents
             .iter()
             .map(|agent| agent.workspace.clone())
+            .collect()
+    }
+
+    /// Every running session paired with whether it is still doing work — what
+    /// `workspaces::may_remove` decides on. A session that has gone idle is not
+    /// working: nothing drops an `AgentView` when its session ends, so treating
+    /// a finished session as live would block its worktree's removal forever.
+    fn running_sessions(&self) -> Vec<workspaces::RunningSession> {
+        self.agents
+            .iter()
+            .map(|agent| workspaces::RunningSession {
+                workspace: agent.workspace.clone(),
+                working: agent.activity.is_busy() || !agent.queued_messages.is_empty(),
+            })
             .collect()
     }
 

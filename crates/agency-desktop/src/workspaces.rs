@@ -208,22 +208,52 @@ pub fn active_after_removal(
     active_after_switch(&surviving_workspaces, cwd, shifted)
 }
 
-/// Whether any running session belongs to `target`.
-pub fn has_live_session(agent_workspaces: &[PathBuf], target: &Path) -> bool {
-    agent_workspaces.iter().any(|workspace| workspace == target)
+/// One running session, reduced to what removing a worktree has to decide
+/// about: where it runs, and whether it is still doing anything.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunningSession {
+    pub workspace: PathBuf,
+    /// The session is mid-turn, waiting on the user, or holding messages it has
+    /// not sent yet.
+    pub working: bool,
+}
+
+/// Whether a session in `target` is still working.
+///
+/// Deliberately not "a session exists here". Nothing removes an `AgentView`
+/// when a session finishes — agents carry no process-exit event — so a session
+/// that merely *ran* here once would block removal of its worktree forever,
+/// and the agent that delegated the work would have no way to clear it: it
+/// cannot trash another worktree's session, and it must not enter that
+/// worktree. Only work actually in flight is worth refusing for, because that
+/// refusal clears itself.
+pub fn has_working_session(sessions: &[RunningSession], target: &Path) -> bool {
+    sessions
+        .iter()
+        .any(|session| session.working && session.workspace.as_path() == target)
 }
 
 /// Whether `target` may be removed, given which worktree is primary and
-/// which sessions are currently running.
+/// what its sessions are doing.
 ///
 /// The primary worktree is refused unconditionally by `worktrees::remove`
-/// itself, with a message naming that as the reason. A live session running
+/// itself, with a message naming that as the reason. A working session running
 /// in the primary worktree too must not shadow that permanent refusal with
-/// the transient, fixable-sounding "session is running" one — so this
+/// the transient, fixable-sounding "session is working" one — so this
 /// returns `true` for the primary regardless of what is running there,
 /// deferring the decision to `worktrees::remove`.
-pub fn may_remove(target: &Path, primary: &Path, agent_workspaces: &[PathBuf]) -> bool {
-    target == primary || !has_live_session(agent_workspaces, target)
+pub fn may_remove(target: &Path, primary: &Path, sessions: &[RunningSession]) -> bool {
+    target == primary || !has_working_session(sessions, target)
+}
+
+/// The refusal a caller sees when work is still in flight in the worktree it
+/// asked to remove. It has to name the remedy, because the condition is
+/// temporary: the caller waits for the session to go idle and asks again.
+pub fn working_session_refusal(branch: &str) -> String {
+    format!(
+        "An Agency session is still working in {branch}. Wait for it to go idle, then remove the \
+worktree again."
+    )
 }
 
 #[cfg(test)]
@@ -526,54 +556,110 @@ mod tests {
         );
     }
 
+    fn session(workspace: &str, working: bool) -> RunningSession {
+        RunningSession {
+            workspace: PathBuf::from(workspace),
+            working,
+        }
+    }
+
     /// Sessions outlive a worktree switch now, so removing a worktree could
     /// otherwise delete the directory a running agent is working in.
     #[test]
-    fn a_worktree_running_a_session_is_detected() {
-        let workspaces = vec![PathBuf::from("/repo"), PathBuf::from("/repo/wt")];
+    fn a_worktree_running_a_working_session_is_detected() {
+        let sessions = vec![session("/repo", true), session("/repo/wt", true)];
 
-        assert!(has_live_session(&workspaces, Path::new("/repo/wt")));
-        assert!(!has_live_session(&workspaces, Path::new("/repo/other")));
+        assert!(has_working_session(&sessions, Path::new("/repo/wt")));
+        assert!(!has_working_session(&sessions, Path::new("/repo/other")));
     }
 
-    /// A live session outside the primary worktree blocks removal — this is
+    /// The bug that replaced the old "a session lives here" guard: nothing
+    /// drops an `AgentView` when its session finishes, so a worktree that had
+    /// ever hosted a session was un-removable forever — breaking the
+    /// delegate-then-clean-up workflow `start_worktree_session` exists for.
+    #[test]
+    fn a_session_that_has_stopped_working_does_not_count_as_working() {
+        let sessions = vec![session("/repo/wt", false)];
+
+        assert!(!has_working_session(&sessions, Path::new("/repo/wt")));
+    }
+
+    /// A working session outside the primary worktree blocks removal — this is
     /// the ordinary case the guard exists for.
     #[test]
-    fn a_non_primary_worktree_with_a_live_session_may_not_be_removed() {
-        let workspaces = vec![PathBuf::from("/repo"), PathBuf::from("/repo/wt")];
+    fn a_non_primary_worktree_with_a_working_session_may_not_be_removed() {
+        let sessions = vec![session("/repo", true), session("/repo/wt", true)];
 
         assert!(!may_remove(
             Path::new("/repo/wt"),
             Path::new("/repo"),
-            &workspaces
+            &sessions
+        ));
+    }
+
+    /// An idle session is not a reason to keep a worktree. Removal is
+    /// deliberate and `worktrees::remove` already refuses uncommitted changes,
+    /// so the session ends with the directory it was working in.
+    #[test]
+    fn a_worktree_whose_session_went_idle_may_be_removed() {
+        let sessions = vec![session("/repo/wt", false)];
+
+        assert!(may_remove(
+            Path::new("/repo/wt"),
+            Path::new("/repo"),
+            &sessions
         ));
     }
 
     /// A worktree nobody is running a session in may be removed.
     #[test]
-    fn a_worktree_with_no_live_session_may_be_removed() {
-        let workspaces = vec![PathBuf::from("/repo")];
+    fn a_worktree_with_no_session_may_be_removed() {
+        let sessions = vec![session("/repo", true)];
 
         assert!(may_remove(
             Path::new("/repo/wt"),
             Path::new("/repo"),
-            &workspaces
+            &sessions
         ));
     }
 
-    /// The motivating case: a session happens to be running in the primary
+    /// The motivating case: a session happens to be working in the primary
     /// worktree too. `worktrees::remove` refuses the primary unconditionally
-    /// and permanently, so `may_remove` must not claim the live session is
+    /// and permanently, so `may_remove` must not claim the working session is
     /// the reason removal fails — it defers to that refusal instead.
     #[test]
-    fn a_primary_worktree_with_a_live_session_defers_to_the_primary_refusal() {
-        let workspaces = vec![PathBuf::from("/repo")];
+    fn a_primary_worktree_with_a_working_session_defers_to_the_primary_refusal() {
+        let sessions = vec![session("/repo", true)];
 
         assert!(may_remove(
             Path::new("/repo"),
             Path::new("/repo"),
-            &workspaces
+            &sessions
         ));
+    }
+
+    /// The refusal is temporary, so it has to tell the caller how to get past
+    /// it. A message that only says "cannot be removed" reads as permanent and
+    /// leaves a delegating agent with nothing to try.
+    #[test]
+    fn the_refusal_names_the_branch_and_the_remedy() {
+        let refusal = working_session_refusal("feature");
+
+        assert!(refusal.contains("feature"));
+        assert!(refusal.contains("idle"));
+    }
+
+    /// Removing the worktree the user is looking at leaves nothing focused
+    /// here; `SelectWorktree` re-picks once `cwd` has moved.
+    #[test]
+    fn evicting_the_worktree_on_screen_focuses_nothing() {
+        let workspaces = vec![PathBuf::from("/wt"), PathBuf::from("/a")];
+        let evicted = sessions_in_worktree(&workspaces, Path::new("/wt"));
+
+        assert_eq!(
+            active_after_removal(&workspaces, &evicted, Path::new("/wt"), Some(0)),
+            None
+        );
     }
 
     /// A load failure (I/O error, corrupt session file) must not leave the
