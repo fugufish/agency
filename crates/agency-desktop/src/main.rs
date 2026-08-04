@@ -2522,11 +2522,13 @@ impl Agency {
         self.slash_command_catalog = agency_commands();
         self.emit(AppEvent::SlashCatalogRequested);
         self.overlays.slash.close();
-        for agent in &self.agents {
-            self.rpc_capabilities.revoke(&agent.rpc_token);
-        }
-        self.agents.clear();
-        self.active_agent = None;
+        let agent_workspaces = self
+            .agents
+            .iter()
+            .map(|agent| agent.workspace.clone())
+            .collect::<Vec<_>>();
+        self.active_agent =
+            workspaces::active_after_switch(&agent_workspaces, &self.cwd, self.active_agent);
         self.emit(AppEvent::TerminalVisibilityChanged(false));
         self.active_terminal = self
             .terminals

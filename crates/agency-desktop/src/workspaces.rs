@@ -79,6 +79,22 @@ impl Default for Workspaces {
     }
 }
 
+/// Which session should be focused after the user switches to `cwd`, given the
+/// worktree each running session belongs to. Sessions outside `cwd` keep
+/// running; they are simply not the ones on screen.
+pub fn active_after_switch(
+    agent_workspaces: &[PathBuf],
+    cwd: &Path,
+    current: Option<usize>,
+) -> Option<usize> {
+    if current.is_some_and(|index| agent_workspaces.get(index).is_some_and(|w| w == cwd)) {
+        return current;
+    }
+    agent_workspaces
+        .iter()
+        .position(|workspace| workspace == cwd)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -161,6 +177,50 @@ mod tests {
                 .registry
                 .records()
                 .is_empty()
+        );
+    }
+
+    /// Switching worktrees must move focus to a session that lives in the new
+    /// worktree, exactly as the terminal list already re-selects by directory.
+    #[test]
+    fn switching_focuses_a_session_in_the_new_worktree() {
+        let workspaces = vec![
+            PathBuf::from("/a"),
+            PathBuf::from("/b"),
+            PathBuf::from("/b"),
+        ];
+
+        assert_eq!(
+            active_after_switch(&workspaces, Path::new("/b"), Some(0)),
+            Some(1)
+        );
+    }
+
+    /// A switch that lands back on the focused session's own worktree leaves it
+    /// focused rather than jumping to the first one in the list.
+    #[test]
+    fn switching_keeps_a_session_that_already_belongs_to_the_worktree() {
+        let workspaces = vec![
+            PathBuf::from("/a"),
+            PathBuf::from("/b"),
+            PathBuf::from("/b"),
+        ];
+
+        assert_eq!(
+            active_after_switch(&workspaces, Path::new("/b"), Some(2)),
+            Some(2)
+        );
+    }
+
+    /// A worktree with no sessions focuses nothing — and, critically, the
+    /// roster it was given is unchanged, because sessions elsewhere keep running.
+    #[test]
+    fn switching_to_an_empty_worktree_focuses_nothing() {
+        let workspaces = vec![PathBuf::from("/a"), PathBuf::from("/b")];
+
+        assert_eq!(
+            active_after_switch(&workspaces, Path::new("/c"), Some(1)),
+            None
         );
     }
 
