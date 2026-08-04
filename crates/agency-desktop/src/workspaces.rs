@@ -168,6 +168,19 @@ pub fn has_live_session(agent_workspaces: &[PathBuf], target: &Path) -> bool {
     agent_workspaces.iter().any(|workspace| workspace == target)
 }
 
+/// Whether `target` may be removed, given which worktree is primary and
+/// which sessions are currently running.
+///
+/// The primary worktree is refused unconditionally by `worktrees::remove`
+/// itself, with a message naming that as the reason. A live session running
+/// in the primary worktree too must not shadow that permanent refusal with
+/// the transient, fixable-sounding "session is running" one — so this
+/// returns `true` for the primary regardless of what is running there,
+/// deferring the decision to `worktrees::remove`.
+pub fn may_remove(target: &Path, primary: &Path, agent_workspaces: &[PathBuf]) -> bool {
+    target == primary || !has_live_session(agent_workspaces, target)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -377,6 +390,46 @@ mod tests {
 
         assert!(has_live_session(&workspaces, Path::new("/repo/wt")));
         assert!(!has_live_session(&workspaces, Path::new("/repo/other")));
+    }
+
+    /// A live session outside the primary worktree blocks removal — this is
+    /// the ordinary case the guard exists for.
+    #[test]
+    fn a_non_primary_worktree_with_a_live_session_may_not_be_removed() {
+        let workspaces = vec![PathBuf::from("/repo"), PathBuf::from("/repo/wt")];
+
+        assert!(!may_remove(
+            Path::new("/repo/wt"),
+            Path::new("/repo"),
+            &workspaces
+        ));
+    }
+
+    /// A worktree nobody is running a session in may be removed.
+    #[test]
+    fn a_worktree_with_no_live_session_may_be_removed() {
+        let workspaces = vec![PathBuf::from("/repo")];
+
+        assert!(may_remove(
+            Path::new("/repo/wt"),
+            Path::new("/repo"),
+            &workspaces
+        ));
+    }
+
+    /// The motivating case: a session happens to be running in the primary
+    /// worktree too. `worktrees::remove` refuses the primary unconditionally
+    /// and permanently, so `may_remove` must not claim the live session is
+    /// the reason removal fails — it defers to that refusal instead.
+    #[test]
+    fn a_primary_worktree_with_a_live_session_defers_to_the_primary_refusal() {
+        let workspaces = vec![PathBuf::from("/repo")];
+
+        assert!(may_remove(
+            Path::new("/repo"),
+            Path::new("/repo"),
+            &workspaces
+        ));
     }
 
     /// A load failure (I/O error, corrupt session file) must not leave the
