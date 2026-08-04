@@ -73,6 +73,19 @@ impl Workspaces {
                 mcp_servers: Vec::new(),
             })
     }
+
+    /// Drops everything cached for a worktree that no longer exists.
+    ///
+    /// `ensure` early-returns on a key it already holds, and `worktrees::create`
+    /// builds a deterministic path from the branch name — so removing a branch's
+    /// worktree and creating it again reuses the same key. Without this, the
+    /// fresh worktree would resolve to the deleted one's cached registry, and
+    /// the next `record` would `save` every stale record back to disk,
+    /// re-materialising sessions that died with the worktree, bound to provider
+    /// session IDs that no longer exist. It also bounds the map's growth.
+    pub fn forget(&mut self, workspace: &Path) {
+        self.states.remove(workspace);
+    }
 }
 
 impl Default for Workspaces {
@@ -659,6 +672,43 @@ mod tests {
         assert_eq!(
             active_after_removal(&workspaces, &evicted, Path::new("/wt"), Some(0)),
             None
+        );
+    }
+
+    /// A worktree whose branch is recreated resolves to the same deterministic
+    /// path, so a state left behind by the removed worktree would hand the new
+    /// one the deleted sessions — and the next `record` would `save` them all
+    /// back to disk under a fresh `session.json`.
+    #[test]
+    fn forgetting_a_worktree_drops_its_cached_sessions() {
+        let workspace = temp_workspace("forget");
+        let mut workspaces = Workspaces::new();
+        workspaces
+            .ensure(&workspace)
+            .expect("could not load the worktree");
+        workspaces
+            .state_mut(&workspace)
+            .registry
+            .record(
+                Provider::Claude,
+                "claude-1".to_owned(),
+                Some("Delegated".to_owned()),
+            )
+            .expect("could not record the session");
+        assert_eq!(workspaces.state(&workspace).registry.records().len(), 1);
+
+        workspaces.forget(&workspace);
+        // The directory goes with the worktree; recreating the branch rebuilds
+        // it empty, which is what `ensure` must now see.
+        std::fs::remove_dir_all(&workspace).expect("could not remove the worktree directory");
+        std::fs::create_dir_all(&workspace).expect("could not recreate the worktree directory");
+        workspaces
+            .ensure(&workspace)
+            .expect("could not reload the recreated worktree");
+
+        assert!(
+            workspaces.state(&workspace).registry.records().is_empty(),
+            "a recreated worktree must not inherit the removed one's sessions"
         );
     }
 

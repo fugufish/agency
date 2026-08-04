@@ -2504,12 +2504,14 @@ impl Agency {
     /// worktree's state and re-picking the active agent and terminal for it —
     /// runs exactly once.
     ///
-    /// The removed worktree's sessions end here. Removal is deliberate and
-    /// `worktrees::remove` already refuses a worktree with uncommitted changes,
-    /// so an agent left pointed at a deleted checkout — still holding an RPC
-    /// capability scoped to it — is worse than an ended session.
+    /// The removed worktree's sessions end here and its cached state is
+    /// forgotten. Removal is deliberate and `worktrees::remove` already refuses
+    /// a worktree with uncommitted changes, so an agent left pointed at a
+    /// deleted checkout — still holding an RPC capability scoped to it — is
+    /// worse than an ended session.
     fn worktree_removed(&mut self, removed: &Worktree) {
         self.evict_sessions_in(&removed.path);
+        self.workspaces.forget(&removed.path);
         let was_active = self
             .worktrees
             .get(self.active_worktree)
