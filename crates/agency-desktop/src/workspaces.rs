@@ -81,10 +81,6 @@ impl Default for Workspaces {
     }
 }
 
-/// Gains a production caller in a later task of this series (the RPC handler
-/// for `worktree.start_session`, which spawns the resolved request); until
-/// then it is exercised only by tests.
-#[allow(dead_code)]
 #[derive(Debug)]
 pub struct StartRequest {
     pub worktree: Worktree,
@@ -95,10 +91,6 @@ pub struct StartRequest {
 /// Turns `start_worktree_session` arguments into something startable, or into
 /// the error the caller sees. Every refusal happens here, before a process is
 /// spawned, so a mistyped branch or agent costs nothing.
-///
-/// Gains a production caller in a later task of this series (the RPC handler
-/// for `worktree.start_session`); until then it is exercised only by tests.
-#[allow(dead_code)]
 pub fn resolve_start_request(
     params: &Value,
     worktrees: &[Worktree],

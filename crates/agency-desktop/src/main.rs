@@ -877,6 +877,14 @@ enum AppEvent {
     WorktreeRemoved {
         worktree: Worktree,
     },
+    /// A tool call started a session in `worktree`. Focus does not move: the
+    /// caller keeps its own worktree, and the notice is how the user learns
+    /// where the new session is.
+    WorktreeSessionStarted {
+        conversation_id: String,
+        worktree: Worktree,
+        provider: Provider,
+    },
     StartAgent(Provider),
     ResumeSession(usize),
     RequestSessionTrash(usize),
@@ -1302,6 +1310,17 @@ impl Agency {
             AppEvent::WorktreesDiscovered { worktrees } => self.worktrees_discovered(worktrees),
             AppEvent::WorktreeCreated { worktree } => self.worktree_created(worktree),
             AppEvent::WorktreeRemoved { worktree } => self.worktree_removed(&worktree),
+            AppEvent::WorktreeSessionStarted {
+                conversation_id,
+                worktree,
+                provider,
+            } => {
+                self.notice = Some(format!(
+                    "Started {} session {conversation_id} in {}",
+                    provider.label(),
+                    worktree.label
+                ));
+            }
             AppEvent::StartAgent(provider) => {
                 self.selected_agent = provider;
                 self.start_agent(provider);
@@ -2795,6 +2814,32 @@ impl Agency {
                         })
                     })
                 }
+                "worktree.start_session" => worktrees::discover(&call.context.workspace)
+                    .and_then(|worktrees| {
+                        workspaces::resolve_start_request(&call.params, &worktrees)
+                    })
+                    .and_then(|request| {
+                        let workspace = request.worktree.path.clone();
+                        let conversation_id = self.start_session_in(
+                            request.provider,
+                            workspace,
+                            Some(request.prompt),
+                        )?;
+                        let worktree = worktree_json(request.worktree.clone());
+                        self.emit(AppEvent::WorktreeSessionStarted {
+                            conversation_id: conversation_id.clone(),
+                            worktree: request.worktree,
+                            provider: request.provider,
+                        });
+                        Ok(serde_json::json!({
+                            "caller": rpc_caller(&call.context),
+                            "session": {
+                                "conversation_id": conversation_id,
+                                "worktree": worktree,
+                                "agent": request.provider.command()
+                            }
+                        }))
+                    }),
                 "mcp.status" => {
                     let connected = call
                         .params
