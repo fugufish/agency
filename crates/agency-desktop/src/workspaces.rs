@@ -1,9 +1,11 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use agency_agents::McpServer;
+use agency_agents::{McpServer, Provider};
+use serde_json::Value;
 
 use crate::sessions::SessionRegistry;
+use crate::worktrees::Worktree;
 
 /// Everything Agency tracks for one worktree. Sessions are recorded under the
 /// worktree that owns them, and MCP servers are added to the worktree they were
@@ -79,6 +81,80 @@ impl Default for Workspaces {
     }
 }
 
+/// Gains a production caller in a later task of this series (the RPC handler
+/// for `worktree.start_session`, which spawns the resolved request); until
+/// then it is exercised only by tests.
+#[allow(dead_code)]
+#[derive(Debug)]
+pub struct StartRequest {
+    pub worktree: Worktree,
+    pub provider: Provider,
+    pub prompt: String,
+}
+
+/// Turns `start_worktree_session` arguments into something startable, or into
+/// the error the caller sees. Every refusal happens here, before a process is
+/// spawned, so a mistyped branch or agent costs nothing.
+///
+/// Gains a production caller in a later task of this series (the RPC handler
+/// for `worktree.start_session`); until then it is exercised only by tests.
+#[allow(dead_code)]
+pub fn resolve_start_request(
+    params: &Value,
+    worktrees: &[Worktree],
+) -> Result<StartRequest, String> {
+    let branch = params
+        .get("worktree")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|branch| !branch.is_empty())
+        .ok_or_else(|| "start_worktree_session requires a worktree".to_owned())?;
+    let worktree = worktrees
+        .iter()
+        .find(|worktree| worktree.branch.as_deref() == Some(branch))
+        .cloned()
+        .ok_or_else(|| {
+            let known = worktrees
+                .iter()
+                .filter_map(|worktree| worktree.branch.as_deref())
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!(
+                "No worktree is checked out on {branch}. Create it first with create_worktree. \
+Worktrees that exist: {known}"
+            )
+        })?;
+
+    let agent = params
+        .get("agent")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|agent| !agent.is_empty())
+        .ok_or_else(|| "start_worktree_session requires an agent".to_owned())?;
+    let provider = Provider::from_name(agent).ok_or_else(|| {
+        let known = Provider::ALL
+            .iter()
+            .map(|provider| provider.command())
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!("Unknown agent {agent}. Agents Agency can start: {known}")
+    })?;
+
+    let prompt = params
+        .get("prompt")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|prompt| !prompt.is_empty())
+        .ok_or_else(|| "start_worktree_session requires a prompt".to_owned())?
+        .to_owned();
+
+    Ok(StartRequest {
+        worktree,
+        provider,
+        prompt,
+    })
+}
+
 /// Which session should be focused after the user switches to `cwd`, given the
 /// worktree each running session belongs to. Sessions outside `cwd` keep
 /// running; they are simply not the ones on screen.
@@ -99,7 +175,79 @@ pub fn active_after_switch(
 mod tests {
     use super::*;
     use crate::config::path_component;
-    use agency_agents::{McpTransport, Provider};
+    use agency_agents::McpTransport;
+
+    fn worktree(branch: &str, path: &str) -> Worktree {
+        Worktree {
+            path: PathBuf::from(path),
+            label: branch.to_owned(),
+            branch: Some(branch.to_owned()),
+        }
+    }
+
+    #[test]
+    fn a_request_resolves_its_worktree_agent_and_prompt() {
+        let worktrees = vec![worktree("main", "/repo"), worktree("feature", "/repo/wt")];
+
+        let request = resolve_start_request(
+            &serde_json::json!({
+                "worktree": "feature",
+                "prompt": "Add the parser",
+                "agent": "claude-code"
+            }),
+            &worktrees,
+        )
+        .expect("the request should resolve");
+
+        assert_eq!(request.worktree.path, PathBuf::from("/repo/wt"));
+        assert_eq!(request.provider, Provider::Claude);
+        assert_eq!(request.prompt, "Add the parser");
+    }
+
+    #[test]
+    fn an_unknown_worktree_names_the_branches_that_exist() {
+        let worktrees = vec![worktree("main", "/repo")];
+
+        let error = resolve_start_request(
+            &serde_json::json!({"worktree": "typo", "prompt": "Go", "agent": "claude"}),
+            &worktrees,
+        )
+        .expect_err("an unknown branch should be refused");
+
+        assert!(error.contains("typo"));
+        assert!(error.contains("main"));
+    }
+
+    /// Resolution reads the agent name through `Provider::from_name`, so an
+    /// agent Agency does not ship must fail loudly instead of defaulting to
+    /// whichever provider happens to be first.
+    #[test]
+    fn a_fabricated_agent_name_is_refused_with_the_accepted_names() {
+        let worktrees = vec![worktree("main", "/repo")];
+
+        let error = resolve_start_request(
+            &serde_json::json!({"worktree": "main", "prompt": "Go", "agent": "fabricated-agent"}),
+            &worktrees,
+        )
+        .expect_err("an unknown agent should be refused");
+
+        assert!(error.contains("fabricated-agent"));
+        assert!(error.contains("claude"));
+        assert!(error.contains("codex"));
+    }
+
+    #[test]
+    fn a_blank_prompt_is_refused_before_anything_spawns() {
+        let worktrees = vec![worktree("main", "/repo")];
+
+        let error = resolve_start_request(
+            &serde_json::json!({"worktree": "main", "prompt": "   ", "agent": "claude"}),
+            &worktrees,
+        )
+        .expect_err("a blank prompt should be refused");
+
+        assert!(error.contains("prompt"));
+    }
 
     fn temp_workspace(name: &str) -> PathBuf {
         let path = std::env::temp_dir().join(format!("agency-workspaces-{name}"));

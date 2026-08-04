@@ -57,6 +57,10 @@ const fn enabled_by_default() -> bool {
 }
 
 impl Provider {
+    /// Every agent Agency knows how to start. Used where a caller has to be
+    /// told which names are accepted.
+    pub const ALL: [Self; 2] = [Self::Codex, Self::Claude];
+
     pub fn label(self) -> &'static str {
         match self {
             Self::Codex => "Codex",
