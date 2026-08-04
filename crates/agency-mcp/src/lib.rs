@@ -114,19 +114,49 @@ fn tools() -> Value {
                 "required": ["branch"],
                 "additionalProperties": false
             }
+        },
+        {
+            "name": "start_worktree_session",
+            "description": "Start an agent session in an existing worktree with a first prompt. The session runs in parallel with yours and is the only way to get work done in another worktree.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "worktree": {
+                        "type": "string",
+                        "description": "Branch of the worktree the session should run in, as reported by list_worktrees."
+                    },
+                    "prompt": {
+                        "type": "string",
+                        "description": "First message sent to the new session."
+                    },
+                    "agent": {
+                        "type": "string",
+                        "description": "Agent to run, such as \"claude\" or \"codex\"."
+                    }
+                },
+                "required": ["worktree", "prompt", "agent"],
+                "additionalProperties": false
+            }
         }
     ])
+}
+
+fn rpc_method(name: &str) -> Option<&'static str> {
+    match name {
+        "list_worktrees" => Some("worktree.list"),
+        "create_worktree" => Some("worktree.create"),
+        "remove_worktree" => Some("worktree.remove"),
+        "start_worktree_session" => Some("worktree.start_session"),
+        _ => None,
+    }
 }
 
 fn call_tool(id: Value, message: &Value, socket: &std::path::Path, token: &str) -> Value {
     let Some(name) = message.pointer("/params/name").and_then(Value::as_str) else {
         return rpc_error(id, -32602, "Missing tool name");
     };
-    let method = match name {
-        "list_worktrees" => "worktree.list",
-        "create_worktree" => "worktree.create",
-        "remove_worktree" => "worktree.remove",
-        _ => return rpc_error(id, -32602, format!("Unknown Agency tool: {name}")),
+    let Some(method) = rpc_method(name) else {
+        return rpc_error(id, -32602, format!("Unknown Agency tool: {name}"));
     };
     let params = message
         .pointer("/params/arguments")
@@ -188,4 +218,45 @@ fn write_json(writer: &mut impl Write, value: &Value) -> Result<(), String> {
         .write_all(b"\n")
         .and_then(|_| writer.flush())
         .map_err(|error| format!("Could not write MCP response: {error}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn start_worktree_session_is_declared_with_its_three_inputs() {
+        let tools = tools();
+        let tool = tools
+            .as_array()
+            .expect("tools should be an array")
+            .iter()
+            .find(|tool| tool["name"] == "start_worktree_session")
+            .expect("start_worktree_session should be declared");
+
+        let required = tool["inputSchema"]["required"]
+            .as_array()
+            .expect("the schema should require its inputs");
+
+        assert!(required.iter().any(|name| name == "worktree"));
+        assert!(required.iter().any(|name| name == "prompt"));
+        assert!(required.iter().any(|name| name == "agent"));
+    }
+
+    #[test]
+    fn every_declared_tool_maps_to_an_rpc_method() {
+        for tool in tools().as_array().expect("tools should be an array") {
+            let name = tool["name"].as_str().expect("a tool needs a name");
+            assert!(rpc_method(name).is_some(), "{name} has no RPC method");
+        }
+        assert_eq!(
+            rpc_method("start_worktree_session"),
+            Some("worktree.start_session")
+        );
+    }
+
+    #[test]
+    fn an_unknown_tool_has_no_rpc_method() {
+        assert_eq!(rpc_method("fabricated_tool"), None);
+    }
 }
