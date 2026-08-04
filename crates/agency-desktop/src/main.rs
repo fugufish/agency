@@ -590,7 +590,7 @@ struct Agency {
     active_terminal: Option<usize>,
     agents: Vec<AgentView>,
     active_agent: Option<usize>,
-    sessions: SessionRegistry,
+    workspaces: workspaces::Workspaces,
     toolbar: ToolbarState,
     explorer: ExplorerState,
     overlays: OverlayState,
@@ -608,7 +608,6 @@ struct Agency {
     cursor_blinked_at: Instant,
     animation_started_at: Instant,
     transcript_scroll_target: Option<f32>,
-    mcp_servers: Vec<McpServer>,
     file_viewer: file_viewer::State,
     agent_installations: Vec<AgentInstallation>,
     slash_command_catalog: Vec<SlashCommandCompletion>,
@@ -962,10 +961,8 @@ impl Agency {
         // primary's history rather than search the worktree it started in.
         sessions::migrate_legacy_sessions(&worktrees);
         let _ = worktrees::ensure_agency_ignored(&cwd);
-        let (sessions, session_notice) = match SessionRegistry::load(&cwd) {
-            Ok(sessions) => (sessions, None),
-            Err(error) => (SessionRegistry::empty(&cwd), Some(error)),
-        };
+        let mut workspaces = workspaces::Workspaces::new();
+        let session_notice = workspaces.ensure(&cwd).err();
         let rpc_capabilities = SessionCapabilities::default();
         let slash_command_catalog = agency_commands();
         let (rpc_server, rpc_notice) = if spawn_agent_and_rpc {
@@ -993,7 +990,7 @@ impl Agency {
             active_terminal: None,
             agents: Vec::new(),
             active_agent: None,
-            sessions,
+            workspaces,
             worktrees,
             active_worktree,
             cwd,
@@ -1007,7 +1004,6 @@ impl Agency {
             cursor_blinked_at: Instant::now(),
             animation_started_at: Instant::now(),
             transcript_scroll_target: None,
-            mcp_servers: Vec::new(),
             file_viewer: file_viewer::State::default(),
             agent_installations,
             slash_command_catalog,
@@ -1867,12 +1863,12 @@ impl Agency {
                     .unwrap_or_default();
             }
             Action::ToolbarOpen => {
-                if !self.sessions.records().is_empty() {
+                if !self.sessions().records().is_empty() {
                     self.emit(AppEvent::ResumeSession(self.toolbar.selected_session));
                 }
             }
             Action::ToolbarTrash => {
-                if !self.sessions.records().is_empty() {
+                if !self.sessions().records().is_empty() {
                     self.request_session_trash(self.toolbar.selected_session);
                 }
             }
@@ -2093,7 +2089,7 @@ impl Agency {
         }
         let submitted = self.active_agent_mut().and_then(AgentView::submit);
         if let Some((provider, id, name)) = submitted
-            && let Err(error) = self.sessions.name_if_missing(provider, &id, name)
+            && let Err(error) = self.sessions_mut().name_if_missing(provider, &id, name)
         {
             self.notice = Some(error);
         }
@@ -2140,7 +2136,7 @@ impl Agency {
             Ok(Submission::Verbatim) => {
                 let submitted = self.active_agent_mut().and_then(AgentView::submit);
                 if let Some((provider, id, name)) = submitted
-                    && let Err(error) = self.sessions.name_if_missing(provider, &id, name)
+                    && let Err(error) = self.sessions_mut().name_if_missing(provider, &id, name)
                 {
                     self.notice = Some(error);
                 }
@@ -2239,7 +2235,7 @@ impl Agency {
         if name == "agency" {
             return Err("The MCP server name \"agency\" is reserved".to_owned());
         }
-        if self.mcp_servers.iter().any(|server| server.name == name) {
+        if self.mcp_servers().iter().any(|server| server.name == name) {
             return Err(format!("MCP server {name:?} is already connected"));
         }
         let server = load_codex_mcp(name)?;
@@ -2273,7 +2269,7 @@ impl Agency {
             );
         }
 
-        let mut servers = self.mcp_servers.clone();
+        let mut servers = self.mcp_servers().to_vec();
         servers.push(server);
         let reconnect = self
             .agents
@@ -2303,7 +2299,8 @@ impl Agency {
             agent.status = "Reconnecting MCP servers".to_owned();
             agent.mcp_status = McpStatus::Waiting;
         }
-        self.mcp_servers = servers;
+        let cwd = self.cwd.clone();
+        self.workspaces.state_mut(&cwd).mcp_servers = servers;
         self.emit(AppEvent::SlashCatalogRequested);
         self.notice = Some(format!(
             "Added MCP server {name:?} to {} connected agent{}",
@@ -2499,20 +2496,16 @@ impl Agency {
         }
 
         let cwd = worktree.path.clone();
-        let sessions = match SessionRegistry::load(&cwd) {
-            Ok(sessions) => sessions,
-            Err(error) => {
-                self.notice = Some(error);
-                return;
-            }
-        };
+        if let Err(error) = self.workspaces.ensure(&cwd) {
+            self.notice = Some(error);
+            return;
+        }
 
         self.active_worktree = index;
         self.cwd = cwd;
         self.slash_command_catalog = agency_commands();
         self.emit(AppEvent::SlashCatalogRequested);
         self.overlays.slash.close();
-        self.sessions = sessions;
         for agent in &self.agents {
             self.rpc_capabilities.revoke(&agent.rpc_token);
         }
@@ -2527,7 +2520,6 @@ impl Agency {
         self.explorer.expanded.clear();
         self.toolbar.selected_session = 0;
         self.overlays.pending_session_trash = None;
-        self.mcp_servers.clear();
         self.notice = Some(format!("Switched to {}", self.cwd.display()));
     }
 
@@ -2614,10 +2606,10 @@ impl Agency {
             provider,
             &self.cwd,
             &environment,
-            &self.mcp_servers,
+            self.mcp_servers(),
         ) {
             Ok(session) => {
-                let session_directory = self.sessions.session_directory(&conversation_id);
+                let session_directory = self.sessions().session_directory(&conversation_id);
                 let diff_state = DiffSessionState::load(&session_directory).unwrap_or_default();
                 self.agents.push(AgentView {
                     conversation_id: conversation_id.clone(),
@@ -2642,7 +2634,7 @@ impl Agency {
                     queued_messages: VecDeque::new(),
                     image_cache: HashMap::new(),
                     image_cache_directory: self
-                        .sessions
+                        .sessions()
                         .session_directory(&conversation_id)
                         .join("images"),
                     diff_state,
@@ -2789,7 +2781,7 @@ impl Agency {
     }
 
     fn resume_session(&mut self, index: usize) {
-        let Some(record) = self.sessions.records().get(index).cloned() else {
+        let Some(record) = self.sessions().records().get(index).cloned() else {
             return;
         };
         if let Some(running_index) = self
@@ -2829,11 +2821,11 @@ impl Agency {
             &id,
             &self.cwd,
             &environment,
-            &self.mcp_servers,
+            self.mcp_servers(),
         ) {
             Ok(session) => {
                 self.toolbar.selected_session = index;
-                let session_directory = self.sessions.session_directory(record.conversation_id());
+                let session_directory = self.sessions().session_directory(record.conversation_id());
                 let diff_state = match DiffSessionState::load(&session_directory) {
                     Ok(state) => state,
                     Err(error) => {
@@ -2864,7 +2856,7 @@ impl Agency {
                     queued_messages: VecDeque::new(),
                     image_cache: HashMap::new(),
                     image_cache_directory: self
-                        .sessions
+                        .sessions()
                         .session_directory(record.conversation_id())
                         .join("images"),
                     diff_state,
@@ -2929,7 +2921,7 @@ impl Agency {
     fn rebind_session(&mut self, index: usize, provider: Provider) {
         let conversation_id = self.agents[index].conversation_id.clone();
         let binding = self
-            .sessions
+            .sessions()
             .records()
             .iter()
             .find(|record| record.conversation_id() == conversation_id)
@@ -2950,13 +2942,13 @@ impl Agency {
                 session_id,
                 &self.cwd,
                 &environment,
-                &self.mcp_servers,
+                self.mcp_servers(),
             ),
             None => AgentSession::spawn_with_env_and_mcps(
                 provider,
                 &self.cwd,
                 &environment,
-                &self.mcp_servers,
+                self.mcp_servers(),
             ),
         };
         let session = match started {
@@ -3002,7 +2994,7 @@ impl Agency {
         // row would silently point at a different command.
         self.overlays.slash.close();
         if let Some(session) = self
-            .sessions
+            .sessions()
             .records()
             .iter()
             .position(|record| record.conversation_id() == conversation_id)
@@ -3019,7 +3011,7 @@ impl Agency {
     }
 
     fn request_session_trash(&mut self, index: usize) {
-        if index < self.sessions.records().len() {
+        if index < self.sessions().records().len() {
             self.toolbar.selected_session = index;
             self.overlays.pending_session_trash = Some(index);
         }
@@ -3029,7 +3021,7 @@ impl Agency {
         let Some(index) = self.overlays.pending_session_trash.take() else {
             return;
         };
-        match self.sessions.remove(index) {
+        match self.sessions_mut().remove(index) {
             Ok(record) => {
                 if let Some(running_index) = self
                     .agents
@@ -3046,7 +3038,7 @@ impl Agency {
                     };
                 }
                 self.toolbar.selected_session =
-                    index.min(self.sessions.records().len().saturating_sub(1));
+                    index.min(self.sessions().records().len().saturating_sub(1));
                 self.emit(AppEvent::RefreshVisibleTranscript);
                 self.notice = Some(format!(
                     "Trashed session {}",
@@ -3065,15 +3057,31 @@ impl Agency {
             .and_then(|index| self.terminals.get(index))
     }
 
+    /// The session registry of the worktree the user is looking at. Sessions
+    /// running in other worktrees live in their own registries and are reached
+    /// through `self.workspaces`.
+    fn sessions(&self) -> &SessionRegistry {
+        &self.workspaces.state(&self.cwd).registry
+    }
+
+    fn sessions_mut(&mut self) -> &mut SessionRegistry {
+        let cwd = self.cwd.clone();
+        &mut self.workspaces.state_mut(&cwd).registry
+    }
+
+    fn mcp_servers(&self) -> &[McpServer] {
+        &self.workspaces.state(&self.cwd).mcp_servers
+    }
+
     fn record_session_updates(&mut self, updates: Vec<SessionUpdate>) {
         for (provider, id, name, conversation_id, rpc_token) in updates {
             self.rpc_capabilities
                 .bind_provider_session(&rpc_token, id.clone());
             let result = if let Some(conversation_id) = conversation_id {
-                self.sessions
+                self.sessions_mut()
                     .record_binding(conversation_id, provider, id, name)
             } else {
-                self.sessions.record(provider, id, name)
+                self.sessions_mut().record(provider, id, name)
             };
             if let Err(error) = result {
                 self.notice = Some(error);
@@ -3094,9 +3102,9 @@ impl Agency {
         let active_conversation_id = self
             .active_agent()
             .map(|agent| agent.conversation_id.as_str());
-        let mut indices = (0..self.sessions.records().len()).collect::<Vec<_>>();
+        let mut indices = (0..self.sessions().records().len()).collect::<Vec<_>>();
         indices.sort_by_key(|index| {
-            let session = &self.sessions.records()[*index];
+            let session = &self.sessions().records()[*index];
             let agent = self
                 .agents
                 .iter()
@@ -3204,7 +3212,7 @@ impl Agency {
         let session_buttons = self.ordered_session_indices().into_iter().fold(
             column![].spacing(8),
             |sessions, index| {
-                let session = &self.sessions.records()[index];
+                let session = &self.sessions().records()[index];
                 let display_id = session
                     .binding(self.default_agent)
                     .or_else(|| session.binding(next_provider(self.default_agent)))
@@ -3525,7 +3533,7 @@ impl Agency {
                     .width(Fill)
                     .padding([9, 10])
                     .style(|_theme: &Theme| ui_theme::mcp_agent_card());
-                    let servers = self.mcp_servers.iter().fold(
+                    let servers = self.mcp_servers().iter().fold(
                         column![agency_server].spacing(8),
                         |servers, server| {
                             let state = mcp_server_state(server, &self.agents);
@@ -3570,7 +3578,7 @@ impl Agency {
                         },
                     );
                     let body: Element<'_, AppEvent> = scrollable(servers).height(Fill).into();
-                    let server_count = self.mcp_servers.len() + 1;
+                    let server_count = self.mcp_servers().len() + 1;
                     container(
                         column![
                             sidebar_header("MCP", NETWORK_ICON),
@@ -4513,7 +4521,7 @@ impl Agency {
         let Some(index) = self.overlays.pending_session_trash else {
             return application;
         };
-        let Some(session) = self.sessions.records().get(index) else {
+        let Some(session) = self.sessions().records().get(index) else {
             return application;
         };
         let name = session.name.as_deref().unwrap_or("Untitled session");

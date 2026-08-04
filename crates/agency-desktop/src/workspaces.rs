@@ -9,13 +9,11 @@ use crate::sessions::SessionRegistry;
 /// worktree that owns them, and MCP servers are added to the worktree they were
 /// configured in, so both have to be keyed by worktree rather than held once on
 /// the application.
-#[allow(dead_code, reason = "wired into Agency in the next task of this plan")]
 pub struct WorktreeState {
     pub registry: SessionRegistry,
     pub mcp_servers: Vec<McpServer>,
 }
 
-#[allow(dead_code, reason = "wired into Agency in the next task of this plan")]
 pub struct Workspaces {
     states: HashMap<PathBuf, WorktreeState>,
     /// Read for a worktree that was never `ensure`d. Startup, worktree
@@ -24,7 +22,6 @@ pub struct Workspaces {
     fallback: WorktreeState,
 }
 
-#[allow(dead_code, reason = "wired into Agency in the next task of this plan")]
 impl Workspaces {
     pub fn new() -> Self {
         Self {
