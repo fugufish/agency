@@ -35,11 +35,20 @@ impl Workspaces {
 
     /// Loads the worktree's sessions from disk the first time it is asked for.
     /// Later calls are cheap, so callers can `ensure` freely.
+    ///
+    /// A load failure still inserts a state — scoped to `workspace` with an
+    /// empty registry — rather than leaving the worktree unensured. Callers
+    /// that only capture the error for a notice (startup, worktree switching)
+    /// must not leave `self.sessions()` / `self.mcp_servers()` resolving
+    /// against the shared fallback, which is scoped to nothing on disk.
     pub fn ensure(&mut self, workspace: &Path) -> Result<(), String> {
         if self.states.contains_key(workspace) {
             return Ok(());
         }
-        let registry = SessionRegistry::load(workspace)?;
+        let (registry, result) = match SessionRegistry::load(workspace) {
+            Ok(registry) => (registry, Ok(())),
+            Err(error) => (SessionRegistry::empty(workspace), Err(error)),
+        };
         self.states.insert(
             workspace.to_path_buf(),
             WorktreeState {
@@ -47,7 +56,7 @@ impl Workspaces {
                 mcp_servers: Vec::new(),
             },
         );
-        Ok(())
+        result
     }
 
     pub fn state(&self, workspace: &Path) -> &WorktreeState {
@@ -73,6 +82,7 @@ impl Default for Workspaces {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::path_component;
     use agency_agents::{McpTransport, Provider};
 
     fn temp_workspace(name: &str) -> PathBuf {
@@ -151,6 +161,42 @@ mod tests {
                 .registry
                 .records()
                 .is_empty()
+        );
+    }
+
+    /// A load failure (I/O error, corrupt session file) must not leave the
+    /// worktree unensured: callers that only capture the error for a notice
+    /// (startup, worktree switching) still need every later read to resolve
+    /// against a registry scoped to this workspace, not the shared fallback
+    /// (whose `session_directory` resolves against the process cwd instead
+    /// of the worktree).
+    #[test]
+    fn a_failed_load_still_scopes_the_registry_to_its_workspace() {
+        let workspace = temp_workspace("load-failure");
+        // `SessionRegistry::load` reads the sessions directory with
+        // `fs::read_dir`; putting a plain file where that directory is
+        // expected makes the read fail reliably and cheaply.
+        let sessions_directory = crate::sessions::worktree_sessions_directory(&workspace);
+        std::fs::create_dir_all(
+            sessions_directory
+                .parent()
+                .expect("the sessions directory always has a parent"),
+        )
+        .expect("could not create the workspace config directory");
+        std::fs::write(&sessions_directory, "not a directory")
+            .expect("could not occupy the sessions directory with a file");
+
+        let mut workspaces = Workspaces::new();
+        let result = workspaces.ensure(&workspace);
+
+        assert!(result.is_err(), "a failed load must still report its error");
+        assert_eq!(
+            workspaces
+                .state(&workspace)
+                .registry
+                .session_directory("conversation"),
+            sessions_directory.join(path_component("conversation")),
+            "the registry inserted for a failed load must stay scoped to its workspace"
         );
     }
 }
