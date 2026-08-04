@@ -15,6 +15,33 @@ Worktrees may isolate concurrent tasks, while repository instructions and the
 current worktree state remain authoritative. Follow the closest `AGENTS.md`,
 report blockers clearly, and do not overwrite unrelated work.
 
+## Work in a worktree
+
+- Start every new feature, task, or bugfix by creating a worktree for it and
+  doing the work there. Do not commit new work directly in the primary
+  checkout.
+- Creating the worktree is a pre-condition of the `superpowers:brainstorming`
+  skill. When that skill is invoked, create the feature's worktree and its
+  branch first, enter it, and only then begin the brainstorming dialogue, so
+  the design conversation, any notes or specs it produces, and the
+  implementation that follows all live on the same branch.
+- Derive the worktree and branch name from the idea the user brought, before
+  the design is settled; rename the branch later if the brainstorm reshapes
+  the work. Do not delay the worktree until the design is agreed.
+- Create and manage worktrees with Agency's worktree tools, which are
+  session-scoped; never ask the user for an Agency session ID and never fall
+  back to raw `git worktree` commands when a tool covers the operation.
+- Name the worktree and its branch after the work it holds, so concurrent
+  agents can tell one task's worktree from another's.
+- One task per worktree. If a request turns out to cover unrelated work, split
+  it across worktrees rather than mixing changes that must land separately.
+- Before starting, list the existing worktrees and reuse the one that already
+  belongs to this task instead of creating a duplicate.
+- Repository instructions and the current worktree state remain authoritative
+  once you are inside a worktree; follow the closest `AGENTS.md` there.
+- Leave the worktree in place until its change has landed, then remove it so
+  stale worktrees do not accumulate.
+
 ## Provider-neutral resolution
 
 - The harness must not hardcode any provider's surface syntax. Command sigils,
