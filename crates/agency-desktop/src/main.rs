@@ -14,7 +14,7 @@ use std::borrow::Cow;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::ops::Range;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -622,6 +622,7 @@ struct AgentInstallation {
 }
 
 struct AgentView {
+    workspace: PathBuf,
     conversation_id: String,
     rpc_token: String,
     session: AgentSession,
@@ -2087,9 +2088,15 @@ impl Agency {
             agent.prompt_selection_anchor = None;
             agent.command_provider = Some(provider);
         }
+        let workspace = self.active_agent().map(|agent| agent.workspace.clone());
         let submitted = self.active_agent_mut().and_then(AgentView::submit);
         if let Some((provider, id, name)) = submitted
-            && let Err(error) = self.sessions_mut().name_if_missing(provider, &id, name)
+            && let Some(workspace) = workspace
+            && let Err(error) = self
+                .workspaces
+                .state_mut(&workspace)
+                .registry
+                .name_if_missing(provider, &id, name)
         {
             self.notice = Some(error);
         }
@@ -2134,9 +2141,15 @@ impl Agency {
                 self.route_agent_command(provider, prompt);
             }
             Ok(Submission::Verbatim) => {
+                let workspace = self.active_agent().map(|agent| agent.workspace.clone());
                 let submitted = self.active_agent_mut().and_then(AgentView::submit);
                 if let Some((provider, id, name)) = submitted
-                    && let Err(error) = self.sessions_mut().name_if_missing(provider, &id, name)
+                    && let Some(workspace) = workspace
+                    && let Err(error) = self
+                        .workspaces
+                        .state_mut(&workspace)
+                        .registry
+                        .name_if_missing(provider, &id, name)
                 {
                     self.notice = Some(error);
                 }
@@ -2258,11 +2271,11 @@ impl Agency {
                 "Wait for every agent to become idle before changing MCP servers".to_owned(),
             );
         }
-        if self
-            .agents
-            .iter()
-            .any(|agent| agent.session.provider() == Provider::Claude && agent.session_id.is_none())
-        {
+        if self.agents.iter().any(|agent| {
+            agent.workspace == self.cwd
+                && agent.session.provider() == Provider::Claude
+                && agent.session_id.is_none()
+        }) {
             return Err(
                 "Wait for every Claude Code agent to finish connecting before changing MCP servers"
                     .to_owned(),
@@ -2275,22 +2288,26 @@ impl Agency {
             .agents
             .iter()
             .enumerate()
-            .filter(|(_, agent)| agent.session.provider() == Provider::Claude)
+            .filter(|(_, agent)| {
+                agent.session.provider() == Provider::Claude && agent.workspace == self.cwd
+            })
             .map(|(index, agent)| {
                 (
                     index,
                     agent.rpc_token.clone(),
                     agent.conversation_id.clone(),
                     agent.session_id.clone().unwrap_or_default(),
+                    agent.workspace.clone(),
                 )
             })
             .collect::<Vec<_>>();
-        for (index, rpc_token, conversation_id, session_id) in reconnect {
+        let reconnected = reconnect.len();
+        for (index, rpc_token, conversation_id, session_id, workspace) in reconnect {
             let environment = self.rpc_environment(&rpc_token, &conversation_id);
             let session = AgentSession::resume_with_env_and_mcps(
                 Provider::Claude,
                 &session_id,
-                &self.cwd,
+                &workspace,
                 &environment,
                 &servers,
             )?;
@@ -2303,9 +2320,8 @@ impl Agency {
         self.workspaces.state_mut(&cwd).mcp_servers = servers;
         self.emit(AppEvent::SlashCatalogRequested);
         self.notice = Some(format!(
-            "Added MCP server {name:?} to {} connected agent{}",
-            self.agents.len(),
-            if self.agents.len() == 1 { "" } else { "s" }
+            "Added MCP server {name:?} to {reconnected} connected agent{}",
+            if reconnected == 1 { "" } else { "s" }
         ));
         Ok(())
     }
@@ -2593,56 +2609,9 @@ impl Agency {
     }
 
     fn start_agent(&mut self, provider: Provider) {
-        let conversation_id = new_conversation_id();
-        let rpc_token = match self.issue_rpc_capability(&conversation_id, provider) {
-            Ok(token) => token,
-            Err(error) => {
-                self.notice = Some(error);
-                return;
-            }
-        };
-        let environment = self.rpc_environment(&rpc_token, &conversation_id);
-        match AgentSession::spawn_with_env_and_mcps(
-            provider,
-            &self.cwd,
-            &environment,
-            self.mcp_servers(),
-        ) {
-            Ok(session) => {
-                let session_directory = self.sessions().session_directory(&conversation_id);
-                let diff_state = DiffSessionState::load(&session_directory).unwrap_or_default();
-                self.agents.push(AgentView {
-                    conversation_id: conversation_id.clone(),
-                    rpc_token,
-                    session,
-                    transcript: Vec::new(),
-                    transcript_dirty: false,
-                    conversation: Conversation::default(),
-                    prompt: String::new(),
-                    prompt_selected: false,
-                    prompt_cursor: 0,
-                    prompt_selection_anchor: None,
-                    command_provider: None,
-                    images: Vec::new(),
-                    pending_question: None,
-                    status: "Initializing".to_owned(),
-                    session_id: None,
-                    pending_session_name: None,
-                    pending_conversation_id: Some(conversation_id.clone()),
-                    completed_turns: 0,
-                    activity: AgentActivity::Starting,
-                    queued_messages: VecDeque::new(),
-                    image_cache: HashMap::new(),
-                    image_cache_directory: self
-                        .sessions()
-                        .session_directory(&conversation_id)
-                        .join("images"),
-                    diff_state,
-                    session_directory,
-                    last_changed_at_millis: unix_time_millis(),
-                    mcp_status: McpStatus::Waiting,
-                    plugin_installs: TranscriptInstalls::default(),
-                });
+        let workspace = self.cwd.clone();
+        match self.start_session_in(provider, workspace, None) {
+            Ok(_) => {
                 self.active_agent = Some(self.agents.len() - 1);
                 // The completion ranking depends on the focused agent's
                 // provider, so a highlighted row that survived the switch
@@ -2652,24 +2621,96 @@ impl Agency {
                 self.emit(AppEvent::EnterComposer);
                 self.notice = None;
             }
+            Err(error) => self.notice = Some(error),
+        }
+    }
+
+    /// Spawns a session in `workspace` and, when `initial_prompt` is set, sends
+    /// it as the session's first message. Focus is left alone on purpose: a
+    /// session started by a tool call belongs to the worktree it was started
+    /// in, not to whatever the user is looking at.
+    fn start_session_in(
+        &mut self,
+        provider: Provider,
+        workspace: PathBuf,
+        initial_prompt: Option<String>,
+    ) -> Result<String, String> {
+        self.workspaces.ensure(&workspace)?;
+        let conversation_id = new_conversation_id();
+        let rpc_token = self.issue_rpc_capability(&conversation_id, provider, &workspace)?;
+        let environment = self.rpc_environment(&rpc_token, &conversation_id);
+        let mcp_servers = self.workspaces.state(&workspace).mcp_servers.to_vec();
+        let session = match AgentSession::spawn_with_env_and_mcps(
+            provider,
+            &workspace,
+            &environment,
+            &mcp_servers,
+        ) {
+            Ok(session) => session,
             Err(error) => {
                 self.rpc_capabilities.revoke(&rpc_token);
-                self.notice = Some(error);
+                return Err(error);
             }
+        };
+        let session_directory = self
+            .workspaces
+            .state(&workspace)
+            .registry
+            .session_directory(&conversation_id);
+        let diff_state = DiffSessionState::load(&session_directory).unwrap_or_default();
+        self.agents.push(AgentView {
+            workspace,
+            conversation_id: conversation_id.clone(),
+            rpc_token,
+            session,
+            transcript: Vec::new(),
+            transcript_dirty: false,
+            conversation: Conversation::default(),
+            prompt: String::new(),
+            prompt_selected: false,
+            prompt_cursor: 0,
+            prompt_selection_anchor: None,
+            command_provider: None,
+            images: Vec::new(),
+            pending_question: None,
+            status: "Initializing".to_owned(),
+            session_id: None,
+            pending_session_name: None,
+            pending_conversation_id: Some(conversation_id.clone()),
+            completed_turns: 0,
+            activity: AgentActivity::Starting,
+            queued_messages: VecDeque::new(),
+            image_cache: HashMap::new(),
+            image_cache_directory: session_directory.join("images"),
+            diff_state,
+            session_directory,
+            last_changed_at_millis: unix_time_millis(),
+            mcp_status: McpStatus::Waiting,
+            plugin_installs: TranscriptInstalls::default(),
+        });
+        if let Some(prompt) = initial_prompt
+            && let Some(agent) = self.agents.last_mut()
+        {
+            agent.prompt = normalized_prompt(prompt);
+            agent.prompt_cursor = agent.prompt.len();
+            agent.prompt_selection_anchor = None;
+            agent.submit();
         }
+        Ok(conversation_id)
     }
 
     fn issue_rpc_capability(
         &self,
         conversation_id: &str,
         provider: Provider,
+        workspace: &Path,
     ) -> Result<String, String> {
         if self.rpc_server.is_none() {
             return Err("Agency RPC is unavailable".to_owned());
         }
         self.rpc_capabilities.issue(SessionContext {
             conversation_id: conversation_id.to_owned(),
-            workspace: self.cwd.clone(),
+            workspace: workspace.to_path_buf(),
             provider: match provider {
                 Provider::Codex => "codex",
                 Provider::Claude => "claude",
@@ -2808,13 +2849,14 @@ impl Agency {
             return;
         };
         self.selected_agent = provider;
-        let rpc_token = match self.issue_rpc_capability(&record.conversation_id, provider) {
-            Ok(token) => token,
-            Err(error) => {
-                self.notice = Some(error);
-                return;
-            }
-        };
+        let rpc_token =
+            match self.issue_rpc_capability(&record.conversation_id, provider, &self.cwd) {
+                Ok(token) => token,
+                Err(error) => {
+                    self.notice = Some(error);
+                    return;
+                }
+            };
         let environment = self.rpc_environment(&rpc_token, &record.conversation_id);
         match AgentSession::resume_with_env_and_mcps(
             provider,
@@ -2834,6 +2876,7 @@ impl Agency {
                     }
                 };
                 self.agents.push(AgentView {
+                    workspace: self.cwd.clone(),
                     conversation_id: record.conversation_id.clone(),
                     rpc_token,
                     session,
@@ -2920,15 +2963,18 @@ impl Agency {
     /// conversation, its session directory, and its diffs stay put.
     fn rebind_session(&mut self, index: usize, provider: Provider) {
         let conversation_id = self.agents[index].conversation_id.clone();
+        let workspace = self.agents[index].workspace.clone();
         let binding = self
-            .sessions()
+            .workspaces
+            .state(&workspace)
+            .registry
             .records()
             .iter()
             .find(|record| record.conversation_id() == conversation_id)
             .and_then(|record| record.binding(provider))
             .map(str::to_owned);
 
-        let rpc_token = match self.issue_rpc_capability(&conversation_id, provider) {
+        let rpc_token = match self.issue_rpc_capability(&conversation_id, provider, &workspace) {
             Ok(token) => token,
             Err(error) => {
                 self.notice = Some(error);
@@ -2936,19 +2982,20 @@ impl Agency {
             }
         };
         let environment = self.rpc_environment(&rpc_token, &conversation_id);
+        let mcp_servers = self.workspaces.state(&workspace).mcp_servers.to_vec();
         let started = match &binding {
             Some(session_id) => AgentSession::resume_with_env_and_mcps(
                 provider,
                 session_id,
-                &self.cwd,
+                &workspace,
                 &environment,
-                self.mcp_servers(),
+                &mcp_servers,
             ),
             None => AgentSession::spawn_with_env_and_mcps(
                 provider,
-                &self.cwd,
+                &workspace,
                 &environment,
-                self.mcp_servers(),
+                &mcp_servers,
             ),
         };
         let session = match started {
@@ -3077,11 +3124,16 @@ impl Agency {
         for (provider, id, name, conversation_id, rpc_token) in updates {
             self.rpc_capabilities
                 .bind_provider_session(&rpc_token, id.clone());
+            let workspace = self
+                .agents
+                .iter()
+                .find(|agent| agent.rpc_token == rpc_token)
+                .map_or_else(|| self.cwd.clone(), |agent| agent.workspace.clone());
+            let registry = &mut self.workspaces.state_mut(&workspace).registry;
             let result = if let Some(conversation_id) = conversation_id {
-                self.sessions_mut()
-                    .record_binding(conversation_id, provider, id, name)
+                registry.record_binding(conversation_id, provider, id, name)
             } else {
-                self.sessions_mut().record(provider, id, name)
+                registry.record(provider, id, name)
             };
             if let Err(error) = result {
                 self.notice = Some(error);
